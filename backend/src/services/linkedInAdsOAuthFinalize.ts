@@ -14,7 +14,7 @@
 import axios from 'axios';
 import crypto from 'crypto';
 import { getLinkedInAdsConfig } from '../config/integrations';
-import { createAccount } from './connectedAccountsDb';
+import { createAccount, getAccountsByUserId } from './connectedAccountsDb';
 import { listAdAccounts } from './linkedInAdsService';
 
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -81,13 +81,25 @@ const retrieveTokenSession = (sessionId: string, userId: string): TokenSession |
 export interface LinkedInAdsFinalizeResult {
   adAccounts: any[];
   tokenSessionId: string;
+  /**
+   * The ad account list request failed (LinkedIn error, rate limit, outage). `adAccounts` is then empty
+   * because nothing could be read, which is NOT the same as "this login has no ad account". The portal
+   * route ignores this flag and answers exactly as before.
+   */
+  listFailed: boolean;
 }
+
+/** LinkedIn's token response names the granted scopes in `scope`, comma (or space) separated. */
+const parseGrantedScopes = (scope: unknown): string[] =>
+  typeof scope === 'string' ? [...new Set(scope.split(/[\s,]+/).filter((x) => /^[A-Za-z_]{2,60}$/.test(x)))] : [];
 
 /**
  * Exchange the OAuth code for tokens and list the user's ad accounts. `scopes` is what the consent
  * asked for (stored with the connection); the portal passes none and keeps the configured list.
+ * `recordGrantedScopes` (Zoma) stores the scopes LinkedIn actually granted when its answer names them,
+ * so a connection is never recorded as holding more than it has; the portal passes none.
  */
-export async function finalizeLinkedInAdsOAuth(params: { userId: string; code: string; scopes?: string[] }): Promise<LinkedInAdsFinalizeResult> {
+export async function finalizeLinkedInAdsOAuth(params: { userId: string; code: string; scopes?: string[]; recordGrantedScopes?: boolean }): Promise<LinkedInAdsFinalizeResult> {
   const { userId, code } = params;
   const config = await getLinkedInAdsConfig();
 
@@ -103,11 +115,13 @@ export async function finalizeLinkedInAdsOAuth(params: { userId: string; code: s
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
   });
 
-  const { access_token, refresh_token, expires_in } = tokenResponse.data as {
+  const { access_token, refresh_token, expires_in, scope } = tokenResponse.data as {
     access_token: string;
     refresh_token?: string;
     expires_in: number;
+    scope?: string;
   };
+  const granted = params.recordGrantedScopes ? parseGrantedScopes(scope) : [];
 
   // Fetch the authenticated person's LinkedIn member ID (r_basicprofile scope)
   let personUrn: string | undefined;
@@ -123,6 +137,9 @@ export async function finalizeLinkedInAdsOAuth(params: { userId: string; code: s
 
   // Fetch the user's ad accounts so they can pick one
   const accountsResult = await listAdAccounts(access_token);
+  // A failed list is not an empty account list. Status only: the body is LinkedIn's and is never logged.
+  const listFailed = accountsResult.success === false;
+  if (listFailed) console.error('[LinkedIn Ads OAuth] ad account list failed', accountsResult.status ?? 'no response');
   const adAccounts = (accountsResult.data?.elements || []).map((acc: any) => ({
     ...acc,
     id: String(acc.id), // LinkedIn returns numeric IDs; normalize to string for frontend
@@ -139,11 +156,11 @@ export async function finalizeLinkedInAdsOAuth(params: { userId: string; code: s
     access_token,
     refresh_token,
     expires_in,
-    scopes: params.scopes ?? config.scopes,
+    scopes: granted.length ? granted : (params.scopes ?? config.scopes),
     personUrn,
   }, adAccountRefs);
 
-  return { adAccounts, tokenSessionId };
+  return { adAccounts, tokenSessionId, listFailed };
 }
 
 export interface LinkedInAdsAccountChoice {
@@ -154,7 +171,7 @@ export interface LinkedInAdsAccountChoice {
 }
 
 export type LinkedInAdsConnectResult =
-  | { ok: true; accounts: any[] }
+  | { ok: true; accounts: any[]; /** Ad account ids left as they were because the stored connection holds more scopes. */ kept: string[] }
   | { ok: false; reason: 'invalid_session' };
 
 /**
@@ -166,6 +183,13 @@ export async function connectLinkedInAdsAccounts(params: {
   userId: string;
   tokenSessionId: string;
   accounts: LinkedInAdsAccountChoice[];
+  /**
+   * Zoma: createAccount replaces the WHOLE config of an existing (linkedin_ads, account_id) row, so a Zoma
+   * reconnect with fewer scopes would silently narrow a portal connection (e.g. drop the organization-social
+   * scopes). With this set, an account whose stored row holds a scope the new connection lacks is left exactly
+   * as it is and reported in `kept`. The portal does not set it and behaves as before.
+   */
+  keepWiderExisting?: boolean;
 }): Promise<LinkedInAdsConnectResult> {
   const { userId, tokenSessionId } = params;
   const session = retrieveTokenSession(tokenSessionId, userId);
@@ -173,7 +197,15 @@ export async function connectLinkedInAdsAccounts(params: {
 
   const { tokens } = session;
   const saved: any[] = [];
+  const kept: string[] = [];
+  const existingRows = params.keepWiderExisting ? await getAccountsByUserId(userId) : [];
   for (const choice of params.accounts) {
+    const held = existingRows.find((a) => a.platform === 'linkedin_ads' && String(a.account_id) === String(choice.adAccountId));
+    const heldScopes: unknown = (held?.config as any)?.scopes;
+    if (Array.isArray(heldScopes) && heldScopes.some((scope) => typeof scope === 'string' && !tokens.scopes.includes(scope))) {
+      kept.push(choice.adAccountId);
+      continue;
+    }
     const organizationUrn = session.adAccountRefs?.[String(choice.adAccountId)];
     const account = await createAccount(userId, 'linkedin_ads', {
       account_id: choice.adAccountId,
@@ -193,5 +225,5 @@ export async function connectLinkedInAdsAccounts(params: {
     await safeAutoResolve('LinkedIn Ads Connect', userId, 'linkedin_ads', choice.adAccountId);
     saved.push(account);
   }
-  return { ok: true, accounts: saved };
+  return { ok: true, accounts: saved, kept };
 }

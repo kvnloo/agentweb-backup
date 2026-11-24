@@ -158,7 +158,7 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
       'Choose your ad account',
       (step.message ? `<p><strong>${escapeHtml(step.message)}</strong></p>` : '<p>Pick the Meta ad account(s) Zoma should manage.</p>') +
         `<form method="post" action="${escapeHtml(step.action)}"><input type="hidden" name="t" value="${escapeHtml(step.token)}">${options}` +
-        `<p><button type="submit">Continue</button></p></form>`,
+        `<p><button type="submit">${escapeHtml(step.submitLabel ?? 'Continue')}</button></p></form>`,
       PICKER_FORM_ACTION,
     );
   }

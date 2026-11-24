@@ -27,6 +27,30 @@ export const ZOMA_LINKEDIN_WRITE_SCOPES: readonly string[] = ['rw_ads'];
 /** Scopes to ask for: the read scopes, plus the write scope only when Zoma offers writes. */
 export const zomaLinkedInScopes = (writes: boolean): string[] => [...ZOMA_LINKEDIN_READ_SCOPES, ...(writes ? ZOMA_LINKEDIN_WRITE_SCOPES : [])];
 
+/**
+ * What a Zoma link asks for: the mode's scopes PLUS every scope already stored on the user's existing
+ * linkedin_ads connections. A reconnect replaces a connection's config wholesale, so asking for less than
+ * it holds (the portal asks for the organization-social scopes) would narrow it.
+ */
+export async function zomaLinkedInConsentScopes(userId: string, writes: boolean): Promise<string[]> {
+  const { getAccountsByUserId } = await import('./connectedAccountsDb');
+  let stored: string[] = [];
+  try {
+    stored = (await getAccountsByUserId(userId))
+      .filter((a) => a.platform === 'linkedin_ads')
+      .flatMap((a) => ((a.config as any)?.scopes as unknown[]) ?? [])
+      .filter((scope): scope is string => typeof scope === 'string' && /^[A-Za-z_]{2,60}$/.test(scope));
+  } catch {
+    // Reading the stored scopes is best effort; the mode's scopes are still asked for.
+  }
+  return [...new Set([...zomaLinkedInScopes(writes), ...stored])];
+}
+
+/** The Zoma connect URL for `userId`, with the consent described above. */
+export async function buildZomaLinkedInConnectUrl(userId: string, writes: boolean, stateExtra: Record<string, string>): Promise<string> {
+  return buildLinkedInAdsConnectUrl(userId, stateExtra, await zomaLinkedInConsentScopes(userId, writes));
+}
+
 export const generateLinkedInAdsOAuthState = (userId: string, extra: Record<string, string> = {}): string =>
   jwt.sign({ ...extra, userId, nonce: crypto.randomBytes(16).toString('hex') }, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 

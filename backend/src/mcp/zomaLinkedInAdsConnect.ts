@@ -31,6 +31,12 @@ import type { LinkedInAdsAccountChoice, LinkedInAdsConnectResult, LinkedInAdsFin
 
 type PageStep = Extract<BrowserStep, { kind: 'page' }>;
 
+/** "mvarma@argusoft.com" → "m***@argusoft.com"; null when it is not an address. */
+export function maskEmail(email: unknown): string | null {
+  const match = typeof email === 'string' ? /^([^@\s])[^@\s]*@([^@\s]+)$/.exec(email.trim()) : null;
+  return match ? `${match[1]}***@${match[2]}` : null;
+}
+
 export interface ZomaLinkedInAdsDeps {
   links: ZomaLinkCodec;
   /** Verifies a LinkedIn OAuth state (signature AND expiry); null when invalid/expired/tampered. */
@@ -38,12 +44,14 @@ export interface ZomaLinkedInAdsDeps {
   finalize: (userId: string, code: string) => Promise<LinkedInAdsFinalizeResult>;
   connect: (userId: string, tokenSessionId: string, accounts: LinkedInAdsAccountChoice[]) => Promise<LinkedInAdsConnectResult>;
   mintLink: (userId: string) => Promise<string>;
+  /** The Zoma login's email, to show whose account is being connected; undefined when unknown. */
+  getUserEmail?: (userId: string) => Promise<string | undefined>;
   /** ZOMA_LINKEDIN_ADS_ENABLED is "read" or "true"; defaults to linkedInAdsToolkitEnabled(). Off: these pages are not offered. */
   enabled?: () => boolean;
 }
 
-/** The scopes Zoma asks for now (the same call the connect link uses), as the connection's recorded scopes. */
-const currentScopes = async () => (await import('../services/linkedInAdsConnectUrl')).zomaLinkedInScopes(linkedInAdsWritesEnabled());
+/** The scopes Zoma asks for now for this user (the same call the connect link uses): the mode's plus those already stored. */
+const currentScopes = async (userId: string) => (await import('../services/linkedInAdsConnectUrl')).zomaLinkedInConsentScopes(userId, linkedInAdsWritesEnabled());
 
 export const defaultZomaLinkedInAdsDeps: ZomaLinkedInAdsDeps = {
   links: defaultZomaLinkCodec,
@@ -56,13 +64,18 @@ export const defaultZomaLinkedInAdsDeps: ZomaLinkedInAdsDeps = {
       return null;
     }
   },
+  // Stores the scopes LinkedIn actually granted (else the requested set), and never replaces a stored connection with a narrower one.
   finalize: async (userId, code) =>
-    (await import('../services/linkedInAdsOAuthFinalize')).finalizeLinkedInAdsOAuth({ userId, code, scopes: await currentScopes() }),
+    (await import('../services/linkedInAdsOAuthFinalize')).finalizeLinkedInAdsOAuth({ userId, code, scopes: await currentScopes(userId), recordGrantedScopes: true }),
   connect: async (userId, tokenSessionId, accounts) =>
-    (await import('../services/linkedInAdsOAuthFinalize')).connectLinkedInAdsAccounts({ userId, tokenSessionId, accounts }),
+    (await import('../services/linkedInAdsOAuthFinalize')).connectLinkedInAdsAccounts({ userId, tokenSessionId, accounts, keepWiderExisting: true }),
   mintLink: async (userId) => {
     const { buildLinkedInAdsConnectUrl } = await import('../services/linkedInAdsConnectUrl');
-    return buildLinkedInAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP }, await currentScopes());
+    return buildLinkedInAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP }, await currentScopes(userId));
+  },
+  getUserEmail: async (userId) => {
+    const user = await (await import('../services/db')).userDb.getUserById(userId);
+    return typeof user?.email === 'string' ? user.email : undefined;
   },
 };
 
@@ -116,13 +129,26 @@ async function failedPage(userId: string, deps: ZomaLinkedInAdsDeps, { status, t
   };
 }
 
-const connectedPage = (count: number): PageStep => ({
+const connectedPage = (count: number, keptCount = 0): PageStep => ({
   kind: 'page',
   status: 200,
   title: 'LinkedIn Ads connected',
-  message: `Your LinkedIn Ads ${count === 1 ? 'account is' : 'accounts are'} connected to Zoma. ${NOTHING_CHANGED} ${ZOMA_BACK_TO_AGENT}`,
+  message: count === 0
+    ? `Your LinkedIn Ads ${keptCount === 1 ? 'account was' : 'accounts were'} already connected with wider access than this connection, so nothing was replaced and nothing changed. ${ZOMA_BACK_TO_AGENT}`
+    : `Your LinkedIn Ads ${count === 1 ? 'account is' : 'accounts are'} connected to Zoma. ${keptCount ? `${keptCount} more ${keptCount === 1 ? 'was' : 'were'} already connected with wider access and was left as it was. ` : ''}${NOTHING_CHANGED} ${ZOMA_BACK_TO_AGENT}`,
   done: true,
 });
+
+/** Whose Zoma account the link connects, shown on the confirm page so a link someone else sent cannot go unnoticed. */
+async function whoseAccount(userId: string, deps: ZomaLinkedInAdsDeps): Promise<string> {
+  let masked: string | null = null;
+  try {
+    masked = maskEmail(await deps.getUserEmail?.(userId));
+  } catch {
+    masked = null;
+  }
+  return masked ? `the Zoma account ${masked}` : 'the Zoma account that asked for this link';
+}
 
 /** GET /api/zoma/linkedin/callback — finalized server-side for the signed state's user. */
 export async function completeLinkedInAdsConnect(
@@ -161,6 +187,15 @@ export async function completeLinkedInAdsConnect(
     });
   }
 
+  if (result.listFailed) {
+    // Nothing could be read from LinkedIn: that is not "no ad account", so no create-an-account steps.
+    logZomaSetup({ userId, step: 'linkedin_callback', outcome: 'failed', reason: 'ad_account_list_failed' });
+    return failedPage(userId, deps, {
+      status: 502,
+      title: 'LinkedIn Ads not connected',
+      message: 'We could not read your LinkedIn ad accounts from LinkedIn just now, so nothing was connected. This is usually temporary. Please try again.',
+    });
+  }
   const accounts = result.adAccounts.filter(isConnectable).map((a) => ({
     account_id: String(a.id),
     name: String(a.name ?? a.id),
@@ -180,24 +215,29 @@ export async function completeLinkedInAdsConnect(
     });
   }
   logZomaSetup({ userId, step: 'linkedin_callback', outcome: 'ok', reason: `${accounts.length}_ad_accounts` });
-  if (accounts.length === 1) return connectAccounts(userId, result.tokenSessionId, accounts, deps);
 
+  // Never connect on arrival, not even for a single account. The link is a bearer link: someone could send theirs
+  // to a LinkedIn user so that the victim's ad accounts land on the sender's Zoma account. So the page always names
+  // the Zoma account being connected and waits for an explicit Connect.
   const token = deps.links.sign(
     { purpose: 'pick_linkedin_account', zoma: ZOMA_MCP_SETUP, uid: userId, tokenSessionId: result.tokenSessionId, linkedinAccounts: accounts },
     600, // the parked token session lives 10 minutes
   );
-  return picker(token, accounts);
+  return picker(token, accounts, await whoseAccount(userId, deps));
 }
 
-const PICK_MESSAGE = 'Pick the LinkedIn ad account(s) Zoma should manage. Choosing one only connects it — nothing is created or changed in it.';
+function pickMessage(who: string, extra?: string): string {
+  return `${extra ? `${extra} ` : ''}Connect your LinkedIn ad account(s) to ${who}? Only continue if that is your Zoma account: a link like this can be sent to you by someone else. Connecting only reads your accounts; nothing is created or changed in LinkedIn.`;
+}
 
-function picker(token: string, accounts: Array<{ account_id: string; name: string; currency: string }>, message = PICK_MESSAGE): BrowserStep {
+function picker(token: string, accounts: Array<{ account_id: string; name: string; currency: string }>, who: string, extra?: string): BrowserStep {
   return {
     kind: 'pick_account',
     action: ZOMA_LINKEDIN_SELECT_PATH,
     token,
     accounts: accounts.map((a) => ({ account_id: a.account_id, name: a.name, currency: a.currency })),
-    message,
+    message: pickMessage(who, extra),
+    submitLabel: 'Connect',
   };
 }
 
@@ -218,8 +258,8 @@ async function connectAccounts(
     logZomaSetup({ userId, step: 'linkedin_connect', outcome: 'rejected', reason: result.reason });
     return failedPage(userId, deps, { status: 400, title: 'LinkedIn Ads not connected', message: 'This connection expired before it finished. (If it already said "LinkedIn Ads connected", you are already done.)' });
   }
-  logZomaSetup({ userId, step: 'linkedin_connect', outcome: 'ok', reason: `${result.accounts.length}_ad_accounts` });
-  return connectedPage(result.accounts.length);
+  logZomaSetup({ userId, step: 'linkedin_connect', outcome: 'ok', reason: `${result.accounts.length}_ad_accounts${result.kept.length ? `_${result.kept.length}_kept` : ''}` });
+  return connectedPage(result.accounts.length, result.kept.length);
 }
 
 /** POST /api/zoma/linkedin/select — only accounts LinkedIn offered (carried in the signed picker link) can be chosen. */
@@ -238,6 +278,6 @@ export async function selectLinkedInAdsAccounts(
   }
   const wanted = new Set((Array.isArray(params.account_id) ? params.account_id : [params.account_id]).filter((v): v is string => typeof v === 'string'));
   const chosen = claims.linkedinAccounts.filter((a) => wanted.has(a.account_id));
-  if (chosen.length === 0) return picker(params.t as string, claims.linkedinAccounts, 'Choose at least one LinkedIn ad account.');
+  if (chosen.length === 0) return picker(params.t as string, claims.linkedinAccounts, await whoseAccount(claims.uid, deps), 'Choose at least one LinkedIn ad account.');
   return connectAccounts(claims.uid, claims.tokenSessionId, chosen, deps);
 }

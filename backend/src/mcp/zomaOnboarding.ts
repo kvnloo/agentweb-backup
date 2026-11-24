@@ -338,8 +338,9 @@ async function defaultXAdsConnectUrl(userId: string): Promise<string> {
 async function defaultLinkedInAdsConnectUrl(userId: string): Promise<string> {
   // Same pattern as Google: the state carries `zoma`, so the callback finishes on Zoma's pages for this user.
   // Consent asks only for the scopes of the current mode (read: no write scope).
-  const { buildLinkedInAdsConnectUrl, zomaLinkedInScopes } = await import('../services/linkedInAdsConnectUrl');
-  return buildLinkedInAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP }, zomaLinkedInScopes(linkedInAdsWritesEnabled()));
+  // The user's existing LinkedIn connections' scopes are asked for too, so a reconnect never narrows one.
+  const { buildZomaLinkedInConnectUrl } = await import('../services/linkedInAdsConnectUrl');
+  return buildZomaLinkedInConnectUrl(userId, linkedInAdsWritesEnabled(), { zoma: ZOMA_MCP_SETUP });
 }
 
 async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
