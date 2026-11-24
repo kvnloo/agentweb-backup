@@ -60,7 +60,8 @@ import {
  * The ceiling is keyed by currency code, because LinkedIn budgets are decimal strings in the ad
  * account's own currency: {"USD":{"maxDailyBudget":100000000,"maxChangeRatio":3},"EUR":{...}} with
  * money in MICROS of that currency, like GOOGLE_TOOLKIT_SPEND_CEILING and X_ADS_TOOLKIT_SPEND_CEILING.
- *   - unset or empty: no ceiling, exactly like GOOGLE_TOOLKIT_SPEND_CEILING (nothing new is required).
+ *   - unset or empty: the built-in default below (conservative: USD only), so nothing new is required and
+ *     full mode is never unlimited. (Google's and X's unset means no ceiling; LinkedIn's does not.)
  *   - set but not that shape (not JSON, not an object, a key that is not a 3-letter currency code, a
  *     value with no limit): fails closed. Every budget write is refused until it is fixed.
  *   - set: a budget write on an account whose currency is missing, or is not a key of the policy, is
@@ -68,8 +69,17 @@ import {
  */
 export type LinkedInSpendCeiling = { unreadable: true } | { byCurrency: Record<string, MetaSpendCeilingPolicy> };
 
+/**
+ * Built in, used when LINKEDIN_ADS_TOOLKIT_SPEND_CEILING is unset (no env var is needed for it to hold):
+ * USD only, a daily budget of at most 50.00 and a single change of at most 2x. Any other currency is
+ * refused until the env var configures it. Setting the env var REPLACES this default entirely.
+ * Units are the parser's: micros of the account currency (50 USD = 50_000_000).
+ * TO CONFIRM WITH HARSHA: both numbers and the USD-only choice.
+ */
+export const DEFAULT_LINKEDIN_SPEND_CEILING: LinkedInSpendCeiling = { byCurrency: { USD: { maxDailyBudget: 50_000_000, maxChangeRatio: 2 } } };
+
 export function linkedInSpendCeilingFromEnv(raw: string | undefined = process.env.LINKEDIN_ADS_TOOLKIT_SPEND_CEILING): LinkedInSpendCeiling | null {
-  if (!raw) return null;
+  if (!raw) return DEFAULT_LINKEDIN_SPEND_CEILING;
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -416,8 +426,19 @@ const stateOf = (kind: Kind, row: any) => {
       unitCost: money(row.unitCost), dailyBudget: money(row.dailyBudget), totalBudget: money(row.totalBudget), start: row.runSchedule?.start, end: row.runSchedule?.end,
     };
   }
-  return { id: trailingId(row.id), status: row.intendedStatus, campaign: trailingId(row.campaign) };
+  const textAd = row.content?.textAd;
+  return {
+    id: trailingId(row.id), status: row.intendedStatus, campaign: trailingId(row.campaign),
+    reference: typeof row.content?.reference === 'string' ? row.content.reference : undefined,
+    headline: textAd?.headline, description: textAd?.description, landingPage: textAd?.landingPage, image: textAd?.image,
+  };
 };
+
+/** An ISO time without the pointless .000, so the preview shows the time the caller typed. */
+const iso = (ms: number) => new Date(ms).toISOString().replace('.000Z', 'Z');
+/** One line per targeting facet, with the facet URN and every value, exactly as they will be sent. */
+const targetingLines = (label: string, clauses: Array<{ facet_urn: string; values: string[] }> | undefined): string[] =>
+  (clauses ?? []).map((c) => `${label} ${c.facet_urn}: ${c.values.join(', ')}`);
 
 const ID_ARG: Record<Kind, string> = { group: 'campaign group', campaign: 'campaign', creative: 'creative' };
 
@@ -482,30 +503,37 @@ export async function executeLinkedInAdsWrite(
   /** Daily spend this write unlocks (ACTIVATE), in micros; undefined when it cannot be bounded. */
   let unlockMicros: number | undefined;
   let unlockUnbounded: string | undefined;
+  /** Currency codes (as LinkedIn reports them) of every budget the unlock figure is made of. */
+  const unlockCurrencies: Array<string | undefined> = [];
   const isActivate = v.action === 'ACTIVATE';
   const verb = (kind: Kind) => ({ group: 'campaign group', campaign: 'campaign', creative: 'creative' })[kind];
 
   if (v.action === 'CREATE') {
     if (v.kind === 'group') {
       lines.push(`Create campaign group "${v.params.name}" as DRAFT (it cannot deliver).`);
-      lines.push(`Schedule: starts ${new Date(v.params.run_schedule_start).toISOString()}${v.params.run_schedule_end ? `, ends ${new Date(v.params.run_schedule_end).toISOString()}` : ', no end date'}.`);
+      lines.push(`Schedule: starts ${iso(v.params.run_schedule_start)}${v.params.run_schedule_end ? `, ends ${iso(v.params.run_schedule_end)}` : ', no end date'}.`);
       lines.push(`Total budget: ${money(v.totalMicros)}.`);
     } else if (v.kind === 'campaign') {
       const group = await readEntity('group', v.parent!.id);
       if (TERMINAL.includes(group.status)) throw new MetaToolkitRefusal(`Campaign group ${v.parent!.id} is ${group.status}, so no campaign can be added to it. Nothing was sent.`);
       state = { parent: stateOf('group', group) };
-      lines.push(`Create campaign "${v.params.name}" in campaign group "${group.name}" (group is ${group.status}) as DRAFT (it cannot deliver).`);
-      lines.push(`Type ${v.params.type}, objective ${v.params.objective_type}, ${v.params.cost_type} with a bid of ${money(v.unitCostMicros)}.`);
+      lines.push(`Create campaign "${v.params.name}" in campaign group "${group.name}" (id ${v.parent!.id}, group is ${group.status}) as DRAFT (it cannot deliver).`);
+      lines.push(`Type ${v.params.type}, objective ${v.params.objective_type}, cost type ${v.params.cost_type} with a bid of ${money(v.unitCostMicros)}.`);
       lines.push(`Daily budget: ${money(v.dailyMicros)}.${v.totalMicros !== undefined ? ` Total budget: ${money(v.totalMicros)}.` : ''}`);
-      lines.push(`Schedule: starts ${new Date(v.params.run_schedule_start).toISOString()}${v.params.run_schedule_end ? `, ends ${new Date(v.params.run_schedule_end).toISOString()}` : ', no end date'}.`);
+      lines.push(`Schedule: starts ${iso(v.params.run_schedule_start)}${v.params.run_schedule_end ? `, ends ${iso(v.params.run_schedule_end)}` : ', no end date'}.`);
       if (v.params.run_schedule_start < deps.now()) lines.push('The start time is already in the past: LinkedIn may refuse the campaign, and a later ACTIVATE then needs a new start_time.');
       lines.push(`Locale ${v.params.locale_country}/${v.params.locale_language}, political intent ${v.params.politicalIntent}, no LinkedIn Audience Network, no audience expansion.`);
-      lines.push(`Targeting: ${v.params.targeting_include.map((c: any) => `${c.facet_urn.split(':').pop()} (${c.values.length})`).join(', ')}${v.params.targeting_exclude ? `; excluding ${v.params.targeting_exclude.map((c: any) => c.facet_urn.split(':').pop()).join(', ')}` : ''}.`);
+      lines.push(...targetingLines('Targeting include', v.params.targeting_include), ...targetingLines('Targeting exclude', v.params.targeting_exclude));
     } else {
       const campaign = await readEntity('campaign', v.parent!.id);
       if (TERMINAL.includes(campaign.status)) throw new MetaToolkitRefusal(`Campaign ${v.parent!.id} is ${campaign.status}, so no creative can be added to it. Nothing was sent.`);
       state = { parent: stateOf('campaign', campaign) };
-      lines.push(`Create a ${v.params.post_urn ? `creative from post ${v.params.post_urn}` : `text ad "${v.params.headline}"`} in campaign "${campaign.name}" (campaign is ${campaign.status}) as DRAFT (it cannot deliver).`);
+      lines.push(`Create a creative in campaign "${campaign.name}" (id ${v.parent!.id}, campaign is ${campaign.status}) as DRAFT (it cannot deliver).`);
+      if (v.params.post_urn) lines.push(`Post: ${v.params.post_urn}`);
+      else {
+        lines.push(`Text ad headline: ${v.params.headline}`, `Text ad description: ${v.params.description}`, `Landing page: ${v.params.landing_page} (LinkedIn adds utm_source, utm_medium and utm_campaign tags to it)`);
+        if (v.params.image_urn) lines.push(`Image: ${v.params.image_urn}`);
+      }
     }
     lines.push('It is created DRAFT: nothing delivers or spends until you approve a separate ACTIVATE.');
   } else {
@@ -513,17 +541,28 @@ export async function executeLinkedInAdsWrite(
     const priorState = stateOf(v.kind, prior);
     state = { prior: priorState };
     const priorStatus = String(priorState.status);
-    const name = v.kind === 'creative' ? `creative ${v.target!.id}` : `${verb(v.kind)} "${priorState.name}"`;
+    const name = v.kind === 'creative' ? `creative ${v.target!.id}` : `${verb(v.kind)} "${priorState.name}" (id ${v.target!.id})`;
     if (v.params.status) {
       if (TERMINAL.includes(priorStatus)) throw new MetaToolkitRefusal(`The ${name} is ${priorStatus} and cannot be ${isActivate ? 'activated' : 'paused'}. Nothing was sent.`);
       if (priorStatus === v.params.status) throw new MetaToolkitRefusal(`The ${name} is already ${priorStatus}. Nothing was sent.`);
       lines.push(`${isActivate ? 'Activate' : 'Pause'} ${name}: ${priorStatus} → ${v.params.status}.`);
+      if (v.kind === 'creative') {
+        // What the user is approving to put live: the creative's own content, as LinkedIn holds it.
+        const c = priorState as any;
+        if (c.reference) lines.push(`Post: ${c.reference}`);
+        if (c.headline !== undefined) lines.push(`Text ad headline: ${c.headline}`);
+        if (c.description !== undefined) lines.push(`Text ad description: ${c.description}`);
+        if (c.landingPage !== undefined) lines.push(`Landing page: ${c.landingPage}`);
+        if (c.image !== undefined) lines.push(`Image: ${c.image}`);
+        if (!c.reference && c.headline === undefined) lines.push('LinkedIn did not describe this creative\'s content, so it cannot be shown here.');
+        if (c.campaign) lines.push(`Campaign: ${c.campaign}`);
+      }
       if (v.kind === 'campaign') {
         const cp = priorState as any;
         if (v.newStartMs !== undefined) {
           v.params.run_schedule_start = v.newStartMs;
           if (cp.end !== undefined) v.params.run_schedule_end = cp.end;
-          lines.push(`New start ${new Date(v.newStartMs).toISOString()}${cp.end !== undefined ? ` (end ${new Date(cp.end).toISOString()} kept)` : ''}.`);
+          lines.push(`New start ${iso(v.newStartMs)}${cp.end !== undefined ? ` (end ${iso(cp.end)} kept)` : ''}.`);
           v.expect.push(...(cp.end !== undefined ? [{ path: 'runSchedule.end', value: Number(cp.end), as: 'number' as const }] : []));
         } else if (typeof cp.start === 'number' && cp.start < deps.now() && priorStatus === 'DRAFT') {
           lines.push('Its stored start time has passed: LinkedIn refuses any change to a campaign in that state unless start_time is passed too.');
@@ -532,6 +571,7 @@ export async function executeLinkedInAdsWrite(
       if (isActivate) {
         if (v.kind === 'campaign') {
           unlockMicros = amountToMicros((priorState as any).dailyBudget?.amount);
+          if ((priorState as any).dailyBudget) unlockCurrencies.push((priorState as any).dailyBudget.currency);
           lines.push(unlockMicros === undefined
             ? 'It has no daily budget (lifetime budget only), so its daily spend cannot be bounded.'
             : `It will start delivering and can spend up to ${money(unlockMicros)}/day.`);
@@ -547,8 +587,10 @@ export async function executeLinkedInAdsWrite(
           const live = campaigns.filter((c) => c?.status === 'ACTIVE');
           state = { ...state, campaigns: campaigns.map((c) => ({ id: trailingId(c?.id), status: c?.status, daily: c?.dailyBudget?.amount === undefined ? undefined : String(c.dailyBudget.amount) })) };
           const unbounded = live.filter((c) => amountToMicros(c?.dailyBudget?.amount) === undefined);
+          unlockCurrencies.push(...live.filter((c) => c?.dailyBudget).map((c) => c.dailyBudget.currencyCode));
           unlockMicros = unbounded.length ? undefined : live.reduce((sum, c) => sum + (amountToMicros(c.dailyBudget.amount) as number), 0);
           if (unbounded.length) unlockUnbounded = `${unbounded.length} ACTIVE campaign(s) in it have no daily budget (${unbounded.map((c) => trailingId(c?.id)).join(', ')}), so the daily spend cannot be bounded.`;
+          for (const c of campaigns.slice(0, 20)) lines.push(`Campaign ${trailingId(c?.id)} "${c?.name ?? ''}": ${c?.status}, daily budget ${moneyOf(c?.dailyBudget)}`);
           lines.push(live.length
             ? `Its ${live.length} ACTIVE campaign(s) can start delivering${unlockMicros === undefined ? '' : ` and can spend up to ${money(unlockMicros)}/day together`}; DRAFT or PAUSED ones spend only after their own ACTIVATE.`
             : 'It has no ACTIVE campaigns, so nothing delivers until a campaign in it is activated.');
@@ -558,6 +600,7 @@ export async function executeLinkedInAdsWrite(
           const campaign = await readEntity('campaign', campaignId);
           state = { ...state, campaign: stateOf('campaign', campaign) };
           unlockMicros = amountToMicros(campaign.dailyBudget?.amount);
+          if (campaign.dailyBudget) unlockCurrencies.push(campaign.dailyBudget.currencyCode);
           if (unlockMicros === undefined) unlockUnbounded = 'Its campaign has no daily budget, so its daily spend cannot be bounded.';
           lines.push(`It can serve in campaign "${campaign.name}" (now ${campaign.status}), which spends up to ${money(unlockMicros)}/day.`);
         }
@@ -565,6 +608,7 @@ export async function executeLinkedInAdsWrite(
     } else {
       if (TERMINAL.includes(priorStatus)) throw new MetaToolkitRefusal(`The ${name} is ${priorStatus} and cannot be edited. Nothing was sent.`);
       const p = priorState as any;
+      lines.push(`Change ${name}.`);
       if (v.params.name !== undefined) lines.push(`Rename ${name} → "${v.params.name}".`);
       if (v.params.daily_budget_amount !== undefined) lines.push(`Daily budget: ${moneyOf(p.dailyBudget)} → ${v.params.daily_budget_amount} ${cur}.`);
       if (v.params.total_budget_amount !== undefined) lines.push(`Total budget: ${moneyOf(p.totalBudget)} → ${v.params.total_budget_amount} ${cur}.`);
@@ -574,7 +618,7 @@ export async function executeLinkedInAdsWrite(
         const end = v.newEndMs ?? (typeof p.end === 'number' ? p.end : undefined);
         v.params.run_schedule_start = v.newStartMs;
         if (end !== undefined) { v.params.run_schedule_end = end; v.expect.push({ path: 'runSchedule.end', value: end, as: 'number' }); }
-        lines.push(`Schedule: starts ${new Date(v.newStartMs).toISOString()}${end !== undefined ? `, ends ${new Date(end).toISOString()}` : ', no end date'}.`);
+        lines.push(`Schedule: starts ${iso(v.newStartMs)}${end !== undefined ? `, ends ${iso(end)}` : ', no end date'}.`);
       }
       lines.push(`Status stays ${priorStatus}.`);
       if (priorStatus === 'ACTIVE' && (v.dailyMicros !== undefined || v.totalMicros !== undefined)) lines.push('It is ACTIVE, so the new budget applies to live delivery.');
@@ -589,6 +633,19 @@ export async function executeLinkedInAdsWrite(
     if (policy) {
       const priorDaily = amountToMicros(((state.prior as any)?.dailyBudget)?.amount);
       const priorTotal = amountToMicros(((state.prior as any)?.totalBudget)?.amount);
+      // The ceiling is in the account's own currency. A budget LinkedIn reports in another currency (or none) would be
+      // compared as if it were the same money, so the write is refused instead.
+      const compared = [
+        ...(isActivate ? unlockCurrencies : []),
+        ...(v.dailyMicros !== undefined && priorDaily !== undefined ? [((state.prior as any)?.dailyBudget)?.currency] : []),
+        ...(v.totalMicros !== undefined && priorTotal !== undefined ? [((state.prior as any)?.totalBudget)?.currency] : []),
+      ];
+      const bad = compared.find((currency) => !currency || String(currency).toUpperCase() !== cur);
+      if (compared.some((currency) => !currency || String(currency).toUpperCase() !== cur)) {
+        throw new MetaToolkitRefusal(
+          `A budget this change depends on is in ${bad ? String(bad) : 'an unknown currency'}, but this ad account's currency is ${cur}, so it cannot be checked against the spend ceiling. Nothing was sent.`,
+        );
+      }
       const checks: Array<{ label: string; field: 'daily_budget' | 'lifetime_budget'; proposed: unknown; prior?: unknown }> = [];
       if (v.dailyMicros !== undefined) checks.push({ label: '', field: 'daily_budget', proposed: v.dailyMicros, prior: priorDaily });
       if (v.totalMicros !== undefined) checks.push({ label: '', field: 'lifetime_budget', proposed: v.totalMicros, prior: priorTotal });
