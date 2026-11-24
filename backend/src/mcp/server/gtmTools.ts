@@ -17,10 +17,10 @@
  *    exactly YYYY-MM-DD (the report emails split it on "-") or empty to clear; a contact (`dri`) is an email address or empty to clear;
  *  - `add_work_items` takes up to 20 items and sends them one after the other through the single-item route. A failure says which items
  *    were added and which were not tried; nothing is rolled back (the same as adding them one by one in the portal);
- *  - nothing here emails anyone. `send_status_report` is not an action (it answered "sent" while sending nothing; the routes now report
- *    what was sent, but they put the caller's text into the HTML of a system email unescaped, so an outside agent's key must not drive them
- *    yet), and `update_work_item` takes no `notify_*` flags (the old tool forwarded a guessed `notifications` object to the route). Both
- *    are refused by name with that reason. Enabling them is a decision: escape the report templates first (services/gtmPlanNotificationService.ts).
+ *  - nothing here emails anyone. `send_status_report` is not an action (it answered "sent" while sending nothing), and `update_work_item`
+ *    takes no `notify_*` flags (the old tool forwarded a guessed `notifications` object to the route). Both are refused by name, and the
+ *    refusal says where emailing lives: `send_gtm_status_report` (gtmEmailTool.ts), a separate tool behind the opt-in `gtm:email` key scope
+ *    with its own limits. The report templates escape caller text (W2-4), so what held emailing back is now handled there.
  *
  * A plan's status and a phase's status follow their work items (complete when everything under them is), so they cannot be set here.
  *
@@ -50,7 +50,7 @@ function fail(tool: string, message: string): never {
 }
 
 /** An id as an agent may send it: text, no whitespace or control characters, at most 200 characters. */
-function idArg(tool: string, field: string, value: unknown): string {
+export function idArg(tool: string, field: string, value: unknown): string {
   if (typeof value !== 'string' || value.length === 0) fail(tool, `${field} is required and must be text.`);
   if ((value as string).length > 200 || /[\s\u0000-\u001f\u007f-\u009f]/.test(value as string)) {
     fail(tool, `${field} is not a valid id. Use an id returned by manage_gtm_plan get or list_gtm_plans.`);
@@ -188,7 +188,7 @@ const ITEM_ACTIONS = [
 ] as const;
 
 /** What an outside agent may not make this tool do, and why. Named, so the refusal teaches instead of saying "not an input". */
-const EMAIL_REFUSAL = 'emailing people is not available over MCP: the status report and the update notifications send email from AgentWeb to the addresses on the plan. Use the GTM plan page in the portal.';
+const EMAIL_REFUSAL = 'emailing people is not available over MCP through manage_gtm_items: the status report and the update notifications send email from AgentWeb to the addresses on the plan. To email a status report use send_gtm_status_report (it needs an API key with the gtm:email scope); to tell people about an update, update the item and then send a report.';
 const EMAIL_INPUTS = ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc', 'notify_phase_pocs', 'notification_message', 'notifications', 'message'] as const;
 type ItemAction = (typeof ITEM_ACTIONS)[number];
 
@@ -373,7 +373,7 @@ mcpToolRegistry.register({
       + `add_work_items: plan_id, phase_id, work_items (1 to ${GTM_MAX_BATCH_ITEMS} objects, each with title and optionally description, dri, due_date); they are added one after the other. `
       + 'update_work_item: plan_id, phase_id, work_item_id and at least one of title, description, status (pending, in_progress, completed, skipped), notes, dri, due_date. '
       + 'delete_work_item: plan_id, phase_id, work_item_id. get_common_items: nothing (a plan_id is accepted and ignored). add_common_items: plan_id, items (up to 50, from get_common_items: each a title and optionally a description), and exactly one of target_phase_id or new_phase_name. '
-      + 'Nothing here emails anyone: status reports and update notifications are sent from the portal. '
+      + 'Nothing here emails anyone: to email a status report use send_gtm_status_report (it needs an API key with the gtm:email scope). '
       + 'Dates are YYYY-MM-DD; dri is an email address; an empty string (or null) clears description, notes, dri or due_date. A phase\'s and a plan\'s status follow their work items and cannot be set.',
     inputSchema: {
       type: 'object',
