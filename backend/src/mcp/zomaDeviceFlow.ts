@@ -363,7 +363,7 @@ export type BrowserStep =
       /** ENG-3128: ordered instructions (the new-to-ads setup guide) and a label for the retry link. */
       steps?: readonly string[]; retryLabel?: string;
     }
-  | { kind: 'pick_account'; action: string; token: string; accounts: ZomaPickerAccount[]; message?: string }
+  | { kind: 'pick_account'; action: string; token: string; accounts: ZomaPickerAccount[]; message?: string; /** Button text; the shared page says "Continue" when absent. */ submitLabel?: string }
   | {
       kind: 'ask_ads_experience'; action: string; token: string; question: string;
       options: ReadonlyArray<{ value: ZomaAdsExperience; label: string }>; message?: string;
