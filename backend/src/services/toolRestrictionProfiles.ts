@@ -323,6 +323,18 @@ export function isServerSideBrowserCodeTool(toolName: string): boolean {
   return typeof toolName === 'string' && /(^|_)browser_run_code$/.test(toolName);
 }
 
+/**
+ * ENG-3170: the Playwright tools that take a `filename` (evaluate, snapshot, screenshot, console, network, pdf, video...) write the result to that path, and
+ * `browser_file_upload` takes `paths` and sends those files to the page. The browser server runs in the backend's own working directory (no `cwd` is set) and
+ * Playwright allows anything under it, so a call that sets one is reading or overwriting the deployed backend's files (a restart then runs what was written).
+ * A visitor who may not run the sensitive tools may not set either; the same call without them (the result comes back in the chat) is unaffected. Pure.
+ */
+export function browserCallTouchesServerFiles(args?: unknown): boolean {
+  if (!args || typeof args !== 'object') return false;
+  const record = args as Record<string, unknown>;
+  return isSet(record.filename) || isSet(record.paths);
+}
+
 /** True for a tool that is sensitive whatever its arguments (the whole-tool list). A tool judged by an argument is not: it needs the call. */
 export function isSensitiveWholeTool(toolName: string): boolean {
   return typeof toolName === 'string' && (SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName) || SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS.has(toolName));

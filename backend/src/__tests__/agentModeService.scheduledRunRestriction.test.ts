@@ -405,6 +405,18 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
     const BROWSER = 'playwright_browser_navigate'; // (browser_run_code runs the caller's code on the server: a visitor-made schedule is refused it, see below)
     const RUN_CODE = 'playwright_browser_run_code';
 
+    it('in a run of a MARKED schedule the refusal says "adopt the schedule" (not the link settings), and a caller cannot claim its call is nested', async () => {
+      marked();
+      const inSession = (sessionId: string, tool: string, args: unknown, ctx: Record<string, unknown> = {}) =>
+        (service as any).executeTool('gpt-4', tool, args, 'owner-user-id', sessionId, false, { isUnattendedRun: true, ...ctx });
+      await expect(inSession('sched-a', 'playwright_browser_run_code', { code: 'x' })).rejects.toMatchObject({ message: expect.stringContaining('adopt the schedule') });
+      await expect(inSession('sched-b', 'playwright_browser_evaluate', { function: '() => 1', filename: 'dist/server.js' })).rejects.toMatchObject({ message: expect.stringContaining('adopt the schedule') });
+      // a context that CLAIMS its call is nested does not make it so
+      await expect(inSession('sched-c', 'playwright_browser_run_code', { code: 'x' }, { nestedInRestrictedCall: true })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      // the same call without a file runs (in the schedule's own browser)
+      await expect(inSession('sched-d', 'playwright_browser_evaluate', { function: '() => 1' })).resolves.toEqual({ ran: true });
+    });
+
     it('a run of a MARKED schedule may not call the tool that runs the caller\'s code on the server; the owner\'s own schedule may; an unreadable schedule may not', async () => {
       // one session per case: the answer to "is this schedule marked" is kept for a minute per session
       const inSession = (sessionId: string) => (service as any).executeTool('gpt-4', RUN_CODE, { code: 'x' }, 'owner-user-id', sessionId, false, { isUnattendedRun: true });

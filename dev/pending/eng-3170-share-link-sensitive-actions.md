@@ -233,3 +233,15 @@ restricted call is on the stack (`nestedInRestrictedCall`, set in `executeTool` 
 owner has it. `browser_evaluate` runs inside the page and is not affected (the sandbox-account policy of ENG-1907 already denies the whole browser class, `browser_run_code` included).
 NOT fixed here, and not a ticket I opened: the tool is still callable by any signed-in customer in their own chat, and the browser process still inherits the backend's environment.
 That is a platform security issue for Harsha and Yugo (start the browser server with a scrubbed environment, isolate it, and treat the tool as running arbitrary code).
+
+## Eighth final-review round (2026-11-24, on 7ff64bd5f): browser calls that name a file on the server
+Both reviews gave NO BLOCKER on 7ff64bd5f. They agreed on one cheap, complete fix: the Playwright tools that take a `filename` (evaluate, snapshot, screenshot, console, network,
+pdf, video) write their result to that path, and `browser_file_upload` takes `paths` and sends those files to the page, while the browser server runs in the backend's own working
+directory (no `cwd` is set) and Playwright allows anything under it. A visitor who may not run the sensitive tools may no longer set either on a direct browser call
+(`browserCallTouchesServerFiles`; the same call without them, whose result comes back in the chat, is unaffected; nested calls, ON and legacy links and the owner are unaffected).
+Also: in a run of a schedule a visitor wrote the refusal says "adopt the schedule" (not the link settings), and `nestedInRestrictedCall` is dropped from a caller's context when
+there is no profile (it is only ever set from the call stack).
+Reported, NOT fixed here (platform items for Harsha and Yugo, equally reachable by any signed-in customer): the browser server process inherits the backend's environment and its working
+directory, so `browser_run_code` (now closed for visitors) and the file parameters are reachable by customers; the browser can navigate to the cloud metadata address (nothing
+blocks it, `ssrfGuard` is not applied to browser tools; whether it yields credentials depends on the instance's metadata settings, not verified); screenshots and downloads share one
+output folder. The fix is on the infrastructure side: start the browser server with a scrubbed environment, an empty working directory of its own per pool, and no route to the metadata address.

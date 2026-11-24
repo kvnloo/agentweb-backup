@@ -568,6 +568,31 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
         await expect(run('playwright_browser_run_code', VISITOR, { code: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
       });
 
+      describe('a direct browser call that names a file on the server (the browser server runs in the backend\'s own directory)', () => {
+        it.each([
+          ['playwright_browser_evaluate', { function: '() => 1', filename: 'dist/server.js' }],
+          ['playwright_browser_take_screenshot', { filename: 'package.json' }],
+          ['playwright_browser_snapshot', { filename: 'x.md' }],
+          ['playwright_browser_file_upload', { paths: ['/etc/hostname'] }],
+        ])('OFF link: %s with %j is refused; the same call without the file runs', async (tool, withFile) => {
+          readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+          await expect(run(tool, VISITOR, withFile)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+          expect(dispatch).not.toHaveBeenCalled();
+          const { filename: _f, paths: _p, ...without } = withFile as any;
+          await expect(run(tool, VISITOR, without)).resolves.toEqual({ ran: true });
+          await expect(run(tool, VISITOR, { ...without, filename: '' })).resolves.toEqual({ ran: true });
+        });
+
+        it('a link that allows the sensitive tools, and the owner, keep it; a link that cannot be read does not', async () => {
+          readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+          await expect(run('playwright_browser_evaluate', VISITOR, { function: '() => 1', filename: 'x.json' })).resolves.toEqual({ ran: true });
+          readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+          await expect(run('playwright_browser_evaluate', undefined, { function: '() => 1', filename: 'x.json' })).resolves.toEqual({ ran: true });
+          readSession.mockRejectedValue(new Error('throttled'));
+          await expect(run('playwright_browser_evaluate', VISITOR, { function: '() => 1', filename: 'x.json' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        });
+      });
+
       it('ON link, a legacy dialog link and the owner keep it', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
         await expect(run('playwright_browser_run_code', VISITOR, { code: 'x' })).resolves.toEqual({ ran: true });
