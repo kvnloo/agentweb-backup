@@ -12,7 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -1303,14 +1303,20 @@ export class AgentModeService {
    * visitor who may not use the owner's logins, the session's browser is released (a fresh one starts with no logins), and the owner's cookies are
    * loaded again the next time the owner drives it. A visitor whose history is unknown in this process is treated as a switch.
    */
-  private async separateBrowserBetweenActors(sessionId: string, actor: 'owner' | 'visitor'): Promise<void> {
+  private async separateBrowserBetweenActors(sessionId: string, actor: 'owner' | 'visitor'): Promise<boolean> {
     const last = this.browserActorBySession.get(sessionId);
     if (last !== actor && (last !== undefined || actor === 'visitor')) {
+      // FORCED: a call the other person left running on the session's browser (a timed-out request keeps running; a visitor can also end their own turn)
+      // must not survive the hand-over, or it keeps controlling a browser the new person logs in. If the browser could not be released, nothing is
+      // recorded and the step is not run: the caller answers with an error and the next call tries again.
+      let released = false;
       try {
-        await this.mcpClientService.releaseSessionClients(sessionId);
+        const result = await this.mcpClientService.releaseSessionClients(sessionId, { force: true });
+        released = !result || result.skippedInFlight === 0;
       } catch (releaseError) {
         console.warn(`AgentMode ENG-3170: could not release the browser of session ${sessionId} between the owner and a visitor:`, releaseError);
       }
+      if (!released) return false;
       this.browserCookieAutoState.sessions.delete(sessionId);
     }
     this.browserActorBySession.delete(sessionId);
@@ -1320,6 +1326,7 @@ export class AgentModeService {
       if (oldest === undefined) break;
       this.browserActorBySession.delete(oldest);
     }
+    return true;
   }
   // ENG-2103 (F2): driveServiceAccountEmail moved to a module-level singleton
   // in emma/impl/shared/googleDriveAccess.ts (the same "pure cache" treatment
@@ -10164,6 +10171,34 @@ export class AgentModeService {
     args?: unknown,
     nameOnly: boolean = false,
   ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
+    // ENG-3170: a browser step of an unattended run asks whether its schedule is marked; a run makes many such steps, so a settled answer is kept for a
+    // minute (an unreadable schedule is never kept). Only the browser question is kept: the schedule-write and sensitive-call questions are asked every time.
+    const browserQuestion = extraContext?.isUnattendedRun === true && isBrowserAutomationTool(toolName) && !SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    if (browserQuestion && sessionId) {
+      const kept = this.browserProvenanceAnswers.get(sessionId);
+      if (kept && kept.until > Date.now()) return kept.answer;
+    }
+    const answer = await this.scheduledRunRestrictionRead(toolName, sessionId, extraContext, args, nameOnly);
+    if (browserQuestion && sessionId && !answer.unsettled && answer.refusal === null) {
+      this.browserProvenanceAnswers.set(sessionId, { until: Date.now() + 60_000, answer });
+      while (this.browserProvenanceAnswers.size > 500) {
+        const oldest = this.browserProvenanceAnswers.keys().next().value;
+        if (oldest === undefined) break;
+        this.browserProvenanceAnswers.delete(oldest);
+      }
+    }
+    return answer;
+  }
+
+  private browserProvenanceAnswers = new Map<string, { until: number; answer: { refusal: string | null; profile?: RestrictionProfileId } }>();
+
+  private async scheduledRunRestrictionRead(
+    toolName: string,
+    sessionId: string,
+    extraContext?: Record<string, any>,
+    args?: unknown,
+    nameOnly: boolean = false,
+  ): Promise<{ refusal: string | null; profile?: RestrictionProfileId; unsettled?: boolean }> {
     const unrestricted = { refusal: null };
     if (!sessionId) return unrestricted;
     // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
@@ -10179,7 +10214,7 @@ export class AgentModeService {
     const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
     // What "could not be verified" means for THIS caller: refused if it is an unattended run, otherwise left alone.
     const browserOnly = browserOfUnattendedRun && !refusedByProfile && !SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
-    const withoutOwnerLogins = { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE as RestrictionProfileId };
+    const withoutOwnerLogins = { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE as RestrictionProfileId, unsettled: true };
     const whenUnverifiable = extraContext?.isUnattendedRun === true ? (browserOnly ? withoutOwnerLogins : unverifiable) : unrestricted;
 
     let session: any;
@@ -10233,6 +10268,22 @@ export class AgentModeService {
       return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) };
     }
     return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
+  }
+
+  /** ENG-3170: does this schedule email results to anyone (the recipients stored on it)? Consistent read, one retry; a schedule that cannot be read counts as yes. A schedule that is not there counts as no (the tool answers not found). */
+  private async scheduleEmailsOthers(scheduleId: string): Promise<boolean> {
+    let schedule: any;
+    try {
+      schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+    } catch (firstError) {
+      try {
+        schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      } catch (retryError) {
+        console.error(`AgentMode ENG-3170: could not read schedule ${scheduleId} to see who it emails; refusing the edit:`, retryError);
+        return true;
+      }
+    }
+    return Array.isArray(schedule?.emailNotifications) && schedule.emailNotifications.length > 0;
   }
 
   /**
@@ -10352,6 +10403,16 @@ export class AgentModeService {
         if (scheduledByArgument.refusal) throw new ToolRestrictionDenied(scheduledByArgument.refusal);
       }
     }
+    // ENG-3170: a visitor rewriting the prompt, keywords or variables of one of the owner's schedules that already emails OTHER people would have AgentWeb
+    // send their text to those people (the visitor mark limits the tools a run may use, not who receives its output). Only on a link that may not run the
+    // sensitive tools; a schedule that emails nobody else stays editable. An unreadable schedule refuses.
+    if (isShareVisitor) {
+      const editedScheduleId = scheduleContentEditTarget(toolName, preparedArgs);
+      if (editedScheduleId && !(await this.readShareLinkControl(toolName, sessionId)).sensitive && await this.scheduleEmailsOthers(editedScheduleId)) {
+        console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: schedule ${editedScheduleId} emails other people and the link has not been given full control.`);
+        throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+      }
+    }
     const policyDecision = evaluateAgentToolPolicy({
       toolName,
       args: preparedArgs,
@@ -10404,7 +10465,12 @@ export class AgentModeService {
         const visitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
         const visitorCall = isShareVisitor || visitorSchedule || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
         const borrowOwnerLogins = !visitorCall || (!visitorSchedule && await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false));
-        await this.separateBrowserBetweenActors(sessionId, borrowOwnerLogins ? 'owner' : 'visitor');
+        if (!(await this.separateBrowserBetweenActors(sessionId, borrowOwnerLogins ? 'owner' : 'visitor'))) {
+          return {
+            success: false,
+            error: 'This chat\'s browser could not be reset just now (it is shared between the account owner and people using a shared link, and a step of the other person is still running). The step was not run and nothing was done. Please try again in a moment.',
+          };
+        }
         if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
         const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
         const toolFailed = result && (result as any).success === false;

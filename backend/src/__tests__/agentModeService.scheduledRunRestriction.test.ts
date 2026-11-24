@@ -429,6 +429,33 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       expect(loads()).toBeGreaterThan(0);
     });
 
+    it('a run makes many browser steps: the schedule is read ONCE for them (a settled answer is kept for a minute)', async () => {
+      scheduleWith(undefined);
+      for (let i = 0; i < 5; i++) await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      expect(getSchedule).toHaveBeenCalledTimes(1);
+      expect(loads()).toBeGreaterThan(0);
+    });
+
+    it('an answer that could not be settled (the schedule could not be read) is NOT kept: the next browser step asks again', async () => {
+      getSchedule.mockRejectedValue(new Error('throttled'));
+      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      const afterFirst = getSchedule.mock.calls.length;
+      getSchedule.mockReset().mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id' } as any);
+      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      expect(afterFirst).toBe(2);
+      expect(getSchedule).toHaveBeenCalledTimes(1);
+      expect(loads()).toBeGreaterThan(0);
+    });
+
+    it('the kept answer is per session: another run asks for itself, and a schedule-write or sensitive call is never answered from it', async () => {
+      scheduleWith(undefined);
+      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      marked();
+      await (service as any).executeTool('gpt-4', BROWSER, { code: 'x' }, 'owner-user-id', 'other-run-session', false, { isUnattendedRun: true });
+      expect(dispatch.mock.calls.filter((c) => c[0] === BROWSER).map((c) => c[2].restrictionProfile)).toEqual([undefined, 'share_visitor_schedule']);
+      await expect(runWith('slack_send_message', { isUnattendedRun: true }, { text: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+    });
+
     it('Meta: a MARKED schedule may read the ad account but not write to it (an unattended write is staged for an approver who is not the owner)', async () => {
       marked();
       const meta = (action: string) => runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action }));

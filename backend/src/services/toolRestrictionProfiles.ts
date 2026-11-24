@@ -207,7 +207,12 @@ export type SensitiveByArgument =
        */
       forbidWhenSet?: Readonly<Record<string, readonly string[]>>;
     }
-  | { kind: 'present'; arguments: readonly string[] };
+  | {
+      kind: 'present';
+      arguments: readonly string[];
+      /** Arguments whose mere PRESENCE counts (even an empty list): `attendees: []` on an update removes every attendee of the owner's meeting. */
+      keyExists?: readonly string[];
+    };
 
 const READ_PREFIXES: readonly string[] = ['get', 'list', 'search'];
 
@@ -243,7 +248,7 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   // setting a lead to do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
   set_lead_contact_status: { kind: 'action', argument: 'contact_status', allowedValues: ['do-not-contact', 'unsubscribed'] },
   google_calendar_create_event: { kind: 'present', arguments: ['attendees'] },
-  google_calendar_update_event: { kind: 'present', arguments: ['attendees'] },
+  google_calendar_update_event: { kind: 'present', arguments: ['attendees'], keyExists: ['attendees'] },
   // `dri` is an email address: every later status report and update notice of the plan goes to it, so a visitor naming an address makes the owner's next report reach it
   update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc', 'dri'] },
   update_gtm_plan: { kind: 'present', arguments: ['dri'] },
@@ -283,6 +288,19 @@ export function isSensitiveInVisitorScheduleCall(toolName: string, args?: unknow
   return true;
 }
 
+/**
+ * The schedule a call EDITS the content of, or null. A schedule's results are emailed by AgentWeb to the recipients stored on it, and the visitor mark only
+ * limits the tools a run may use, not who receives its output: so a visitor rewriting the prompt, keywords or variables of one of the owner's schedules that
+ * already emails other people would have AgentWeb send their text to those people. `executeTool` refuses such an edit on a link that may not run the sensitive
+ * tools (a schedule with no recipients but the owner's own results stays editable, as before).
+ */
+export function scheduleContentEditTarget(toolName: string, args?: unknown): string | null {
+  if (toolName !== 'manage_scheduled_chat' && toolName !== 'submit_scheduled_chat_variables') return null;
+  const record = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  if (toolName === 'manage_scheduled_chat' && (typeof record.action !== 'string' || normaliseActionValue(record.action) !== 'update')) return null;
+  return typeof record.schedule_id === 'string' && record.schedule_id.trim() ? record.schedule_id.trim() : null;
+}
+
 function normaliseActionValue(value: string): string {
   return value.trim().toLowerCase().replace(/_/g, '-');
 }
@@ -317,7 +335,10 @@ export function isSensitiveToolCall(toolName: string, args?: unknown): boolean {
   if (!Object.prototype.hasOwnProperty.call(SHARE_VISITOR_SENSITIVE_BY_ARGUMENT, toolName)) return false;
   const rule = SHARE_VISITOR_SENSITIVE_BY_ARGUMENT[toolName];
   const record = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
-  if (rule.kind === 'present') return rule.arguments.some((name) => isSet(record[name]));
+  if (rule.kind === 'present') {
+    return rule.arguments.some((name) => isSet(record[name]))
+      || (rule.keyExists ?? []).some((name) => Object.prototype.hasOwnProperty.call(record, name) && record[name] !== undefined);
+  }
   const raw = record[rule.argument];
   if (typeof raw !== 'string') return true;
   const value = normaliseActionValue(raw);

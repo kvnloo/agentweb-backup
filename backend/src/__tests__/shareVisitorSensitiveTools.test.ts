@@ -8,7 +8,7 @@ import {
   restrictionRefusal,
   sensitiveActionRefusal,
   sensitiveActionScheduleRefusal,
-  sensitiveActionUnverifiableRefusal, SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS, SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, isSensitiveInVisitorScheduleCall } from '../services/toolRestrictionProfiles';
+  sensitiveActionUnverifiableRefusal, SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS, SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget } from '../services/toolRestrictionProfiles';
 import { AgentModeService, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
 
 /**
@@ -213,10 +213,35 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
     });
   });
 
+  describe('a calendar update that names attendees, even an EMPTY list, is sensitive (an empty list removes every attendee of the owner\'s meeting)', () => {
+    it.each([[['a@example.com']], [[]], [''], [null]])('attendees %p', (attendees) => {
+      expect(isSensitiveToolCall('google_calendar_update_event', { event_id: 'e', attendees })).toBe(true);
+    });
+    it('and not when the key is absent or undefined; a create with an empty list reaches nobody', () => {
+      expect(isSensitiveToolCall('google_calendar_update_event', { event_id: 'e', summary: 's' })).toBe(false);
+      expect(isSensitiveToolCall('google_calendar_update_event', { event_id: 'e', attendees: undefined })).toBe(false);
+      expect(isSensitiveToolCall('google_calendar_create_event', { summary: 's', attendees: [] })).toBe(false);
+    });
+  });
+
+  describe('the schedule a call edits the content of (a schedule that emails other people may not be edited from an OFF link)', () => {
+    it('is the schedule_id of an update, and of a variables submission', () => {
+      expect(scheduleContentEditTarget('manage_scheduled_chat', { action: 'update', schedule_id: ' s1 ' })).toBe('s1');
+      expect(scheduleContentEditTarget('manage_scheduled_chat', { action: ' UPDATE ', schedule_id: 's1' })).toBe('s1');
+      expect(scheduleContentEditTarget('submit_scheduled_chat_variables', { schedule_id: 's1', variable_values: {} })).toBe('s1');
+    });
+    it('is none for a create, a toggle, a delete, another tool, or no schedule_id', () => {
+      for (const action of ['create', 'toggle', 'delete', undefined, 7]) expect(scheduleContentEditTarget('manage_scheduled_chat', { action, schedule_id: 's1' })).toBeNull();
+      expect(scheduleContentEditTarget('manage_scheduled_chat', { action: 'update' })).toBeNull();
+      expect(scheduleContentEditTarget('manage_scheduled_chat', { action: 'update', schedule_id: '  ' })).toBeNull();
+      expect(scheduleContentEditTarget('get_leads', { action: 'update', schedule_id: 's1' })).toBeNull();
+      expect(scheduleContentEditTarget('manage_scheduled_chat', undefined)).toBeNull();
+    });
+  });
+
   describe('a tool that reaches someone only when an argument is set', () => {
     it.each([
       ['google_calendar_create_event', 'attendees', ['a@example.com'], []],
-      ['google_calendar_update_event', 'attendees', ['a@example.com'], []],
       ['update_gtm_work_item', 'notify_user', true, false],
       ['update_gtm_work_item', 'notify_item_poc', true, false],
       ['update_gtm_work_item', 'notify_phase_poc', true, false],
