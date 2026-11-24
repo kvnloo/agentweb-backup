@@ -517,6 +517,73 @@ describe('GTM Plan Notification Service', () => {
     });
   });
 
+  // ENG-2840 PR B: an outside agent's key may email at most 10 people in one call. The cap is checked after the recipients are resolved and
+  // before anything is sent, so it is a promise about the whole report and never a partial send.
+  describe('The recipient cap (maxRecipients)', () => {
+    const wide: any = {
+      planId: 'plan-w', userId: 'user-1', title: 'Wide Plan', status: 'in_progress', dri: 'plan-poc@example.com',
+      phases: Array.from({ length: 12 }, (_, i) => ({ id: `phase-${i}`, title: `P${i}`, dri: `poc${i}@example.com`, status: 'in_progress', workItems: [] })),
+    };
+
+    beforeEach(() => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockReset().mockResolvedValue({ id: 'email-1' });
+      mockUserDb.getUserById.mockReset().mockResolvedValue({ userId: 'user-1', email: 'owner@example.com' } as any);
+    });
+
+    it('sends nothing and says why when a plan report would reach more people than the cap', async () => {
+      // plan contact + 12 phase contacts + the owner = 14 distinct people
+      const result = await sendPlanStatusReport(wide, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 10 });
+      expect(result).toEqual({ recipients: 14, sent: 0, failed: 0, overCap: 10 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('sends the whole report when it reaches exactly the cap, and when it is under it', async () => {
+      const atCap = await sendPlanStatusReport(wide, { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 13 }); // 1 + 12
+      expect(atCap).toEqual({ recipients: 13, sent: 13, failed: 0 });
+      expect(atCap.overCap).toBeUndefined();
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(13);
+
+      (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+      const under = await sendPlanStatusReport(wide, { notifyPlanPoc: true, maxRecipients: 10 });
+      expect(under).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('counts distinct people, not addresses written: a duplicate address is one person', async () => {
+      const dup: any = { ...wide, phases: wide.phases.map((p: any) => ({ ...p, dri: 'same@example.com' })) };
+      const result = await sendPlanStatusReport(dup, { notifyPhasePocs: true, maxRecipients: 1 });
+      expect(result).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('applies to a phase report too', async () => {
+      const phasePlan: any = { ...wide, phases: [{ id: 'phase-a', title: 'A', dri: 'a@example.com', status: 'in_progress', workItems: [] }] };
+      const over = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 2 }); // 3 people
+      expect(over).toEqual({ recipients: 3, sent: 0, failed: 0, overCap: 2 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+
+      const ok = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 3 });
+      expect(ok).toEqual({ recipients: 3, sent: 3, failed: 0 });
+    });
+
+    it('a cap of 0 refuses every report that has a recipient', async () => {
+      const result = await sendPlanStatusReport(wide, { notifyPlanPoc: true, maxRecipients: 0 });
+      expect(result).toEqual({ recipients: 1, sent: 0, failed: 0, overCap: 0 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('no cap, or a value that is not a usable cap, is no cap (the portal and Emma set none)', async () => {
+      for (const cap of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -1, '2', '', true, {}]) {
+        (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+        const result = await sendPlanStatusReport(wide, { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: cap as any });
+        expect(result).toEqual({ recipients: 13, sent: 13, failed: 0 });
+      }
+    });
+
+    it('a report to nobody is still "nobody" (recipients 0), not over any cap', async () => {
+      const result = await sendPlanStatusReport({ ...wide, dri: undefined }, { notifyPlanPoc: true, maxRecipients: 0 });
+      expect(result).toEqual({ recipients: 0, sent: 0, failed: 0 });
+    });
+  });
+
   // ENG-2840 PR A: automated mail can wait a few seconds, so the GTM emails go in the bulk lane of the shared email queue: several
   // reports at once can never delay a password reset or a support reply. A full bulk lane refuses at once; that is one failed recipient, never a throw.
   describe('Emails wait in the bulk lane', () => {

@@ -11,6 +11,21 @@ describe('describeStatusReport', () => {
     expect(outcome.message).not.toContain('successfully');
   });
 
+  it('refuses with 400 and says nothing was emailed when the report would go to more people than the caller allows', () => {
+    const outcome = describeStatusReport({ recipients: 12, sent: 0, failed: 0, overCap: 10 }, 'plan status report for "Launch"');
+    expect(outcome).toEqual({
+      ok: false,
+      httpStatus: 400,
+      message: 'The plan status report for "Launch" was not sent: it would go to 12 people and one call may email at most 10. Nothing was emailed. Choose fewer contacts.',
+    });
+  });
+
+  it('a report over the cap is a 400 (nothing happened), never the 502 "refused all" answer its zero counts would otherwise give', () => {
+    expect(describeStatusReport({ recipients: 3, sent: 0, failed: 0, overCap: 2 }, 'x').httpStatus).toBe(400);
+    // a cap of 0 is still a cap: the field is "set", not "truthy"
+    expect(describeStatusReport({ recipients: 1, sent: 0, failed: 0, overCap: 0 }, 'x').ok).toBe(false);
+  });
+
   it('refuses with 502 when the mail service refused every email', () => {
     const outcome = describeStatusReport({ recipients: 2, sent: 0, failed: 2 }, 'phase status report');
     expect(outcome).toEqual({
