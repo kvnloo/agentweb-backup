@@ -1141,6 +1141,14 @@ export async function linkedinManagePost(
   // normalize to a URN, or return a validation message the model can act on.
   if (args.post_urn && ['repost', 'comment', 'list_comments', 'react'].includes(action)) {
     const normalized = normalizeLinkedInPostUrn(args.post_urn);
+    // Log both outcomes so a run can see which URN the socialActions call used,
+    // or that a validation error was returned without calling LinkedIn.
+    console.log('[AgentMode] linkedinManagePost post_urn normalized:', {
+      action,
+      input: args.post_urn,
+      ok: normalized.ok,
+      postUrn: normalized.ok ? normalized.urn : undefined,
+    });
     if (!normalized.ok) return { success: false, message: normalized.message };
     args = { ...args, post_urn: normalized.urn };
     // reshareContext.parent accepts only share/ugcPost URNs, not activity URNs.
