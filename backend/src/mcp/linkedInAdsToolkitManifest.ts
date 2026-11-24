@@ -141,6 +141,10 @@ const WRITE_KEYS = new Set(Object.keys(WRITE_PROPERTIES));
 export function assertLinkedInAdsToolkitCall(name: string, args: any): void {
   if (!isLinkedInAdsToolkitTool(name)) throw new MetaToolkitRefusal(`Tool ${name} is not part of the LinkedIn Ads toolkit.`);
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new MetaToolkitRefusal(`${name} arguments must be an object.`);
+  // Plain strings only: an array, object or number would be coerced differently by different readers
+  // (the paywall, this table, the validator), and that is how a write can slip past one of them.
+  if (typeof args.action !== 'string') throw new MetaToolkitRefusal(`${name} action must be a string.`);
+  if (name === LINKEDIN_ADS_WRITE_TOOL && typeof args.entity_type !== 'string') throw new MetaToolkitRefusal(`${name} entity_type must be a string.`);
   const allowed = name === LINKEDIN_ADS_READ_TOOL ? READ_KEYS : WRITE_KEYS;
   const unknown = Object.keys(args).filter((key) => !allowed.has(key));
   if (unknown.length) {
