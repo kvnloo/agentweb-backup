@@ -116,6 +116,7 @@ export async function handleLinkedInAdsToolkitCall(
     accessToken: auth.accessToken,
     currency: typeof cfg?.currency === 'string' ? cfg.currency.trim().toUpperCase() : '',
     freshToken: auth.fresh,
+    connectedAccountIds: accounts.filter(LINKEDIN_ADS_PROVIDER.isAdAccount).flatMap(LINKEDIN_ADS_PROVIDER.accountIds),
     scopes: Array.isArray(cfg?.scopes) ? cfg.scopes.map(String) : undefined,
     sleep: deps.sleep,
   };

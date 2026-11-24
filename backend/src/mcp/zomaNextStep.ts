@@ -31,6 +31,19 @@ export function zomaErrorNextStep(message: string): string {
       ? 'Ask the user which account to use, then retry with account_id (Meta) or customer_id (Google) set to it.'
       : 'Ask the user which account to use, then retry with account_id set to it.';
   }
+  // LinkedIn Ads: these messages exist only while the LinkedIn flag is on, so nothing else can match them.
+  if (/rate limiting this app|Too many LinkedIn Ads calls/i.test(message)) {
+    return 'Wait the number of seconds in retry_after_seconds (about a minute), then try once more. Do not retry in a loop.';
+  }
+  if (/LinkedIn (write access is not enabled|has not enabled the Zoma app)/i.test(message)) {
+    return 'Tell the user LinkedIn has not enabled this ad account for the Zoma app yet, so this cannot be done here; offer reporting (linkedin_ads_read GET_ANALYTICS) instead and do not retry.';
+  }
+  if (/LinkedIn Ads changes are not available yet/i.test(message)) {
+    return 'Tell the user LinkedIn changes are not available yet (they need LinkedIn Standard-tier approval); offer reading and reporting with linkedin_ads_read.';
+  }
+  if (/LinkedIn Ads account needs to be reconnected|connection has expired or was revoked/i.test(message)) {
+    return 'Tell the user their LinkedIn Ads connection needs to be reconnected; call zoma_status to see the state of the connection.';
+  }
   if (/preview_token|PREVIEW/i.test(message)) {
     return 'Call again without confirm to get a fresh PREVIEW, show it to the user, and confirm only after they approve it.';
   }

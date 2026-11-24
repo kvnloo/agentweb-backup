@@ -171,7 +171,7 @@ export function getLinkedInAdsToolkitManifest(writes: boolean = linkedInAdsWrite
   const read = {
     name: LINKEDIN_ADS_READ_TOOL,
     description:
-      'LinkedIn Ads reads on the connected LinkedIn ad account (nothing is changed). LIST_ACCOUNTS (ad accounts this LinkedIn login can see); ' +
+      'LinkedIn Ads reads on the connected LinkedIn ad account (nothing is changed). LIST_ACCOUNTS (the LinkedIn ad accounts connected to Zoma); ' +
       'LIST_CAMPAIGN_GROUPS (status?); LIST_CAMPAIGNS (campaign_group_id? | status?); LIST_CREATIVES (campaign_id); LIST_TARGETING_FACETS; ' +
       'SEARCH_TARGETING_ENTITIES (facet_urn, query?, locale_language?, locale_country?); ESTIMATE_AUDIENCE (targeting_include, targeting_exclude?: the matching member count); ' +
       'GET_ANALYTICS (pivot, start_date, end_date as YYYY-MM-DD, time_granularity ALL|DAILY|MONTHLY|YEARLY, fields?, campaign_group_ids? campaign_ids? creative_ids?: LinkedIn adAnalytics). ' +
@@ -295,7 +295,7 @@ export async function executeLinkedInAdsRead(args: any, session: LinkedInAdsSess
     const kind = classifyLinkedInFailure(result);
     if (kind === 'not_enabled') return { ok: false, body: linkedInNotEnabledReadResult(endpoint) };
     if (kind === 'rate_limited') return { ok: false, body: linkedInRateLimitedResult(`the ${what} read`, false) };
-    throw new MetaToolkitRefusal(`LinkedIn could not ${what}: ${redactLinkedInText(result.error || 'no details')}`);
+    throw new MetaToolkitRefusal(`LinkedIn could not ${what}: ${redactLinkedInText(result.error || 'no details', [session.accessToken])}`);
   };
 
   const statuses = (): string | undefined => {
@@ -310,7 +310,9 @@ export async function executeLinkedInAdsRead(args: any, session: LinkedInAdsSess
     case 'LIST_ACCOUNTS': {
       const r = await step('list ad accounts', 'ad accounts', (t) => api.listAdAccounts(t));
       if (!r.ok) return r.body;
-      const data = r.result.data?.elements ?? [];
+      // Only the ad accounts this caller has connected: an org-shared connection's token also sees its owner's other accounts.
+      const mine = new Set(session.connectedAccountIds ?? [session.accountId]);
+      const data = (r.result.data?.elements ?? []).filter((a: any) => mine.has(String(a?.id).replace(/^urn:li:sponsoredAccount:/, '')));
       return { success: true, count: data.length, data };
     }
     case 'LIST_CAMPAIGN_GROUPS': {

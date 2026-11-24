@@ -435,6 +435,7 @@ export async function executeLinkedInAdsWrite(
   const v = validateLinkedInAdsWriteShape(args, session.currency);
   const acct = session.accountId;
   const { api } = deps;
+  const scrub = (text: string) => redactLinkedInText(text, [session.accessToken]);
 
   // Consent: a connection made without rw_ads (read mode) cannot change anything. A connection that
   // never recorded its scopes is not blocked here; LinkedIn decides.
@@ -456,7 +457,7 @@ export async function executeLinkedInAdsWrite(
     if (kind === 'not_enabled') throw new MetaToolkitRefusal(LINKEDIN_WRITE_NOT_ENABLED);
     if (kind === 'rate_limited') throw new MetaToolkitRefusal(linkedInRateLimitedResult(what, true).message);
     if (result.status === 404 && notFound) throw new MetaToolkitRefusal(`${notFound} was not found on LinkedIn Ads account ${acct}. Nothing was sent.`);
-    throw new MetaToolkitRefusal(`LinkedIn could not ${what}, so nothing was sent: ${redactLinkedInText(result.error || 'no details')}`);
+    throw new MetaToolkitRefusal(`LinkedIn could not ${what}, so nothing was sent: ${scrub(result.error || 'no details')}`);
   };
   const readEntity = async (kind: Kind, id: string) => {
     const result = await before(
@@ -631,7 +632,7 @@ export async function executeLinkedInAdsWrite(
   } catch (error) {
     // A reconnect or similar refusal means nothing was sent; anything else gave no answer, so it may have applied.
     if (error instanceof MetaToolkitRefusal) throw error;
-    return unconfirmed(`The call to LinkedIn failed without an answer (${redactLinkedInText(error instanceof Error ? error.message : 'unknown error')}). The change may have applied: re-read with linkedin_ads_read before retrying so nothing is duplicated.`);
+    return unconfirmed(`The call to LinkedIn failed without an answer (${scrub(error instanceof Error ? error.message : 'unknown error')}). The change may have applied: re-read with linkedin_ads_read before retrying so nothing is duplicated.`);
   }
   let createdId: string | undefined;
   if (!applied.success) {
@@ -649,9 +650,9 @@ export async function executeLinkedInAdsWrite(
     if (kind === 'not_enabled') throw new MetaToolkitRefusal(LINKEDIN_WRITE_NOT_ENABLED);
     if (kind === 'rate_limited') return linkedInRateLimitedResult('this change', true);
     if (kind === 'outcome_unknown') {
-      return unconfirmed(`LinkedIn did not give a definite answer (${redactLinkedInText(applied.error || 'no response')}). The change may have applied: re-read with linkedin_ads_read before retrying so nothing is duplicated.`);
+      return unconfirmed(`LinkedIn did not give a definite answer (${scrub(applied.error || 'no response')}). The change may have applied: re-read with linkedin_ads_read before retrying so nothing is duplicated.`);
     }
-    throw new MetaToolkitRefusal(`LinkedIn rejected the change, so nothing was changed: ${redactLinkedInText(applied.error || 'no details')}`);
+    throw new MetaToolkitRefusal(`LinkedIn rejected the change, so nothing was changed: ${scrub(applied.error || 'no details')}`);
   }
   if (v.action === 'CREATE') {
     const rawId = typeof applied.data?.id === 'string' || typeof applied.data?.id === 'number' ? String(applied.data.id) : '';
@@ -675,7 +676,7 @@ export async function executeLinkedInAdsWrite(
     );
     const row = read.data;
     if (!read.success) {
-      result.read_back_error = redactLinkedInText(read.error || 'the read-back request failed');
+      result.read_back_error = scrub(read.error || 'the read-back request failed');
     } else if (!row || typeof row !== 'object' || Array.isArray(row)) {
       result.read_back_error = 'LinkedIn answered the read-back with something that is not the object that was changed.';
     } else if (trailingId(row.id) !== id) {
@@ -702,7 +703,7 @@ export async function executeLinkedInAdsWrite(
     }
   } catch (error) {
     if (error instanceof MetaToolkitRefusal) throw error;
-    result.read_back_error = redactLinkedInText(error instanceof Error ? error.message : 'the read-back failed');
+    result.read_back_error = scrub(error instanceof Error ? error.message : 'the read-back failed');
     verification = 'UNCONFIRMED';
   }
   result.verification = verification;

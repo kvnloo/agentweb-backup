@@ -93,13 +93,16 @@ export function linkedInNotEnabledReadResult(endpoint: string) {
   };
 }
 
-/** Scrub anything shaped like a credential from text that came from or about LinkedIn. */
-export function redactLinkedInText(text: string): string {
-  return text
+/**
+ * Scrub anything shaped like a credential from text that came from or about LinkedIn, and any exact
+ * secret the caller knows (the access token of the session).
+ */
+export function redactLinkedInText(text: string, secrets: readonly string[] = []): string {
+  let out = text
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
-    .replace(/([?&](?:access_token|refresh_token|client_secret|code)=)[^&#\s"']*/gi, '$1[redacted]')
-    .replace(/("(?:access_token|refresh_token|client_secret)"\s*:\s*")[^"]*(")/gi, '$1[redacted]$2')
-    .slice(0, 1200);
+    .replace(/\b(access_token|refresh_token|client_secret)\b(["']?\s*[=:]\s*["']?)[^\s"'&,}]+/gi, '$1$2[redacted]');
+  for (const secret of secrets) if (secret && secret.length >= 8) out = out.split(secret).join('[redacted]');
+  return out.slice(0, 1200);
 }
 
 export interface LinkedInAdsSession {
@@ -111,6 +114,11 @@ export interface LinkedInAdsSession {
   currency: string;
   /** The token was minted moments ago (ENG-2663): a first 401 may be LinkedIn lag, so it is retried once. */
   freshToken?: boolean;
+  /**
+   * Ad account ids the caller has connected (own and org-shared). LIST_ACCOUNTS shows only these: the
+   * token of an org-shared connection belongs to a teammate and can see that teammate's other accounts.
+   */
+  connectedAccountIds?: string[];
   /** Scopes stored with the connection; undefined for a connection that never recorded them. */
   scopes?: string[];
   /** Injectable for tests. */
