@@ -60,6 +60,9 @@ export interface LinkedInAdsToolkitGatewayDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
+const defaultWrite = async (userId: string, args: any, session: LinkedInAdsSession) =>
+  (await import('./linkedInAdsToolkitWrites')).executeLinkedInAdsWrite(userId, args, session);
+
 export async function handleLinkedInAdsToolkitCall(
   caller: LinkedInAdsToolkitCaller,
   request: { toolName: string; args?: any; sessionId?: string; userAgent?: string },
@@ -119,8 +122,7 @@ export async function handleLinkedInAdsToolkitCall(
 
   let result: any;
   if (write) {
-    if (!deps.executeWrite) throw new Error('LinkedIn Ads writes are not wired');
-    result = await deps.executeWrite(caller.userId, args, session);
+    result = await (deps.executeWrite ?? defaultWrite)(caller.userId, args, session);
   } else {
     result = await (deps.executeRead ?? executeLinkedInAdsRead)(args, session);
   }
