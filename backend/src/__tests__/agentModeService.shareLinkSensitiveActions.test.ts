@@ -1,5 +1,6 @@
 import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
+import { scheduleDb } from '../services/db';
 import { markShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 
 /**
@@ -564,7 +565,7 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
         expect(release).not.toHaveBeenCalled();
         await browser(VISITOR);
         expect(release).toHaveBeenCalledTimes(1);
-        expect(release).toHaveBeenCalledWith('session-1');
+        expect(release).toHaveBeenCalledWith('session-1', { force: true });
         await browser(VISITOR);
         expect(release).toHaveBeenCalledTimes(1);
       });
@@ -595,13 +596,104 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
         expect(release).not.toHaveBeenCalled();
       });
 
-      it('another session\'s browser is not touched, and a failing release never stops the browser step', async () => {
+      it('another session\'s browser is not touched', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        release.mockRejectedValue(new Error('boom'));
         await browser(undefined, 'session-other');
-        await expect(browser(VISITOR, 'session-1')).resolves.toEqual({ ran: true });
+        await browser(VISITOR, 'session-1');
         expect(release.mock.calls.map((c) => c[0])).toEqual(['session-1']);
       });
+
+      it('the release is FORCED (a call the other person left running must not survive the hand-over)', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(undefined);
+        await browser(VISITOR);
+        expect(release).toHaveBeenCalledWith('session-1', { force: true });
+      });
+
+      it.each([
+        ['a call is still running on the pool and the release skipped it', () => release.mockResolvedValue({ released: 0, skippedInFlight: 1 })],
+        ['the release threw', () => release.mockRejectedValue(new Error('boom'))],
+      ])('when %s: the step is NOT run, nothing is recorded, and the next call tries again', async (_label, arrange) => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(undefined);
+        dispatch.mockClear();
+        arrange();
+        const result = await browser(VISITOR);
+        expect(result).toMatchObject({ success: false, error: expect.stringContaining('could not be reset') });
+        expect(dispatch).not.toHaveBeenCalled();
+        release.mockResolvedValue({ released: 1, skippedInFlight: 0 });
+        await expect(browser(VISITOR)).resolves.toEqual({ ran: true });
+        expect(release).toHaveBeenCalledTimes(2);
+      });
+
+      it('the same in the other direction: if the visitor\'s browser cannot be released, the owner\'s step is not run and no cookies are loaded', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(undefined);
+        await browser(VISITOR);
+        dispatch.mockClear();
+        release.mockResolvedValue({ released: 0, skippedInFlight: 1 });
+        await expect(browser(undefined)).resolves.toMatchObject({ success: false });
+        expect(dispatch.mock.calls.map((c) => c[0])).toEqual([]);
+      });
+    });
+
+    describe('a schedule that already emails OTHER people may not be edited from an OFF link (AgentWeb would send the visitor\'s text to them)', () => {
+      let getSchedule: jest.SpyInstance;
+      beforeEach(() => { getSchedule = jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: 's1', userId: 'owner-user-id', emailNotifications: ['client@example.com'] } as any); });
+      const edit = { action: 'update', schedule_id: 's1', starting_message: 'new prompt' };
+      const variables = { schedule_id: 's1', variable_values: { a: 'b' } };
+
+      it('OFF link: an update of the prompt and a variables submission are refused when the schedule has recipients', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await expect(run('manage_scheduled_chat', VISITOR, edit)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        await expect(run('submit_scheduled_chat_variables', VISITOR, variables)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(getSchedule).toHaveBeenCalledWith('s1', { consistent: true });
+      });
+
+      it('OFF link: a schedule with no recipients (its results go to the owner) is still editable', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        for (const emailNotifications of [[], undefined]) {
+          getSchedule.mockResolvedValue({ scheduleId: 's1', userId: 'owner-user-id', emailNotifications } as any);
+          await expect(run('manage_scheduled_chat', VISITOR, edit)).resolves.toEqual({ ran: true });
+          await expect(run('submit_scheduled_chat_variables', VISITOR, variables)).resolves.toEqual({ ran: true });
+        }
+        getSchedule.mockResolvedValue(null as any); // not there: the tool answers not found
+        await expect(run('manage_scheduled_chat', VISITOR, edit)).resolves.toEqual({ ran: true });
+      });
+
+      it('an unreadable schedule refuses (after one retry)', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        getSchedule.mockRejectedValue(new Error('throttled'));
+        await expect(run('manage_scheduled_chat', VISITOR, edit)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        expect(getSchedule).toHaveBeenCalledTimes(2);
+        getSchedule.mockReset().mockRejectedValueOnce(new Error('blip')).mockResolvedValueOnce({ scheduleId: 's1', emailNotifications: [] } as any);
+        await expect(run('manage_scheduled_chat', VISITOR, edit)).resolves.toEqual({ ran: true });
+      });
+
+      it('ON link, a legacy dialog link and the owner\'s own call are untouched, and nothing about the schedule is read for them', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+        await expect(run('manage_scheduled_chat', VISITOR, edit)).resolves.toEqual({ ran: true });
+        readSession.mockResolvedValue(link({ sharedAt: ago(1), expiresAt: ahead(6) }));
+        await expect(run('manage_scheduled_chat', VISITOR, edit)).resolves.toEqual({ ran: true });
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        getSchedule.mockClear();
+        await expect(run('manage_scheduled_chat', undefined, edit)).resolves.toEqual({ ran: true });
+        expect(getSchedule).not.toHaveBeenCalled();
+      });
+
+      it('a pause, which only restricts, and a call about no schedule are not asked', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await expect(run('manage_scheduled_chat', VISITOR, { action: 'toggle', schedule_id: 's1', status: 'paused' })).resolves.toEqual({ ran: true });
+        await expect(run('manage_scheduled_chat', VISITOR, { action: 'update' })).resolves.toEqual({ ran: true });
+        expect(getSchedule).not.toHaveBeenCalled();
+      });
+    });
+
+    it('OFF link: a calendar update that names attendees, an empty list included, is refused; an update without them runs', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run('google_calendar_update_event', VISITOR, { event_id: 'e', attendees: [] })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(run('google_calendar_update_event', VISITOR, { event_id: 'e', summary: 'new title' })).resolves.toEqual({ ran: true });
     });
 
     it('OFF link: a schedule update that re-times or re-models a schedule, or names recipients, is refused; one that only changes the prompt runs', async () => {

@@ -1095,26 +1095,33 @@ export class McpClientService {
    * bare session id must also release its compound pools — otherwise this
    * no-ops for exactly the per-session browser processes it exists to reclaim.
    */
-  async releaseSessionClients(chatSessionId: string): Promise<void> {
+  async releaseSessionClients(chatSessionId: string, options?: { force?: boolean }): Promise<{ released: number; skippedInFlight: number }> {
     const suffix = `::${chatSessionId}`;
     const poolKeys = Array.from(this.sessionClientPools.keys()).filter(
       key => key === chatSessionId || key.endsWith(suffix)
     );
+    let released = 0;
+    let skippedInFlight = 0;
 
     for (const poolKey of poolKeys) {
       // A run can end with a tool call still executing — a timed-out request keeps running
       // in the worker after the caller's `finally` has moved on. Closing the client there
       // would abort a live browser call, so leave it to the idle sweep instead.
+      // ENG-3170: unless the caller says the browser must not be kept (`force`): when the person driving a session's browser changes between
+      // the owner and a share-link visitor, a call the OTHER person left running is exactly what must not survive the hand-over.
       const pool = this.sessionClientPools.get(poolKey);
-      if (pool && pool.inFlight > 0) {
+      if (pool && pool.inFlight > 0 && options?.force !== true) {
         console.warn(
           `[MCP-SESSION] Not releasing pool ${poolKey.substring(0, 8)} — ${pool.inFlight} tool call(s) `
           + `still in flight; the idle sweep will reclaim it.`
         );
+        skippedInFlight++;
         continue;
       }
       await this.releasePool(poolKey);
+      released++;
     }
+    return { released, skippedInFlight };
   }
 
   /**

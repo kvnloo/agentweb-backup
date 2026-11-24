@@ -175,3 +175,18 @@ owner's connected HubSpot or Attio when auto-sync is on; the import notification
 `send_for_review` (visitor HTML in the reviewer's email on a result link); `/ishare/:id/email-report` (a fixed AgentWeb report link to any address, rate limited, predates this change);
 Meta image and video uploads; turning Full control on also covers everyone who already holds the link (one token per session) and an `enqueue_human_eval` or `generate_image`
 call by a visitor makes an OFF link permanent (an email path does the same, by design); a running visitor turn is not tied to the link it started on.
+
+## Fourth final-review round (2026-11-24, on 70bee57cf): the hand-over is forced and verified, a schedule that emails others is not editable from an OFF link
+- **The browser hand-over could fail silently.** `releaseSessionClients` skips a pool with a call still running (`inFlight > 0`) and returned nothing, so
+  `separateBrowserBetweenActors` recorded the switch and went on to load the owner's cookies into a browser a visitor's still-running code controlled (a timed-out
+  request keeps running for up to an hour; a visitor can also end their own turn). Now the release is FORCED on a switch (`{ force: true }`, it returns
+  `{ released, skippedInFlight }`), and when it did not happen (a pool was skipped, or it threw) nothing is recorded and the browser step is not run: the caller answers with
+  an error and the next call tries again. Both directions.
+- **A visitor rewriting an existing schedule that emails OTHER people.** The visitor mark limits the tools a run may use, not who receives its emailed output, so a rewritten
+  prompt reached the owner's recipients (a phishing text from AgentWeb). On a link that may not run the sensitive tools, `manage_scheduled_chat` update and
+  `submit_scheduled_chat_variables` on a schedule that has recipients are refused (`scheduleContentEditTarget` names the schedule; a consistent read, one retry, an unreadable
+  schedule refuses). A schedule with no recipients but the owner's own results stays editable; ON and legacy links and the owner's own calls are untouched.
+- `google_calendar_update_event` with `attendees: []` (a key present with an empty list removes every attendee) is sensitive (`keyExists` on the by-argument rule).
+- The provenance answer for the browser steps of an unattended run is kept for a minute per session (a run makes many steps); an answer that could not be settled is not kept.
+Not changed: a nested `solve_captcha` inside a marked schedule is judged as the owner's (it only costs that tool its browser step; no leak found); the owner typing in a marked
+schedule's own session now has Meta writes refused until they adopt the schedule, like the other sensitive tools there.
