@@ -65,6 +65,12 @@ const isZomaState = (state: string): boolean => {
   }
 };
 
+/**
+ * A failed token exchange is an AxiosError, whose config carries client_secret and the OAuth code in
+ * its params. Log a short message only, never the error object.
+ */
+const safeErrorText = (error: unknown): string => (error instanceof Error ? error.message : 'unknown error').slice(0, 300);
+
 // ── Routes ───────────────────────────────────────────────────────────────────
 
 /**
@@ -137,7 +143,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     const { adAccounts, tokenSessionId } = await finalizeLinkedInAdsOAuth({ userId, code });
     res.json({ success: true, adAccounts, tokenSessionId });
   } catch (error: any) {
-    console.error('[LinkedIn Ads OAuth] Finalize error:', error);
+    console.error('[LinkedIn Ads OAuth] Finalize error:', safeErrorText(error));
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to finalize LinkedIn Ads connection', ...(details && { details }) });
   }
@@ -168,7 +174,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 
     res.json({ success: true, account: redactAccountSecrets(result.accounts[0]) });
   } catch (error: any) {
-    console.error('[LinkedIn Ads OAuth] Connect error:', error);
+    console.error('[LinkedIn Ads OAuth] Connect error:', safeErrorText(error));
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to connect LinkedIn Ads account', ...(details && { details }) });
   }
