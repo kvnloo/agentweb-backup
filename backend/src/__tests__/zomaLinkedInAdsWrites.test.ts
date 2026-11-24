@@ -879,6 +879,40 @@ describe('token refresh: single flight, saved before use, no secret in an error'
     await expect(getFreshLinkedInAdsToken('u1', stored(), network.d)).rejects.toMatchObject({ kind: 'temporary' });
   });
 
+  it('a refresh that fails because another request refreshed first uses the row\'s new tokens instead of asking for a reconnect', async () => {
+    const rejected = Object.assign(new Error('Request failed with status code 400'), { response: { status: 400 } });
+    const reload = jest.fn().mockResolvedValue(stored({ access_token: 'refreshed-by-someone-else', refresh_token: 'RT-2', token_expires_at: NOW + 59 * 86400000 }));
+    const { d } = tokenDeps({ refresh: jest.fn().mockRejectedValue(rejected), reload });
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const result = await getFreshLinkedInAdsToken('owner-9', stored(), d);
+    expect(result.accessToken).toBe('refreshed-by-someone-else');
+    expect(d.refresh).toHaveBeenCalledTimes(1);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(reload).toHaveBeenCalledWith('owner-9', '5001');
+    expect(d.saveTokens).not.toHaveBeenCalled();
+  });
+
+  it('...but an unchanged, expired, missing or unreadable row is still a reconnect (re-read once, never looped)', async () => {
+    const rejected = Object.assign(new Error('Request failed with status code 401'), { response: { status: 401 } });
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const rows: Array<() => Promise<any>> = [
+      async () => stored(),                                                                                 // same tokens
+      async () => stored({ token_expires_at: NOW + 59 * 86400000 }),                                          // same access token: nothing was refreshed
+      async () => stored({ access_token: 'other', token_expires_at: NOW - 5000 }),                           // changed but already expired
+      async () => stored({ access_token: 'other', token_expires_at: NOW + 60_000 }),                         // changed but inside the refresh buffer
+      async () => null,                                                                                    // row gone
+      async () => { throw new Error('db down'); },                                                         // unreadable
+    ];
+    for (const row of rows) {
+      resetLinkedInRefreshesForTests();
+      const reload = jest.fn().mockImplementation(row);
+      const { d } = tokenDeps({ refresh: jest.fn().mockRejectedValue(rejected), reload });
+      await expect(getFreshLinkedInAdsToken('u1', stored(), d)).rejects.toMatchObject({ kind: 'reconnect' });
+      expect(reload).toHaveBeenCalledTimes(1);
+      expect(d.refresh).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it('a failed refresh is not remembered: the next call tries again', async () => {
     const refresh = jest.fn().mockRejectedValueOnce(new Error('ECONNRESET')).mockResolvedValueOnce({ access_token: 'second-try', expires_in: 3600 });
     const { d } = tokenDeps({ refresh });
