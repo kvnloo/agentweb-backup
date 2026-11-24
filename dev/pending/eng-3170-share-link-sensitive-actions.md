@@ -190,3 +190,20 @@ call by a visitor makes an OFF link permanent (an email path does the same, by d
 - The provenance answer for the browser steps of an unattended run is kept for a minute per session (a run makes many steps); an answer that could not be settled is not kept.
 Not changed: a nested `solve_captcha` inside a marked schedule is judged as the owner's (it only costs that tool its browser step; no leak found); the owner typing in a marked
 schedule's own session now has Meta writes refused until they adopt the schedule, like the other sensitive tools there.
+
+## Fifth final-review round (2026-11-24, on 0b464e28e)
+- **A forced release was undone by the browser tool's own retry.** A browser tool call retries (twice, after 2 s) on any error, and a call still running when the session's
+  browser is force-released fails with exactly such an error, so it reconnected to a NEW pool under the same key and ran the same code in the browser the next person had
+  just logged in (code that outlives the call, like a background cookie reader, then reads the owner's cookies). `McpClientService` now counts the forced releases of a
+  chat session (`sessionEpoch`); a call remembers the epoch it started in and does not retry into a later one (both retry loops), and answers that the browser was reset.
+- **`create_schedule_from_template` is sensitive in full.** The new schedule inherits the template's recipients when none are given, so a visitor could have AgentWeb mail
+  the owner's clients with text shaped by the visitor's variables.
+- **A run of a schedule a visitor wrote may not edit another schedule that emails other people** (it has no link that could allow it): the recipients check also applies under
+  the schedule profile.
+- The recipients check reads every stored format of the list (a list, a bare address, a JSON list in text: `normalizeEmailList`) and does not count the owner's own address
+  as "other people" (new schedules default to it, so before this an OFF-link visitor could edit almost no schedule, their own included); an unreadable owner address counts every
+  recipient as someone else.
+- The browser hand-over is serialized per session (a visitor's step cannot read the actor while the owner's switch is still releasing), and when the actor map is full an
+  OWNER entry is forgotten before a visitor's.
+Still allowed on purpose (disclosed): a `dri` nested inside the `phases` / `items` of `create_gtm_plan`, `add_gtm_phase` and `add_gtm_work_items` (the top-level `dri` is covered);
+voice does not check a link's expiry (`liveVoiceSocket.ts` checks `isActive` only; predates this change); the PATCH route turns Full control on for a link without showing its expiry.

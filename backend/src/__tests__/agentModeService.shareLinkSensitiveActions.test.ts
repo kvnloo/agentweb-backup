@@ -1,6 +1,6 @@
 import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
-import { scheduleDb } from '../services/db';
+import { scheduleDb, userDb } from '../services/db';
 import { markShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 
 /**
@@ -481,6 +481,7 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       ['generate_landing_page', { prompt: 'a page' }],
       ['duplicate_landing_page', { page_id: 'p' }],
       ['create_skill', { name: 'n', systemPrompt: 'p' }],
+      ['create_schedule_from_template', { template_id: 't' }],
       ['save_work_plan', { title: 't', steps: [] }],
       ['attach_knowledge_base_files', { task_id: 't', file_urls: [] }],
       ['create_knowledge_base', { name: 'n' }],
@@ -506,7 +507,6 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       ['update_gtm_plan', { plan_id: 'p', dri: 'someone@example.com' }, { plan_id: 'p', title: 't' }],
       ['update_gtm_phase', { phase_id: 'p', dri: 'someone@example.com' }, { phase_id: 'p', title: 't' }],
       ['update_gtm_work_item', { item_id: 'i', dri: 'someone@example.com' }, { item_id: 'i', title: 't' }],
-      ['create_schedule_from_template', { template_id: 't', email_notifications: ['someone@example.com'] }, { template_id: 't' }],
       ['submit_scheduled_chat_variables', { schedule_id: 's', variable_values: {}, trigger_run: true }, { schedule_id: 's', variable_values: {} }],
       ['create_work_plan', { title: 't', steps: [], autocomplete: true }, { title: 't', steps: [] }],
       ['modify_work_plan', { steps: [], autocomplete: true }, { steps: [] }],
@@ -596,6 +596,36 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
         expect(release).not.toHaveBeenCalled();
       });
 
+      it('two steps at once are handled one at a time per session: a visitor\'s step waits for the owner\'s switch to finish, then switches again', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(VISITOR); // the visitor drives first
+        release.mockClear();
+        const order: string[] = [];
+        let finishFirst: () => void = () => undefined;
+        release.mockImplementationOnce(() => new Promise((resolve) => { order.push('owner switch starts'); finishFirst = () => { order.push('owner switch done'); resolve({ released: 1, skippedInFlight: 0 }); }; }));
+        release.mockImplementationOnce(async () => { order.push('visitor switch'); return { released: 1, skippedInFlight: 0 }; });
+        const ownerStep = browser(undefined).then(() => order.push('owner step ran'));
+        await new Promise((resolve) => setImmediate(resolve));
+        const visitorStep = browser(VISITOR).then(() => order.push('visitor step ran'));
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(order).toEqual(['owner switch starts']); // the visitor\'s switch is queued behind it
+        finishFirst();
+        await Promise.all([ownerStep, visitorStep]);
+        expect(order.slice(0, 3)).toEqual(['owner switch starts', 'owner switch done', 'visitor switch']);
+        expect(release).toHaveBeenCalledTimes(2);
+      });
+
+      it('the actor map forgets an owner entry before a visitor\'s (a forgotten visitor entry would not release a visitor\'s browser)', async () => {
+        const map: Map<string, 'owner' | 'visitor'> = (service as any).browserActorBySession;
+        for (let i = 0; i < 999; i++) map.set(`filler-${i}`, 'visitor');
+        map.set('the-owner-one', 'owner');
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(VISITOR, 'one-more');
+        expect(map.has('the-owner-one')).toBe(false);
+        expect(map.has('filler-0')).toBe(true);
+        expect(map.size).toBe(1000);
+      });
+
       it('another session\'s browser is not touched', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
         await browser(undefined, 'session-other');
@@ -649,6 +679,27 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
         await expect(run('submit_scheduled_chat_variables', VISITOR, variables)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
         expect(dispatch).not.toHaveBeenCalled();
         expect(getSchedule).toHaveBeenCalledWith('s1', { consistent: true });
+      });
+
+      it('the owner\'s own address is not "other people": a schedule that only emails the owner is editable; any other address, in any stored format, is not', async () => {
+        jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'owner-user-id', email: 'Owner@Example.com' } as any);
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        const withRecipients = (emailNotifications: unknown) => getSchedule.mockResolvedValue({ scheduleId: 's1', userId: 'owner-user-id', emailNotifications } as any);
+        for (const own of [['owner@example.com'], ['OWNER@example.com'], 'owner@example.com', ['[\"owner@example.com\"]']]) {
+          withRecipients(own);
+          await expect(run('manage_scheduled_chat', VISITOR, edit)).resolves.toEqual({ ran: true });
+        }
+        for (const others of [['owner@example.com', 'client@example.com'], 'client@example.com', '["client@example.com"]', ['["owner@example.com","client@example.com"]']]) {
+          withRecipients(others);
+          await expect(run('manage_scheduled_chat', VISITOR, edit)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        }
+      });
+
+      it('when the owner\'s address cannot be read, every recipient counts as someone else (refused)', async () => {
+        jest.spyOn(userDb, 'getUserById').mockRejectedValue(new Error('blip'));
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        getSchedule.mockResolvedValue({ scheduleId: 's1', userId: 'owner-user-id', emailNotifications: ['owner@example.com'] } as any);
+        await expect(run('manage_scheduled_chat', VISITOR, edit)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
       });
 
       it('OFF link: a schedule with no recipients (its results go to the owner) is still editable', async () => {

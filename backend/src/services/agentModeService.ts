@@ -14,6 +14,7 @@ import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
 import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
+import { normalizeEmailList } from '../utils/validation';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -1303,7 +1304,20 @@ export class AgentModeService {
    * visitor who may not use the owner's logins, the session's browser is released (a fresh one starts with no logins), and the owner's cookies are
    * loaded again the next time the owner drives it. A visitor whose history is unknown in this process is treated as a switch.
    */
+  /** One hand-over at a time per session: a visitor's step must not read the actor while the owner's switch is still releasing the browser (and the reverse). */
+  private browserHandoverTail = new Map<string, Promise<unknown>>();
   private async separateBrowserBetweenActors(sessionId: string, actor: 'owner' | 'visitor'): Promise<boolean> {
+    const previous = this.browserHandoverTail.get(sessionId) ?? Promise.resolve();
+    const mine = previous.catch(() => undefined).then(() => this.separateBrowserBetweenActorsNow(sessionId, actor));
+    this.browserHandoverTail.set(sessionId, mine);
+    try {
+      return await mine;
+    } finally {
+      if (this.browserHandoverTail.get(sessionId) === mine) this.browserHandoverTail.delete(sessionId);
+    }
+  }
+
+  private async separateBrowserBetweenActorsNow(sessionId: string, actor: 'owner' | 'visitor'): Promise<boolean> {
     const last = this.browserActorBySession.get(sessionId);
     if (last !== actor && (last !== undefined || actor === 'visitor')) {
       // FORCED: a call the other person left running on the session's browser (a timed-out request keeps running; a visitor can also end their own turn)
@@ -1321,10 +1335,14 @@ export class AgentModeService {
     }
     this.browserActorBySession.delete(sessionId);
     this.browserActorBySession.set(sessionId, actor);
+    // Oldest first, but an OWNER entry before a visitor's: a session whose visitor entry is forgotten would not release the visitor's browser when the owner
+    // next drives it.
     while (this.browserActorBySession.size > AgentModeService.BROWSER_ACTOR_MAX_SESSIONS) {
-      const oldest = this.browserActorBySession.keys().next().value;
-      if (oldest === undefined) break;
-      this.browserActorBySession.delete(oldest);
+      let victim: string | undefined;
+      for (const [id, who] of this.browserActorBySession) { if (who === 'owner') { victim = id; break; } }
+      if (victim === undefined) victim = this.browserActorBySession.keys().next().value;
+      if (victim === undefined) break;
+      this.browserActorBySession.delete(victim);
     }
     return true;
   }
@@ -10271,7 +10289,7 @@ export class AgentModeService {
   }
 
   /** ENG-3170: does this schedule email results to anyone (the recipients stored on it)? Consistent read, one retry; a schedule that cannot be read counts as yes. A schedule that is not there counts as no (the tool answers not found). */
-  private async scheduleEmailsOthers(scheduleId: string): Promise<boolean> {
+  private async scheduleEmailsOthers(scheduleId: string, ownerUserId?: string): Promise<boolean> {
     let schedule: any;
     try {
       schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
@@ -10283,7 +10301,17 @@ export class AgentModeService {
         return true;
       }
     }
-    return Array.isArray(schedule?.emailNotifications) && schedule.emailNotifications.length > 0;
+    // Every stored format (a list, a bare address, a JSON list in text), and not the owner's own address: new schedules default to it, and results that go
+    // to the owner reach nobody else.
+    const recipients = normalizeEmailList(schedule?.emailNotifications).map((address) => address.toLowerCase());
+    if (recipients.length === 0) return false;
+    let ownerEmail = '';
+    try {
+      ownerEmail = String((ownerUserId ? await userDb.getUserById(ownerUserId) : undefined)?.email ?? '').trim().toLowerCase();
+    } catch (userError) {
+      console.warn(`AgentMode ENG-3170: could not read the owner's address to tell their own results from others':`, userError);
+    }
+    return recipients.some((address) => address !== ownerEmail);
   }
 
   /**
@@ -10406,9 +10434,11 @@ export class AgentModeService {
     // ENG-3170: a visitor rewriting the prompt, keywords or variables of one of the owner's schedules that already emails OTHER people would have AgentWeb
     // send their text to those people (the visitor mark limits the tools a run may use, not who receives its output). Only on a link that may not run the
     // sensitive tools; a schedule that emails nobody else stays editable. An unreadable schedule refuses.
-    if (isShareVisitor) {
+    // This also holds for a run of a schedule a visitor wrote (it carries the schedule profile, and has no link that could allow it).
+    const inVisitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+    if (isShareVisitor || inVisitorSchedule) {
       const editedScheduleId = scheduleContentEditTarget(toolName, preparedArgs);
-      if (editedScheduleId && !(await this.readShareLinkControl(toolName, sessionId)).sensitive && await this.scheduleEmailsOthers(editedScheduleId)) {
+      if (editedScheduleId && !(isShareVisitor && (await this.readShareLinkControl(toolName, sessionId)).sensitive) && await this.scheduleEmailsOthers(editedScheduleId, userId)) {
         console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: schedule ${editedScheduleId} emails other people and the link has not been given full control.`);
         throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
       }

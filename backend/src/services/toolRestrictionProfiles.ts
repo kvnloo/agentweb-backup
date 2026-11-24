@@ -122,6 +122,7 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'configure_lead_statuses',
   'update_lead_list', // name, filters and status stages
   'save_test_account', // stores a login in the owner's account
+  'create_schedule_from_template', // the new schedule inherits the template's email recipients when none are given, and the visitor mark limits the tools of a run, not who receives its output
   'create_skill', // stores the caller's text as lasting instructions in the owner's library (offered to the owner and the org's members)
   'save_work_plan', // saves the caller's steps as a plan in the owner's library that the owner or teammates later launch
   'attach_knowledge_base_files', // Emma's memory: task runs and owner sessions read a task's knowledge base
@@ -258,8 +259,7 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   // an `autocomplete` plan tells later turns to carry on without pausing, so steps a visitor wrote run unattended in the owner's next turn
   create_work_plan: { kind: 'present', arguments: ['autocomplete'] },
   modify_work_plan: { kind: 'present', arguments: ['autocomplete'] },
-  // the recipients a schedule's results are emailed to (the visitor mark restricts the TOOLS a run may use, not who receives the emailed result)
-  create_schedule_from_template: { kind: 'present', arguments: ['email_notifications'] },
+
   create_google_doc: { kind: 'present', arguments: ['share_with_emails'] },
   create_google_sheet: { kind: 'present', arguments: ['share_with_emails'] },
 };

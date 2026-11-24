@@ -69,6 +69,8 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       'report_product_issues', 'write_clickup_doc', 'create_clickup_task', 'coding_agent', 'list_test_accounts', 'open_site_signin',
       // the third review round: the mailbox is where a login code or reset link would be read from
       'email',
+      // the fifth round: it inherits the template's recipients when none are given
+      'create_schedule_from_template',
     ].sort());
 
     expect([...SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS].sort()).toEqual([
@@ -254,7 +256,6 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       ['update_gtm_phase', 'dri', 'someone@example.com', ''],
       ['add_gtm_phase', 'dri', 'someone@example.com', ''],
       ['create_gtm_plan', 'dri', 'someone@example.com', ''],
-      ['create_schedule_from_template', 'email_notifications', ['someone@example.com'], []],
       ['submit_scheduled_chat_variables', 'trigger_run', true, false],
       ['create_work_plan', 'autocomplete', true, false],
       ['modify_work_plan', 'autocomplete', true, false],
