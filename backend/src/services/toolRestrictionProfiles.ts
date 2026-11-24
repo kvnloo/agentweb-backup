@@ -63,7 +63,9 @@ export const SHARE_VISITOR_BLOCKED_TOOLS: ReadonlySet<string> = new Set([
  *   2. send, post or publish to people or the public outside the account,
  *   3. start, change or stop ad spend,
  *   4. disconnect or revoke a connected account, or
- *   5. hand the owner's saved logins (passwords) to the model.
+ *   5. hand the owner's saved logins (passwords) to the model, or
+ *   6. change what the owner set up (settings, Emma's memory, skills, plans, templates, schedules' timing and recipients) or start something that
+ *      will run LATER as the owner (a task, a schedule, a decision a team approver settles).
  * Whether a visitor may run these is the OWNER's choice per link (`allowSensitiveActions` on the link, see
  * `utils/interactiveShare.interactiveShareAllowsSensitiveActions`; customers see it as "Full control"): off by default, and nothing is
  * removed for an owner who turns it on. Owner decision 2026-11-23: "full control means everything that the customer can do, like it
@@ -94,6 +96,8 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   // 5. hand the owner's saved logins to the model (the tool returns the decrypted password)
   'get_login_credentials',
   'get_test_account',
+  'list_test_accounts', // the site, login and notes of every saved test login: the username half of get_test_account
+  'open_site_signin', // uses a stored captcha-bypass key and opens a sign-in for the model, with the key in the page URL
   // 5b. the owner's saved browser sessions (the cookie jar the browser tools load automatically): load them into the browser, replace them, wipe them
   'load_browser_cookies',
   'save_browser_cookies',
@@ -106,6 +110,7 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'create_task_from_prompt',
   'create_task_from_template',
   'create_revision',
+  'create_image_task_from_prompt', // the same task machinery as create_task_from_prompt, with the visitor's text inside the task
   // 6. what the owner set up inside the account (the approved wording: "change your settings or Emma's memory"): overwrite it
   'update_brand_guidelines',
   'update_market_strategy', // manage_market_strategy (read or update) is judged by its action, below
@@ -113,7 +118,21 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'configure_lead_statuses',
   'update_lead_list', // name, filters and status stages
   'save_test_account', // stores a login in the owner's account
+  'create_skill', // stores the caller's text as lasting instructions in the owner's library (offered to the owner and the org's members)
+  'save_work_plan', // saves the caller's steps as a plan in the owner's library that the owner or teammates later launch
+  'attach_knowledge_base_files', // Emma's memory: task runs and owner sessions read a task's knowledge base
+  'create_knowledge_base',
+  'create_html_template', // replaces the template the owner's emailed reports are built from (found by id or by an exact name)
+  'create_book_outline', // replaces a book's whole outline: every existing chapter is cut off from it
+  'update_google_doc', // replaces the whole body of any Google doc the owner can edit (full Drive scope), shared or published ones included
+  'update_google_sheet', // overwrites ranges in any sheet the owner can edit; values are USER_ENTERED, so formulas run
   // 2. send, post or publish to people or the public outside the account
+  'report_product_issues', // a feature request becomes a PUBLIC Featurebase post authored as the owner (a duplicate votes and comments as the owner); also emails AgentWeb's founders
+  'write_clickup_doc', // a doc or page in the owner's ClickUp workspace, as the owner
+  'create_clickup_task', // a task in any list of the owner's ClickUp, with assignees
+  'coding_agent', // pushes code to the owner's PUBLIC preview branch, which the owner's next publish ships
+  'generate_landing_page', // deploys a LIVE page (onto the owner's existing site by default), can open a lead list to public submissions and locks the owner's site mode
+  'duplicate_landing_page', // regenerates and deploys a live copy
   'stage_pending_decision', // a decision a team approver settles RESUMES this session as a full owner turn (approvalInboxExecution.resumeOriginSession), with the visitor's messages in view; audience customer also emails any address
   'slack_send_message',
   'send_email_from_sender',
@@ -155,6 +174,12 @@ export type SensitiveByArgument =
        * a missing or a non-text argument included, makes that call sensitive. Used for a toggle that is safe to PAUSE but not to resume.
        */
       alsoRequire?: Readonly<Record<string, { argument: string; allowedValues: readonly string[] }>>;
+      /**
+       * An allowed `action` value that is sensitive as soon as ANY of these arguments is set (non-empty text or list, or any other truthy value).
+       * Used for an `update` that is fine for the fields the schedule provenance tracks but would also re-time or re-model a schedule that is
+       * the owner's own, which leaves no visitor mark.
+       */
+      forbidWhenSet?: Readonly<Record<string, readonly string[]>>;
     }
   | { kind: 'present'; arguments: readonly string[] };
 
@@ -172,14 +197,37 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   call_linkedin_marketing_api: { kind: 'action', argument: 'action', allowedValues: ['estimate-reach'], allowedPrefixes: READ_PREFIXES },
   // create and update are handled by schedule provenance (ENG-2816). A toggle writes no visitor mark, so RESUMING a paused schedule of the
   // owner's would let it run again, unrestricted, as the owner (it can email or post): only pausing is allowed. DELETE removes the owner's schedule.
-  manage_scheduled_chat: { kind: 'action', argument: 'action', allowedValues: ['create', 'update', 'toggle'], alsoRequire: { toggle: { argument: 'status', allowedValues: ['paused'] } } },
+  // An UPDATE that touches only what the provenance tracks (prompt, recipients, variables...) is marked and judged; one that re-times or re-models a
+  // schedule leaves no mark (timing is untracked on purpose, utils/scheduleProvenance.ts), so on the owner's own schedule it would make it run now or
+  // far more often, unrestricted. Those fields make an update sensitive.
+  manage_scheduled_chat: {
+    kind: 'action',
+    argument: 'action',
+    allowedValues: ['create', 'update', 'toggle'],
+    alsoRequire: { toggle: { argument: 'status', allowedValues: ['paused'] } },
+    // email_notifications: the result of every run is emailed to those addresses by AgentWeb, whatever tools the run may use
+    forbidWhenSet: {
+      create: ['email_notifications'],
+      update: ['email_notifications', 'schedule_frequency', 'frequency_interval_days', 'next_run_time', 'timezone', 'run_count', 'llm_model', 'backup_model', 'daily_digest'],
+    },
+  },
+  // Submitting variables only changes tracked fields (marked), but trigger_run starts the owner's schedule right now, paused or not, with no mark.
+  submit_scheduled_chat_variables: { kind: 'present', arguments: ['trigger_run'] },
   // The market strategy tool reads and updates through one argument; its update replaces the owner's business overview and merges competitors and ICPs.
   manage_market_strategy: { kind: 'action', argument: 'action', allowedValues: ['read'] },
   // setting a lead to do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
   set_lead_contact_status: { kind: 'action', argument: 'contact_status', allowedValues: ['do-not-contact', 'unsubscribed'] },
   google_calendar_create_event: { kind: 'present', arguments: ['attendees'] },
   google_calendar_update_event: { kind: 'present', arguments: ['attendees'] },
-  update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc'] },
+  // `dri` is an email address: every later status report and update notice of the plan goes to it, so a visitor naming an address makes the owner's next report reach it
+  update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc', 'dri'] },
+  update_gtm_plan: { kind: 'present', arguments: ['dri'] },
+  update_gtm_phase: { kind: 'present', arguments: ['dri'] },
+  // an `autocomplete` plan tells later turns to carry on without pausing, so steps a visitor wrote run unattended in the owner's next turn
+  create_work_plan: { kind: 'present', arguments: ['autocomplete'] },
+  modify_work_plan: { kind: 'present', arguments: ['autocomplete'] },
+  // the recipients a schedule's results are emailed to (the visitor mark restricts the TOOLS a run may use, not who receives the emailed result)
+  create_schedule_from_template: { kind: 'present', arguments: ['email_notifications'] },
   create_google_doc: { kind: 'present', arguments: ['share_with_emails'] },
   create_google_sheet: { kind: 'present', arguments: ['share_with_emails'] },
 };
@@ -223,6 +271,8 @@ export function isSensitiveToolCall(toolName: string, args?: unknown): boolean {
   if (typeof raw !== 'string') return true;
   const value = normaliseActionValue(raw);
   if (rule.allowedValues?.includes(value)) {
+    const forbidden = Object.prototype.hasOwnProperty.call(rule.forbidWhenSet ?? {}, value) ? rule.forbidWhenSet?.[value] : undefined;
+    if (forbidden?.some((name) => isSet(record[name]))) return true;
     const extra = Object.prototype.hasOwnProperty.call(rule.alsoRequire ?? {}, value) ? rule.alsoRequire?.[value] : undefined;
     if (!extra) return false;
     const other = record[extra.argument];
