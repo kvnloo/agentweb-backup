@@ -675,6 +675,14 @@ describe('GTM Plan Notification Service', () => {
       expect(over).toEqual({ recipients: 14, sent: 0, failed: 0, overCap: 13 });
     });
 
+    it('words around an address are not people: "Jane Doe <jane@x.test>" is one, "a@x.test (primary), b@x.test" is two', async () => {
+      const named = await sendPlanStatusReport({ ...wide, dri: 'Jane Doe <jane@x.test>' }, { notifyPlanPoc: true, maxRecipients: 1 });
+      expect(named).toEqual({ recipients: 1, sent: 1, failed: 0 });
+      (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+      const two = await sendPlanStatusReport({ ...wide, dri: 'a@x.test (primary), b@x.test' }, { notifyPlanPoc: true, maxRecipients: 1 });
+      expect(two).toEqual({ recipients: 2, sent: 0, failed: 0, overCap: 1 });
+    });
+
     it('an entry with no @ counts as one person, never as zero', async () => {
       const over = await sendPlanStatusReport({ ...wide, dri: 'not-an-address' }, { notifyPlanPoc: true, maxRecipients: 0 });
       expect(over).toEqual({ recipients: 1, sent: 0, failed: 0, overCap: 0 });
