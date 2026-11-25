@@ -8,14 +8,16 @@
   domain, role, lifecycle, priority, heat score, expected close date and similar stored fields (`manage_leads get` does); status changes and
   deal values DO appear inside engagement events (`status.changed` events carry from, to, dealValue). The history is not only emails and
   hand-recorded notes: `lead.engagements` also holds contact-status audit events (with `actorUserId`, and `delegatedByUserId` for staff
-  acting by delegation), LinkedIn invite events, hot-lead call events and Smartlead email events. `get_lead_engagements` is the history of
+  acting by delegation: both pass the public sanitiser, as they do on the portal's own route), LinkedIn invite events, hot-lead call events and
+  Smartlead events (replies, bounces and opt-outs only: no bodies, and never the emails Smartlead sent). LinkedIn messages are read from the
+  event table under `linkedin-<listId>`, for a lead with a LinkedIn URL; the email events come from the same table under the caller's domain. `get_lead_engagements` is the history of
   one lead, newest first, `limit` 1 to 100 (default 20).
 - NO stale-list search over MCP (decision after review round 3). Emma's `get_lead_details` looks for a lead that is not in `list_id` in the
   caller's other accessible lists (ENG-969): the caller's lists, then one query per organization member, then up to 8 batched reads per tier,
   retried once after 300 ms on an error. `AW-LeadLists` is provisioned at 5 read units and its `userId-index` at 5 (read-only
   `describe-table`, 2026-11-25; 412 items), so a key that can repeat that for any unknown lead id 60 times a minute (600 for a key created
   with the maximum) could throttle the lead-list reads of every tenant. The tool sends `recover_stale_list: false` and an unknown lead id is
-  refused as "Lead not found" at the cost of one read. Emma, the portal and the readback verifier send nothing and keep the search. The
+  refused as "Lead not found" with no per-member list queries (the list read, the access check and one lead read). Emma, the portal and the readback verifier send nothing and keep the search. The
   route takes `recover_stale_list` as a boolean (anything else is a 400); only `false` changes behaviour.
   `get_lead_list_statuses` returns a list's pipeline stages, including the default a list that never stored its own uses (which
   `create_lead_list get` does not show); it only reads, so it is `readOnly` and a `tools:read` key can call it.
@@ -47,13 +49,17 @@
   the portal do this for every such event at once, whatever `limit` is. A failed fetch is not stored and is tried again on the next read. The
   provider fetch path is not paced like sending (sends go out at most 2 a second). For the MCP tools the data layer takes an allowance
   (`options.maxContentFetches`, sent by the tools as 10; the routes take `max_content_fetches`, a whole number 0 to 50, and answer 400 to
-  anything else, so a bad value is never a silent "no cap"): only the newest 10 such events without a stored body are fetched per call, ONE AT A
-  TIME (an uncapped read runs them all at once, as before); the others come back without a body. A body already stored never uses the
+  anything else, so a bad value is never a silent "no cap"): only the newest 10 such events without a stored body are fetched per call, through
+  ONE chain for the whole process (`runCappedFetch` in `services/db.ts`): one at a time, 500 ms apart (the gap the platform's own sends keep),
+  at most 20 waiting; a fetch that would wait behind more is skipped and its event comes back without a body. An uncapped read (Emma, the
+  portal) does not use the chain and runs every fetch at once, as before. Resend's limit is shared with the platform's sends and the chain
+  paces only these fetches: it cannot guarantee that fetches plus sends stay under that limit, it stops a key's reads from adding a burst.
+  The other events come back without a body. A body already stored never uses the
   allowance, and a body that cannot be fetched is not remembered: it uses the allowance again on every call, so a lead whose 10 newest bodies
   fail never reaches older ones. Emma and the portal send nothing and are unchanged. `limit` does not bound reading: the email events of the
   lead's address are read in full (twice, count and list) before the page is cut. `get_lead_details` can also check a connected LinkedIn
   account (Unipile), one probe per connected account when the list names none and the user has more than one; the connection lookup is by the
-  CALLER's account.
+  list's LinkedIn account when the list names one, else by the CALLER's account.
 - Known limit, inherited from `crmDb.getLeadEngagements` / `getLeadEngagementCount` and unchanged here: email events are looked up through the
   CALLING account's single legacy `emailDomain` setting, not the list owner's (an organization member reading a shared list sees only emails
   under their own domain). An account whose sending domains are stored only in the multi-domain setting (`emailDomains[]`), or that sends from
@@ -73,7 +79,7 @@
   `manage_leads`; the descriptions say so. Email text and notes are third-party content: the descriptions tell agents to treat them as data.
 - Proof: unit tests of the request builders, refusals, error texts and descriptions (`mcp/server/__tests__/leadReadTools.test.ts`), the two
   routes against Emma's real handlers and the allowance's path to the data layer (`emmaApi.leadReadback.test.ts`), the allowance itself
-  (`crm.db.test.ts`, `getLeadEngagements`), and two tenants through the real MCP server, tool, route, handler and in-memory database
+  (`crm.db.test.ts`, `getLeadEngagements`: also the chain across concurrent reads, its pacing and its backlog limit), and two tenants through the real MCP server, tool, route, handler and in-memory database
   (`mcp.leadReads.twoTenant.test.ts`): foreign lists and lead ids, identity arguments, organization members with sharing on and off, the
   organization owner and a listed editor with sharing off, what a page holds, and that no other list is ever looked in for a lead asked for
   through the wrong list (the lists asked for are read off the database). The in-memory database now serves BatchGetItem
