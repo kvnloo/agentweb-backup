@@ -298,13 +298,22 @@ export interface RowlessManagedHostResult extends RowlessManagedHost {
  */
 export function selectRowlessManagedHosts(
   domains: Array<{ domain?: string }>,
-  pages: Array<{ id?: unknown; status?: string; userId?: string; customDomainUrl?: string }>
+  pages: Array<{
+    id?: unknown;
+    status?: string;
+    userId?: string;
+    customDomainUrl?: string;
+    archived?: boolean;
+  }>
 ): RowlessManagedHost[] {
   const registeredHosts = new Set(domains.map((d) => d.domain).filter(Boolean));
   const managedSuffix = `.${SUBDOMAIN_BASE}`;
   const out: RowlessManagedHost[] = [];
   for (const p of pages) {
     if (p.status !== "deployed" || !p.customDomainUrl) continue;
+    // ENG-3144: archiving leaves status at "deployed"; an archived page is not live, so its
+    // stored host is not a monitoring target (it alerted daily as an expired certificate).
+    if (p.archived === true) continue;
     // ENG-1907: a sandbox principal's pages never bring a host into monitoring scope.
     if (isEvaluationUser(p.userId)) continue;
     let host: string;

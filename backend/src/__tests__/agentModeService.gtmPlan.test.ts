@@ -63,8 +63,8 @@ jest.mock('../utils/secretsManager', () => ({
 // Mock GTM plan notification service
 jest.mock('../services/gtmPlanNotificationService', () => ({
   sendGTMPlanUpdateNotifications: jest.fn().mockResolvedValue(undefined),
-  sendPhaseStatusReport: jest.fn().mockResolvedValue(undefined),
-  sendPlanStatusReport: jest.fn().mockResolvedValue(undefined),
+  sendPhaseStatusReport: jest.fn().mockResolvedValue({ recipients: 1, sent: 1, failed: 0 }),
+  sendPlanStatusReport: jest.fn().mockResolvedValue({ recipients: 1, sent: 1, failed: 0 }),
 }));
 
 // Mock settings service
@@ -1713,6 +1713,49 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       expect(result.success).toBe(true);
       expect(result.message).toContain('Test GTM Plan');
       expect(sendPlanStatusReport).toHaveBeenCalled();
+    });
+
+    it('does not say "sent" when no recipient resolved (a plan with no contact set)', async () => {
+      setupMockGet(mockPlan);
+      (sendPlanStatusReport as jest.Mock).mockResolvedValueOnce({ recipients: 0, sent: 0, failed: 0 });
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, undefined,
+        { notifyPlanPoc: true },
+        mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Nothing was emailed');
+    });
+
+    it('does not say "sent" when the mail service refused every email (phase report)', async () => {
+      setupMockGet(mockPlan);
+      (sendPhaseStatusReport as jest.Mock).mockResolvedValueOnce({ recipients: 2, sent: 0, failed: 2 });
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, mockPhaseId,
+        { notifyUser: true, notifyPhasePoc: true },
+        mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Nothing was delivered');
+    });
+
+    it('reports a partial send as sent, with the count that failed', async () => {
+      setupMockGet(mockPlan);
+      (sendPlanStatusReport as jest.Mock).mockResolvedValueOnce({ recipients: 3, sent: 2, failed: 1 });
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, undefined,
+        { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true },
+        mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('2 of 3');
+      expect(result.message).toContain('1 could not be sent');
     });
 
     it('should return error when plan not found', async () => {

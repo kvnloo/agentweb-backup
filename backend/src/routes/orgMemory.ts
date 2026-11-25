@@ -2,7 +2,13 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { orgMemoryDb, orgDb, userDb } from '../services/db';
 import { embedText } from '../utils/embeddings';
+import { assertMemorySaveable } from '../utils/memorySaveGuard';
 import { callerCan } from "../services/orgAuthz";
+import { MEMORY_READ_MAX_ROWS_LIST } from '../utils/memoryReadLimits';
+
+// ENG-2840 (W2-1): what the list screens read: up to the list bound, the NEWEST rows (the handler returns them oldest first, the order the
+// screen always had), without embeddings. A category read cannot be ordered by time (its index sorts by category) and is returned as read.
+const LIST_READ = { maxRows: MEMORY_READ_MAX_ROWS_LIST, newestFirst: true, omitEmbeddings: true } as const;
 
 const router = express.Router();
 
@@ -74,8 +80,10 @@ router.get('/:orgId/memory', async (req, res) => {
     if (!member) return res.status(403).json({ error: 'Not a member of this organization' });
 
     const category = req.query.category as string | undefined;
-    const memories = await orgMemoryDb.getOrgMemories(orgId, category);
-    res.json({ memories });
+    // ENG-2840 (W2-1): the whole list (up to the list bound), oldest first as always, without the embedding vectors the screen never reads.
+    const rows = await orgMemoryDb.getOrgMemories(orgId, category, undefined, LIST_READ);
+    // The read is newest first so that, past the bound, it is the OLDEST rows that are left out; the screen has always listed oldest first.
+    res.json({ memories: category ? rows : [...rows].reverse() });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch org memories' });
   }
@@ -98,6 +106,9 @@ router.post('/:orgId/memory', async (req, res) => {
     if (!category || typeof category !== 'string') {
       return res.status(400).json({ error: 'category is required and must be a string' });
     }
+
+    // Refuse what addMemory would refuse BEFORE the embedding is requested (and billed to the caller's cap).
+    assertMemorySaveable(category, content);
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const embedding = (await embedText(content, { userId, feature: 'embeddings' })) ?? undefined;
