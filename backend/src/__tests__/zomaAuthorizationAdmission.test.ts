@@ -36,7 +36,12 @@ describe('ENG-2781 Databricks-origin authorization', () => {
   it('passes the Databricks origin to the seat decision for an account created since launch', async () => {
     mockUser.mockResolvedValue(fresh);
     expect(await admitZomaAuthorizationSignup('new', { databricks: true })).toBe('approved');
-    expect(mockAdmit).toHaveBeenCalledWith('new@company.example', undefined, { databricks: true });
+    expect(mockAdmit).toHaveBeenCalledWith('new@company.example', undefined, { databricks: true, userId: 'new' });
+  });
+  it('adds the account to the origin for the attribution log, keeping the client the route named', async () => {
+    mockUser.mockResolvedValue(fresh);
+    await admitZomaAuthorizationSignup('new', { databricks: true, clientId: 'client-1' });
+    expect(mockAdmit).toHaveBeenCalledWith('new@company.example', undefined, { databricks: true, clientId: 'client-1', userId: 'new' });
   });
   it.each([undefined, {}, { databricks: false }])('an authorization with origin %p is decided exactly as before', async (origin) => {
     mockUser.mockResolvedValue(fresh);

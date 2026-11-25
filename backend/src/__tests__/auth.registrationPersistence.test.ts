@@ -342,10 +342,12 @@ describe('ENG-2781 Databricks-origin signup skips the Zoma seat cap', () => {
     expect(mockAdmitZoma.mock.calls).toEqual([['ghost@unresolvable.test']]);
   });
 
-  it('a Databricks marker bolted onto an ordinary intent is rejected before admission', async () => {
+  it('a Databricks marker bolted onto an ordinary intent is rejected by the invalid-intent guard, before admission', async () => {
+    // A company-domain address: a personal one would be refused by the personal-email gate before this guard runs.
     const [expiry, mac] = mintZomaSignupIntent().split('.');
-    const r = await emailSignup({ signupIntent: `${expiry}.db.${mac}` });
+    const r = await request(app).post('/register').send({ email: 'ghost@unresolvable.test', password: 'ValidPass123!', signupSource: 'mcp', signupIntent: `${expiry}.db.${mac}` });
     expect(r.status).toBe(400);
+    expect(r.body.code).toBe('invalid_signup_intent');
     expect(mockAdmitZoma).not.toHaveBeenCalled();
     expect(mockCreateUser).not.toHaveBeenCalled();
   });

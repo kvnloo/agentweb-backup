@@ -239,7 +239,7 @@ describe('ENG-2781 Databricks-origin OAuth clients and the Zoma seat cap', () =>
       const res = await decide(DATABRICKS_REDIRECT);
       expect(res.status).toBe(302);
       expect(res.headers.location).toContain('code=code-1');
-      expect(mockZomaAuthorizationAdmission).toHaveBeenCalledWith('user-9', { databricks: true });
+      expect(mockZomaAuthorizationAdmission).toHaveBeenCalledWith('user-9', { databricks: true, clientId: 'c1' });
     });
 
     it('still waitlists a client that is not Databricks-origin, with the admission call unchanged', async () => {
@@ -271,7 +271,7 @@ describe('ENG-2781 Databricks-origin OAuth clients and the Zoma seat cap', () =>
     it('mirrors the read-only gate: a client with any Databricks redirect URI is Databricks-origin', async () => {
       mockSvc.getClient.mockResolvedValue({ ...databricksClient({ clientName: 'Claude' }), redirectUris: [LOCAL_REDIRECT, DATABRICKS_REDIRECT] });
       expect((await decide(LOCAL_REDIRECT)).status).toBe(302);
-      expect(mockZomaAuthorizationAdmission).toHaveBeenCalledWith('user-9', { databricks: true });
+      expect(mockZomaAuthorizationAdmission).toHaveBeenCalledWith('user-9', { databricks: true, clientId: 'c1' });
     });
 
     it('never consults capacity for Emma, Databricks client or not', async () => {
@@ -290,7 +290,7 @@ describe('ENG-2781 Databricks-origin OAuth clients and the Zoma seat cap', () =>
         .query({ response_type: 'code', client_id: 'c1', redirect_uri: DATABRICKS_REDIRECT, code_challenge: 'ch', code_challenge_method: 'S256', ...zoma });
       expect(ok.status).toBe(302);
       expect(ok.headers.location).toContain('code=code-1');
-      expect(mockZomaAuthorizationAdmission).toHaveBeenCalledWith('user-5', { databricks: true });
+      expect(mockZomaAuthorizationAdmission).toHaveBeenCalledWith('user-5', { databricks: true, clientId: 'c1' });
 
       mockZomaAuthorizationAdmission.mockClear();
       mockSvc.getClient.mockResolvedValue({ ...databricksClient(), redirectUris: [LOCAL_REDIRECT] });
@@ -304,6 +304,30 @@ describe('ENG-2781 Databricks-origin OAuth clients and the Zoma seat cap', () =>
       mockZomaAuthorizationAdmission.mockResolvedValue('approved');
       expect((await decide()).status).toBe(302);
       expect(mockZomaAuthorizationAdmission.mock.calls).toEqual([['user-9']]);
+    });
+
+    it('a gate that is off treats a Databricks-redirect client exactly as main does: ordinary intent, one-argument admission call', async () => {
+      delete process.env.ZOMA_WAITLIST_ENABLED;
+      mockZomaAuthorizationAdmission.mockResolvedValue('approved');
+      mockSvc.getClient.mockResolvedValue(databricksClient());
+      const { isDatabricksSignupIntent } = require('../services/zomaSignupIntent');
+      const consent = await authorize({ ...zoma, redirect_uri: DATABRICKS_REDIRECT });
+      const intent = new URL(consent.headers.location).searchParams.get('mcp_signup_intent');
+      expect(isDatabricksSignupIntent(intent)).toBe(false);
+      expect(intent!.split('.')).toHaveLength(2);
+      const res = await decide(DATABRICKS_REDIRECT);
+      expect(res.status).toBe(302);
+      expect(res.headers.location).toContain('code=code-1');
+      expect(mockZomaAuthorizationAdmission.mock.calls).toEqual([['user-9']]);
+    });
+
+    it('a refusal for a Databricks client (an admin Reject surfaces as a non-approved decision) is a waitlist response, with no code issued', async () => {
+      mockZomaAuthorizationAdmission.mockResolvedValue('rejected');
+      mockSvc.getClient.mockResolvedValue(databricksClient());
+      const res = await decide(DATABRICKS_REDIRECT);
+      expect(res.status).toBe(202);
+      expect(res.body).toMatchObject({ code: 'waitlisted' });
+      expect(mockSvc.createAuthorizationCode).not.toHaveBeenCalled();
     });
   });
 

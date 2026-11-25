@@ -51,9 +51,16 @@ describe('ENG-2781 Databricks-origin signup intent', () => {
   });
 
   it('an ordinary intent keeps its original two-part shape', () => {
-    expect(mintZomaSignupIntent().split('.')).toHaveLength(2);
-    expect(mintZomaSignupIntent({})).toBe(mintZomaSignupIntent());
-    expect(mintZomaSignupIntent({ databricks: true }).split('.')[1]).toBe('db');
+    // Pinned clock: two mints either side of a second boundary would otherwise differ.
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    try {
+      expect(mintZomaSignupIntent().split('.')).toHaveLength(2);
+      expect(mintZomaSignupIntent({})).toBe(mintZomaSignupIntent());
+      expect(mintZomaSignupIntent({ databricks: false })).toBe(mintZomaSignupIntent());
+      expect(mintZomaSignupIntent({ databricks: true }).split('.')[1]).toBe('db');
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it('the Databricks marker cannot be added to an ordinary intent', () => {
