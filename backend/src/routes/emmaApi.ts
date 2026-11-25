@@ -1068,6 +1068,26 @@ router.post('/lead-engagements', async (req: Request, res: Response) => {
   }
 });
 
+// ENG-2840 (W2-6a): the organization's lead-notification settings for the MCP tool of the same name. Unlike Emma's own read, it requires
+// org:configure (the view holds Slack channel and user ids), as the hot-lead call settings read does. Refusals are real 4xx answers.
+router.get('/lead-notification-settings', async (req: Request, res: Response) => {
+  try {
+    const { readLeadNotificationSettings } = await import('../emma/leadNotificationTools');
+    const { OrgMembershipRequiredError } = await import('../emma/orgCaller');
+    try {
+      res.json(await readLeadNotificationSettings({ userId: userId(req) }, { requireConfigure: true }));
+    } catch (err: any) {
+      if (err instanceof OrgMembershipRequiredError) return res.status(404).json({ message: 'Organization membership required' });
+      if (String(err?.message).startsWith('Only org owners and admins')) return res.status(403).json({ message: 'Only organization owners and admins can read the lead notification settings' });
+      if (err?.message === 'Organization not found') return res.status(404).json({ message: 'Organization not found' });
+      console.error('lead-notification-settings read failed:', err?.message);
+      res.status(500).json({ message: 'The lead notification settings could not be read' });
+    }
+  } catch (err: any) {
+    res.status(500).json({ message: 'The lead notification settings could not be read' });
+  }
+});
+
 router.post('/lead-list-statuses', async (req: Request, res: Response) => {
   const body = req.body ?? {};
   if (!isId(body.list_id)) return res.status(400).json({ message: 'list_id is required' });
