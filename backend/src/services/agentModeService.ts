@@ -52,6 +52,7 @@ import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
 import { requiredToolsBudgetNote, uncalledRequiredTools } from './agentMode/core/stepBudgetRequiredTools';
 import { recordSessionBreakerShadowTurn, shadowTurnCostUsd } from './sessionBreakerShadow';
+import { startSessionLimitForRun, sessionLimitWarningMessage } from './sessionLimit';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -3594,7 +3595,7 @@ export class AgentModeService {
     // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
     // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
     modelRouting?: MessageModelRouting,
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; pausedBySessionLimit?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3684,6 +3685,19 @@ export class AgentModeService {
       // truncates the tool list to the model's maxTools. Read once per turn; a failed
       // read only loses the prioritisation, never the turn.
       const requiredToolNamesForTurn = await this.resolveScheduledRequiredToolNames(currentSession);
+
+      // ENG-2812: persisted per-session turn/spend limit. Null when off, mocked, or unreadable (fail open).
+      // Notices are in-app chat only: shown on runs from the chat controller (persistIncrementally), never on
+      // unattended runs or Slack sessions, whose replies leave the app.
+      const sessionLimit = mockMode ? null : await startSessionLimitForRun({
+        sessionId,
+        userId,
+        messageContent,
+        isUnattendedRun,
+        warningsAllowed: persistIncrementally && !(currentSession?.pageIdentifier || '').toLowerCase().includes('slack'),
+      });
+      const sessionLimitUnattended = isUnattendedRun === true;
+      let pausedBySessionLimit = false;
 
       let content = '';
       const toolCalls: any[] = [];
@@ -3962,6 +3976,16 @@ export class AgentModeService {
           if (!content) {
             content = 'Generation was stopped.';
           }
+          break;
+        }
+
+        // ENG-2812: the session's limit window is used up — stop before another model call and wait for
+        // the person to reply "continue" (an unattended run stays paused until someone does).
+        // `content` is emptied so the post-loop reply rewriters leave it alone; the pause text is set
+        // just before the reply is persisted.
+        if (sessionLimit?.reached()) {
+          content = '';
+          pausedBySessionLimit = true;
           break;
         }
 
@@ -4419,24 +4443,27 @@ export class AgentModeService {
 
         // ENG-2953: shadow of the ENG-2820 session turn/spend breaker. On by default (ENG-2812),
         // off with SESSION_BREAKER_SHADOW=false; log-only, never alters this turn.
+        const turnCostUsd = () => {
+          const usage: any = (response as any)?.usage;
+          if (!usage) return 0;
+          return shadowTurnCostUsd(usage, this.estimateCost(
+            llmModel,
+            Number(usage.prompt_tokens) || 0,
+            Number(usage.completion_tokens) || 0,
+            Number(usage.cache_read_input_tokens) || 0,
+            Number(usage.cache_creation_input_tokens) || 0,
+            usage.cache_creation_by_ttl,
+          ));
+        };
         recordSessionBreakerShadowTurn({
           sessionId,
           userId,
           billingUserId,
           isScheduled: isScheduledSession,
-          costUsd: () => {
-            const usage: any = (response as any)?.usage;
-            if (!usage) return 0;
-            return shadowTurnCostUsd(usage, this.estimateCost(
-              llmModel,
-              Number(usage.prompt_tokens) || 0,
-              Number(usage.completion_tokens) || 0,
-              Number(usage.cache_read_input_tokens) || 0,
-              Number(usage.cache_creation_input_tokens) || 0,
-              usage.cache_creation_by_ttl,
-            ));
-          },
+          costUsd: turnCostUsd,
         });
+        // ENG-2812: count this model call against the session's persisted limit (same cost rule as the shadow).
+        if (sessionLimit) await sessionLimit.recordTurn(turnCostUsd());
 
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
@@ -5683,6 +5710,15 @@ export class AgentModeService {
         content = buildIterationLimitReport(content, toolCalls);
       }
 
+      if (pausedBySessionLimit && sessionLimit) {
+        content = sessionLimit.pauseMessage(sessionLimitUnattended);
+      }
+      // ENG-2812: a one-time 75%/90% notice claimed during this run, appended to the reply (in-app chat only).
+      const sessionLimitWarning = !wasCancelled && !pausedBySessionLimit ? sessionLimit?.dueWarning() : undefined;
+      if (sessionLimitWarning) {
+        content = `${content}\n\n${sessionLimitWarningMessage(sessionLimitWarning)}`;
+      }
+
       // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
       // content-filter and time-budget texts are assigned to `content` after the
       // model's own (often empty) message was already appended, so the transcript
@@ -5699,7 +5735,8 @@ export class AgentModeService {
           && lastResponse.role === 'assistant'
           && !(Array.isArray(lastResponse.tool_calls) && lastResponse.tool_calls.length > 0)
           && persistedTail.length > persistedResponseCount;
-        if (lastIsUnflushedTextAnswer) {
+        // ENG-2812: a session-limit pause is always its own message, never written over the model's text.
+        if (lastIsUnflushedTextAnswer && !pausedBySessionLimit) {
           if (lastResponse.content !== content) lastResponse.content = content;
         } else {
           (messages as any[]).push({
@@ -5742,6 +5779,9 @@ export class AgentModeService {
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
             ...(truncatedByStepBudget && !wasCancelled ? { iterationLimitReached: true } : {}),
+            // ENG-2812: machine-readable marks for the session-limit pause and notices.
+            ...(pausedBySessionLimit && sessionLimit ? { sessionLimitPaused: { ...sessionLimit.usage(), ...sessionLimit.caps } } : {}),
+            ...(sessionLimitWarning ? { sessionLimitWarning } : {}),
             ...(citations.length > 0 ? { citations } : {}),
             // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
             // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
@@ -5787,6 +5827,8 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
+        // ENG-2812: the run stopped at the session limit; callers must not auto-continue it.
+        ...(pausedBySessionLimit ? { pausedBySessionLimit: true } : {}),
         ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
         ...(pendingApprovalDeck ? { pendingApprovalDeck } : {})
       };
