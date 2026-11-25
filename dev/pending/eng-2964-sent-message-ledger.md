@@ -1,4 +1,4 @@
-## ENG-2964: permanent sent-message records, production shadow
+## ENG-2964: permanent sent-message records, production shadow (2026-11-25)
 
 - Created production AW-SentMessages via standalone CloudFormation, us-west-2, PITR/SSE/Retain.
 - Success-only detached recording at sendAsSender and LinkedIn message/InMail; default shadow,
