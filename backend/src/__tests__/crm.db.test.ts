@@ -2181,8 +2181,8 @@ describe('CRM Database Service', () => {
     describe('options.maxContentFetches', () => {
       // the pacing between capped fetches is 500 ms in production; most tests here do not wait for it
       const productionTuning = { ...cappedFetchTuning };
-      beforeEach(() => { cappedFetchTuning.gapMs = 0; cappedFetchTuning.backlog = productionTuning.backlog; });
-      afterEach(() => { cappedFetchTuning.gapMs = productionTuning.gapMs; cappedFetchTuning.backlog = productionTuning.backlog; });
+      beforeEach(() => { Object.assign(cappedFetchTuning, productionTuning, { gapMs: 0 }); });
+      afterEach(() => { Object.assign(cappedFetchTuning, productionTuning); });
       const listId = 'list_cap';
       const leadId = 'lead_cap';
       const userId = 'user_cap';
@@ -2281,6 +2281,61 @@ describe('CRM Database Service', () => {
         arrange(fiveEvents());
         await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 2 });
         expect(fetchedIds()).toHaveLength(2);
+      });
+
+      it('a fetch that never answers is given up on after the deadline: the event comes back without a body, the later fetches still run, and the chain is free afterwards', async () => {
+        cappedFetchTuning.timeoutMs = 40;
+        arrange(fiveEvents());
+        // the newest delivered event (e4) never settles; the others answer
+        resend.getDeliveredEmailContent.mockImplementation((emailId: string) => (emailId === 'email-e4' ? new Promise(() => undefined) : Promise.resolve({ html: `<p>${emailId}</p>`, text: emailId })));
+        const started = Date.now();
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 5 });
+        expect(Date.now() - started).toBeLessThan(2000);
+        expect(result.engagements).toHaveLength(5);
+        const withBody = result.engagements.filter((e: any) => e.emailContent).map((e: any) => e.eventData.subject).sort();
+        expect(withBody).toEqual(['e1', 'e2', 'e3', 'e5']);
+        // nothing is left waiting: a later read fetches normally
+        arrange(fiveEvents());
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 5 });
+        expect(fetchedIds()).toHaveLength(5);
+      });
+
+      it('the waiting count comes back down after fetches that were rejected (a backlog of 2 still serves the next read)', async () => {
+        cappedFetchTuning.backlog = 2;
+        arrange(fiveEvents());
+        resend.getReceivedEmailContent.mockRejectedValue(new Error('provider down'));
+        resend.getDeliveredEmailContent.mockRejectedValue(new Error('provider down'));
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 2 });
+        expect(fetchedIds()).toHaveLength(2);
+        arrange(fiveEvents());
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 2 });
+        expect(fetchedIds()).toHaveLength(2);
+        expect(result.engagements.filter((e: any) => e.emailContent)).toHaveLength(2);
+      });
+
+      it('one account cannot fill the chain: it is held to `perUser`, and another account is still served', async () => {
+        cappedFetchTuning.perUser = 2;
+        arrange(fiveEvents());
+        const state = trackConcurrency();
+        const [a, b] = await Promise.all([
+          crmDb.getLeadEngagements(listId, leadId, 'user_a', { maxContentFetches: 4 }),
+          crmDb.getLeadEngagements(listId, leadId, 'user_b', { maxContentFetches: 4 }),
+        ]);
+        expect(a.engagements.filter((e: any) => e.emailContent)).toHaveLength(2);
+        expect(b.engagements.filter((e: any) => e.emailContent)).toHaveLength(2);
+        expect(state.max).toBe(1);
+        // the per-account count was given back: the same account fetches again
+        arrange(fiveEvents());
+        await crmDb.getLeadEngagements(listId, leadId, 'user_a', { maxContentFetches: 2 });
+        expect(fetchedIds()).toHaveLength(2);
+      });
+
+      it('when the chain is busy, what is skipped is the OLDEST of the allowed events, not the newest', async () => {
+        cappedFetchTuning.backlog = 2;
+        arrange(fiveEvents());
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 5 });
+        const withBody = result.engagements.filter((e: any) => e.emailContent).map((e: any) => e.eventData.subject).sort();
+        expect(withBody).toEqual(['e4', 'e5']);
       });
 
       it('a provider that answers nothing (the real service returns null after its retries) leaves the event without a body, stores nothing, and uses the allowance', async () => {
