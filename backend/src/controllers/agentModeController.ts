@@ -2167,7 +2167,7 @@ async function scheduleAutoMediaContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillDeferred = !resolved?.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
+      stillDeferred = !resolved?.truncatedByStepBudget && !resolved?.pausedBySessionLimit && hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
       if (resolved?.content) {
         const { io } = await import('../server');
         // ENG-1495: resolved is this call's own generateSessionResponse result, so its
@@ -2900,7 +2900,7 @@ async function scheduleAutoWorkPlanContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillStalled = !resolved?.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
+      stillStalled = !resolved?.truncatedByStepBudget && !resolved?.pausedBySessionLimit && hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
       if (resolved?.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(resolved?.toolCalls)) {
         await postWorkPlanNeedsYouMessage(sessionId, userId);
       }
@@ -4925,7 +4925,7 @@ type RunVerifiedChatResult = {
   attempts: number;
   workPlanCompleted: boolean;
   // ENG-2854: why a failed run stopped when it was not a requirements miss.
-  terminationReason?: 'iteration_limit';
+  terminationReason?: 'iteration_limit' | 'session_limit';
   // ENG-396: set when a headless turn left an unanswered blocking question. The
   // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
@@ -5391,9 +5391,9 @@ async function runVerifiedChatInner(
   // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
   // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
   // or null when no question is awaiting.
-  const iterationLimitStopResult = (): RunVerifiedChatResult => ({
+  const iterationLimitStopResult = (terminationReason: 'iteration_limit' | 'session_limit' = 'iteration_limit'): RunVerifiedChatResult => ({
     success: false,
-    terminationReason: 'iteration_limit',
+    terminationReason,
     content: allContent,
     toolCalls: allToolCalls,
     // Score against the truncated turn's content: remainingKeywords is only pruned later.
@@ -5665,6 +5665,8 @@ async function runVerifiedChatInner(
           ...continuationToolCalls.filter((call: any) => call?.name)
         );
         if (continuationResponse.truncatedByStepBudget) return iterationLimitStopResult();
+        // ENG-2812: paused at the session limit — a person must confirm; never press again.
+        if (continuationResponse.pausedBySessionLimit) return iterationLimitStopResult('session_limit');
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
         // main turn instead of falling through and returning success on an
@@ -5817,6 +5819,8 @@ async function runVerifiedChatInner(
       allActualFunctionCallsForReporting.push(...toolCalls.filter((call: any) => call?.name));
       // Exhaustion requires explicit review/resume, never a requirements-driven retry.
       if (response.truncatedByStepBudget) return iterationLimitStopResult();
+      // ENG-2812: paused at the session limit — a person must confirm; never retry into the pause.
+      if (response.pausedBySessionLimit) return iterationLimitStopResult('session_limit');
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -8567,6 +8571,8 @@ export async function runScheduledChat(
       // was left unwritten — marked so the waived minimum is still observable in
       // runResults rather than looking like every requirement was met.
       ...(result.readOnlyRequirementWaived ? { readOnlyRequirementWaived: true } : {}),
+      // ENG-2812: keep why the run stopped (session_limit pause / iteration_limit) on the stored run record.
+      ...(result.terminationReason ? { terminationReason: result.terminationReason } : {}),
       // ENG-2816 (step 3): see skippedRequiredCalls on this function's return type.
       ...(runRequired.skipped.length > 0 ? { skippedRequiredCalls: runRequired.skipped } : {}),
       // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
@@ -8689,7 +8695,8 @@ export async function runScheduledChat(
     // rewrite the schedule's prompt so future runs do better. Runs on test runs too so
     // it's easy to try out. Best-effort — never fails the run.
     // ENG-2854: an iteration-limit report is the terminal turn; no further model turn.
-    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit') {
+    // ENG-2812: nor after a session-limit pause, which is waiting for a person.
+    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit' && result.terminationReason !== 'session_limit') {
       try {
         await runScheduleSelfImprovement({
           schedule,
@@ -10076,6 +10083,8 @@ async function runSessionTurn(
   // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
   // partial answer from a forced synthesis turn instead of the full deliverable.
   truncatedByTimeBudget?: boolean;
+  // ENG-2812: the run stopped at the session's turn/spend limit; no automatic follow-up turn.
+  pausedBySessionLimit?: boolean;
   // ENG-1239: true when the run was cooperatively cancelled (e.g. preempted by a genuine
   // customer message) before it could compose a closing reply — content may be empty
   // even though toolCalls shows real work (an already-dispatched call can't be aborted).
@@ -12218,7 +12227,7 @@ export const agentModeController = {
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
       // ENG-2113: automatic follow-up turns would run on AgentWeb's models; on the plan route the user is asked to continue instead.
-      if (!planRoute && !response.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+      if (!planRoute && !response.truncatedByStepBudget && !response.pausedBySessionLimit && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
         setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
@@ -12230,7 +12239,7 @@ export const agentModeController = {
       // "retry" instead of just continuing per the plan's own "never wait on the user"
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
-      if (!planRoute && !response.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
+      if (!planRoute && !response.truncatedByStepBudget && !response.pausedBySessionLimit && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
@@ -18681,6 +18690,8 @@ export const agentModeController = {
         success: result.success,
         message: result.success
           ? `All required functions were called successfully.`
+          : result.terminationReason === 'session_limit'
+          ? 'Paused at the session turn/spend limit; reply "continue" in the session to keep going.'
           : result.terminationReason === 'iteration_limit'
           ? `Stopped at the iteration limit after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}; see the resumable report in content.`
           : `Some required functions were not called enough times after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}.`,
