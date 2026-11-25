@@ -303,6 +303,12 @@ export interface PreflightToolResult {
  * these to its own implementations; tests wire fakes.
  */
 export interface ToolDispatchPorts {
+  /**
+   * ENG-3170: did the owner turn on full control for the share link this session belongs to? Only asked when a share-link visitor
+   * calls a tool the visitor block list refuses, so the early (model-facing) refusal does not turn away a visitor whose link has it.
+   * Absent or false keeps the refusal (fail closed); `executeTool` makes the same decision again from a consistent read.
+   */
+  shareLinkFullControl?: (sessionId: string) => Promise<boolean>;
   /** evaluate the tool gateway policy for a (tool, args) pair */
   evaluateAgentToolPolicy: (input: {
     toolName: string;
@@ -799,7 +805,11 @@ export async function executePreparedTools(
       // share_visitor restriction profile (toolRestrictionProfiles.ts); executeTool enforces the same
       // profile, so a path that does not come through this preflight (voice) is refused there too.
       if (isInteractiveShare) {
-        const refusal = restrictionRefusal('share_visitor', toolCall.function.name, adminSkillToolNames);
+        let refusal = restrictionRefusal('share_visitor', toolCall.function.name, adminSkillToolNames);
+        // ENG-3170: on a link whose owner turned on full control the rest of the block list is lifted (admin tools never are).
+        if (refusal && ports.shareLinkFullControl && await ports.shareLinkFullControl(sessionId)) {
+          refusal = restrictionRefusal('share_visitor', toolCall.function.name, adminSkillToolNames, undefined, { linkAllowsFullControl: true });
+        }
         if (refusal) {
           appendPreflightToolFailure(toolCall, functionArgs, refusal, JSON.stringify({ error: refusal }));
           continue;

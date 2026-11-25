@@ -20,6 +20,12 @@ describe('describeScheduledRunFailureReasons (ENG-1735)', () => {
     expect(reasons).toEqual([expect.stringMatching(/work plan not completed/)]);
   });
 
+  it('names the blocked step and prerequisite instead of a generic incomplete plan (ENG-2998)', () => {
+    expect(describeScheduledRunFailureReasons({
+      ...base, workPlanCompleted: false, workPlanBlockReason: 'Guest extraction: reason=no_key',
+    })).toEqual(['work plan blocked: Guest extraction: reason=no_key']);
+  });
+
   it('names empty output only when nothing more specific explains the failure', () => {
     expect(describeScheduledRunFailureReasons({ ...base, content: '' })).toEqual([
       expect.stringMatching(/empty final response/),

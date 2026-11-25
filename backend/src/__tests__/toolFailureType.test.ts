@@ -1,6 +1,6 @@
 import { classifyToolFailureType, FAILURE_TYPES } from '../utils/toolFailureType';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
-import { ToolRestrictionDenied, restrictionRefusal, scheduleProvenanceUnverifiableRefusal } from '../services/toolRestrictionProfiles';
+import { ToolRestrictionDenied, restrictionRefusal, scheduleProvenanceUnverifiableRefusal, sensitiveActionRefusal, sensitiveActionScheduleRefusal, sensitiveActionUnverifiableRefusal } from '../services/toolRestrictionProfiles';
 
 /**
  * Decision-layer classification for agent tool failures. Sits on top of the
@@ -338,6 +338,18 @@ describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM r
     });
     it('keeps the transient provenance-unverifiable refusal as bug (class name alone is not enough)', () => {
       expect(roundTrip(scheduleProvenanceUnverifiableRefusal(t))).toBe('bug');
+    });
+    // ENG-3170: a visitor refused a sensitive tool on a link the owner left off is the guard working, not a tool bug
+    it.each([
+      ['share-link sensitive action', sensitiveActionRefusal('delete_leads')],
+      ['scheduled-run sensitive action', sensitiveActionScheduleRefusal('slack_send_message')],
+      ['scheduled-run sensitive action (profile refusal)', restrictionRefusal('share_visitor_schedule', 'delete_leads', [], {})],
+    ])('round-trips the %s refusal to by_design', (_n, msg) => {
+      expect(msg).toBeTruthy();
+      expect(roundTrip(msg as string)).toBe('by_design');
+    });
+    it('keeps "the owner\'s setting could not be verified just now" as bug, like the provenance one', () => {
+      expect(roundTrip(sensitiveActionUnverifiableRefusal('delete_leads'))).toBe('bug');
     });
   });
 

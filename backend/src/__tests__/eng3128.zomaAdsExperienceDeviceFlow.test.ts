@@ -174,7 +174,7 @@ describe('ENG-3128 device-flow page', () => {
     expect(h.deps.saveAdsExperience).not.toHaveBeenCalled();
   });
 
-  it('HTTP: the question renders as a radio form posting to /api/zoma/ads-experience; submitting not_interested shows thanks', async () => {
+  it('HTTP: the question renders as one-click answer buttons posting to /api/zoma/ads-experience; submitting not_interested shows thanks', async () => {
     const h = harness();
     const { deviceId } = await approved(h);
     const app = express();
@@ -185,7 +185,10 @@ describe('ENG-3128 device-flow page', () => {
     expect(page.status).toBe(200);
     expect(page.text).toContain('How familiar are you with ads?');
     expect(page.text).toContain(`action="${ZOMA_ADS_EXPERIENCE_PATH}"`);
-    expect(page.text).toContain('type="radio" name="answer" value="not_interested"');
+    // Same `answer` field as before, now carried by a submit button so one click answers.
+    expect(page.text).toContain('name="answer" value="not_interested"');
+    expect(page.text).toContain('type="submit" class="choice"');
+    expect(page.text).not.toContain('type="radio"');
     expect(page.text).toContain('Not interested, just a friend');
 
     const res = await request(app).post('/api/zoma/ads-experience').type('form').send({ t, answer: 'not_interested' });
