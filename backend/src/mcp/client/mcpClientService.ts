@@ -12,6 +12,14 @@ import { internalMcpServers } from "./mcp_config";
 import { McpOAuthClientProvider, getServerConfig } from "./mcpOAuthClientProvider";
 import { buildMcpToolTelemetry } from "./mcpToolTelemetry";
 import { buildStdioChildEnv } from "./stdioChildEnv";
+import {
+  PLAYWRIGHT_BLOCKED_ORIGINS,
+  PLAYWRIGHT_INHERIT_ENV_FLAG,
+  PLAYWRIGHT_WORK_ROOT,
+  browserNavigationRefusal,
+  playwrightChildEnv,
+  playwrightWorkDirName,
+} from "./playwrightContainment";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -259,6 +267,8 @@ export class McpClientService {
   // Generated Playwright --config / stealth-script files, by pool key, so they can be
   // deleted along with the pool that owns them.
   private playwrightConfigFiles: Map<string, Set<string>> = new Map();
+  /** ENG-3187: each pooled browser server's own empty working and output folder, removed with the pool. */
+  private playwrightWorkDirs: Map<string, string> = new Map();
 
   // Session cleanup timeout (default: 1 hour)
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
@@ -417,6 +427,7 @@ export class McpClientService {
     // Clear Playwright configs orphaned by a previous process that died without releasing
     // its pools; the per-pool cleanup can't reach those.
     this.sweepStalePlaywrightConfigs();
+    this.sweepStalePlaywrightWorkDirs();
     try {
       // 1. Load Internal Config (from code)
       // Skip servers marked isInternal: true — they connect back to ourselves
@@ -562,6 +573,29 @@ export class McpClientService {
   }
 
   /**
+   * ENG-3187: make the browser server's own working and output folder (empty, owner-only). The server runs inside it, and Playwright confines the
+   * browser's file tools to its working folder, so they no longer reach the backend's own folder. Remembered per pool so releasing the pool removes it.
+   */
+  private createPlaywrightWorkDir(poolKey: string | undefined, name: string): string {
+    const dir = path.join(PLAYWRIGHT_WORK_ROOT, playwrightWorkDirName(poolKey || name));
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (poolKey) this.playwrightWorkDirs.set(poolKey, dir);
+    return dir;
+  }
+
+  /** Best-effort delete of a pool's browser working folder. */
+  private removePlaywrightWorkDir(poolKey: string): void {
+    const dir = this.playwrightWorkDirs.get(poolKey);
+    if (!dir) return;
+    this.playwrightWorkDirs.delete(poolKey);
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (error) {
+      console.warn(`MCP: Could not remove Playwright working folder ${dir}:`, (error as Error).message);
+    }
+  }
+
+  /**
    * Sweep Playwright config files old enough that no live process can still be reading them.
    * Covers the case our per-pool cleanup cannot: a hard kill (SIGKILL/OOM) that leaves the
    * files with no pool to release them.
@@ -588,6 +622,32 @@ export class McpClientService {
       }
     } catch (error) {
       console.warn('MCP: Failed to sweep stale Playwright MCP config files:', (error as Error).message);
+    }
+  }
+
+  /** ENG-3187: the same hard-kill leftovers sweep for the browser servers' working folders. */
+  private sweepStalePlaywrightWorkDirs(): void {
+    const root = PLAYWRIGHT_WORK_ROOT;
+    try {
+      if (!fs.existsSync(root)) return;
+      const cutoff = Date.now() - McpClientService.PLAYWRIGHT_CONFIG_MAX_AGE_MS;
+      let removed = 0;
+      for (const entry of fs.readdirSync(root)) {
+        const dir = path.join(root, entry);
+        try {
+          if (fs.statSync(dir).mtimeMs < cutoff) {
+            fs.rmSync(dir, { recursive: true, force: true });
+            removed++;
+          }
+        } catch {
+          // Raced with another process cleaning the same folder — nothing to do.
+        }
+      }
+      if (removed > 0) {
+        console.log(`MCP: Swept ${removed} stale Playwright working folder(s) from ${root}`);
+      }
+    } catch (error) {
+      console.warn('MCP: Failed to sweep stale Playwright working folders:', (error as Error).message);
     }
   }
 
@@ -984,6 +1044,9 @@ export class McpClientService {
               }
             },
             execute: async (args: any, context: ToolContext) => {
+              // ENG-3187: the browser opens public web pages only. Checked once, before the retry loop, so a refusal is never retried.
+              const navigationRefusal = await browserNavigationRefusal(originalToolName, args);
+              if (navigationRefusal) throw new Error(navigationRefusal);
               const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
               let lastError: unknown;
               // ENG-3170: a browser call of a share-link visitor who may not use the owner's logins is pooled under a session id of its own.
@@ -1153,6 +1216,7 @@ export class McpClientService {
     // Only once every client is closed — the subprocess reads its --config at launch,
     // but deleting underneath a still-starting one would be a race.
     this.removePlaywrightConfigFiles(poolKey);
+    this.removePlaywrightWorkDir(poolKey);
   }
 
   /**
@@ -1324,6 +1388,7 @@ export class McpClientService {
   private createStdioTransport(name: string, config: StdioTransportConfig, poolKey?: string): Transport {
     let resolvedCommand = resolveEnvPlaceholders(config.command);
     let resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
+    let playwrightWorkDir: string | undefined;
 
     // Auto-configure Playwright MCP for headless server environments
     const isPlaywrightMcp =
@@ -1420,6 +1485,14 @@ export class McpClientService {
         // chat session, not per user, so leaving them behind grows /tmp without bound.
         this.trackPlaywrightConfigFiles(poolKey, [configPath, stealthScriptPath]);
       }
+      // ENG-3187: the browser server works in its own empty folder (also its output folder), not in the backend's, and never opens the cloud metadata addresses.
+      playwrightWorkDir = this.createPlaywrightWorkDir(poolKey, name);
+      if (!resolvedArgs.some(arg => arg === '--output-dir' || arg.startsWith('--output-dir='))) {
+        resolvedArgs.push('--output-dir', playwrightWorkDir);
+      }
+      if (!resolvedArgs.some(arg => arg === '--blocked-origins' || arg.startsWith('--blocked-origins='))) {
+        resolvedArgs.push('--blocked-origins', PLAYWRIGHT_BLOCKED_ORIGINS);
+      }
       console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox --isolated and --config for ${name}`);
     }
 
@@ -1436,8 +1509,11 @@ export class McpClientService {
     return new StdioClientTransport({
       command: resolvedCommand,
       args: resolvedArgs,
-      // ENG-3187: never hand a child the backend's secrets; only an allowlist plus its own config env.
-      env: buildStdioChildEnv(process.env, resolvedEnv),
+      // ENG-3187: a browser server gets only the variables a headless browser needs (and its own folder); every other stdio server gets the shared allow-list. Neither is handed the backend's secrets.
+      env: isPlaywrightMcp
+        ? playwrightChildEnv(process.env, resolvedEnv, { inheritFullEnv: process.env[PLAYWRIGHT_INHERIT_ENV_FLAG] === 'true' })
+        : buildStdioChildEnv(process.env, resolvedEnv),
+      ...(playwrightWorkDir ? { cwd: playwrightWorkDir } : {}),
     });
   }
 
@@ -1635,6 +1711,9 @@ export class McpClientService {
           }
         },
         execute: async (args: any, context: ToolContext) => {
+          // ENG-3187: the browser opens public web pages only. Checked once, before the retry loop, so a refusal is never retried.
+          const navigationRefusal = await browserNavigationRefusal(originalToolName, args);
+          if (navigationRefusal) throw new Error(navigationRefusal);
           const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
           let lastError: unknown;
           // ENG-3170: a browser call of a share-link visitor who may not use the owner's logins is pooled under a session id of its own.
