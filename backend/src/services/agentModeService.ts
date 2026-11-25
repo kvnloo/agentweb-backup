@@ -4416,6 +4416,19 @@ export class AgentModeService {
         // This prevents blocking the main thread during long-running generateResponse operations
         await new Promise(resolve => setImmediate(resolve));
 
+        // ENG-2812: what this completed call cost, by the ledger's rule with the metering path's usage
+        // normalization (cache reads reported only in prompt_tokens_details are not priced as fresh input).
+        const turnCostUsd = () => {
+          const usage: any = (response as any)?.usage;
+          if (!usage) return 0;
+          const n = normalizeCallUsageTokens(usage, 'openrouter');
+          return shadowTurnCostUsd(usage, this.estimateCost(
+            llmModel, n.inputTokens, n.outputTokens, n.cacheReadTokens, n.cacheWriteTokens, usage.cache_creation_by_ttl,
+          ));
+        };
+        // ENG-2812: count the call against the session's persisted limit before any post-call exit (Stop included).
+        if (sessionLimit) await sessionLimit.recordTurn(turnCostUsd());
+
         // Check cancellation after the LLM returns — for single-shot responses the pre-iteration
         // check fires before the LLM call starts, so a Stop that arrives mid-call is only visible here.
         if (isCancelled?.()) {
@@ -4443,18 +4456,6 @@ export class AgentModeService {
 
         // ENG-2953: shadow of the ENG-2820 session turn/spend breaker. On by default (ENG-2812),
         // off with SESSION_BREAKER_SHADOW=false; log-only, never alters this turn.
-        const turnCostUsd = () => {
-          const usage: any = (response as any)?.usage;
-          if (!usage) return 0;
-          return shadowTurnCostUsd(usage, this.estimateCost(
-            llmModel,
-            Number(usage.prompt_tokens) || 0,
-            Number(usage.completion_tokens) || 0,
-            Number(usage.cache_read_input_tokens) || 0,
-            Number(usage.cache_creation_input_tokens) || 0,
-            usage.cache_creation_by_ttl,
-          ));
-        };
         recordSessionBreakerShadowTurn({
           sessionId,
           userId,
@@ -4462,8 +4463,6 @@ export class AgentModeService {
           isScheduled: isScheduledSession,
           costUsd: turnCostUsd,
         });
-        // ENG-2812: count this model call against the session's persisted limit (same cost rule as the shadow).
-        if (sessionLimit) await sessionLimit.recordTurn(turnCostUsd());
 
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
