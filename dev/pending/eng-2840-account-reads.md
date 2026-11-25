@@ -13,14 +13,15 @@
   arguments) (a refusal or failure is never kept; an `success: true` answer that is empty because the provider call failed IS kept for the 60 s;
   two identical calls at the same moment both go upstream; the memory is per caller, so one tenant's answer never serves another), and each
   caller has an allowance of 30 provider-call units a minute per account across the three tools, each call costing what it can cost the provider:
-  posts 1 (plus 1 per post with metrics), account metrics 4 (a LinkedIn company page is four calls), post analytics 5 per post (a personal
+  posts 1 (plus 5 per post with metrics: a personal LinkedIn post with metrics is up to five calls), account metrics 4 (a LinkedIn company page is four calls), post analytics 5 per post (a personal
   LinkedIn post is five sequential calls; at most 5 posts per call). An answer from memory costs nothing; a call that does not fit is refused
   with the seconds to wait. The budget is per caller, not per account: members of one organization reading the owner's shared page each have
-  their own. Inputs are bounded in the handler: `limit` 1 to 50 (default 10; with `include_metrics` at most 10, because Instagram is one provider
-  call per post), `include_metrics` default false (Emma's own tool defaults to true although its schema says false), `force_reload` is not an
+  their own; one user's several keys share one allowance and there is no cap across callers. Inputs are bounded in the handler: `limit` 1 to 50 (default 10; with `include_metrics` at most 5, because a personal LinkedIn post with metrics is up to five provider calls), `include_metrics` default false (Emma's own tool defaults to true although its schema says false), `force_reload` is not an
   input, dates `YYYY-MM-DD`, real, both or neither, at most 366 days (the range ends at 00:00 UTC of `end_date`), `post_ids` 1 to 5 distinct ids of
-  the shapes the posts tool hands out (letters, digits, colon, underscore, hyphen: Instagram puts the id into a Graph path), account and post ids
-  refuse zero-width and bidirectional-control characters. A personal LinkedIn profile shows only the posts created through AgentWeb (plus a long
+  the shapes the posts tool hands out (a LinkedIn urn, an Instagram media number, a YouTube video id: Instagram puts the id into a Graph path; an
+  invented single path word of 11 characters still matches the YouTube shape and reaches one Graph path segment, bounded by the units), and
+  account and post ids refuse zero-width and bidirectional embedding/override characters (not the isolates U+2066-2069 or tag characters: the
+  account id is only compared exactly and never echoed). A personal LinkedIn profile shows only the posts created through AgentWeb (plus a long
   instruction-style message addressed to Emma); `get_post_analytics` omits LinkedIn company-page posts the provider does not return. They are not `readOnly`
   (policy 'write', need `tools:execute`). The other five are read-only, so a `tools:read` key (and an OAuth client) can call them, including the
   two settings reads (the owner/admin rule is enforced on the route, whatever the key's scope). The routes themselves are unchanged and keep their token-budget class (`exempt` for the two GET
