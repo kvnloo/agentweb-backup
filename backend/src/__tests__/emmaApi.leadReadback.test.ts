@@ -31,18 +31,18 @@ const mockService = {
   searchLeads: jest.fn(),
   getLeads: jest.fn(),
   // The real handler, so the ownership check under test is the production one.
-  getLeadDetails: jest.fn((listId: string, leadId: string, userId: string) =>
-    jest.requireActual('../emma/impl/leads').getLeadDetails(listId, leadId, userId)),
+  getLeadDetails: jest.fn((listId: string, leadId: string, userId: string, options?: any) =>
+    jest.requireActual('../emma/impl/leads').getLeadDetails(listId, leadId, userId, options)),
   // ENG-2840 (W2-5a): the real handlers again, so the list access check under test is the production one.
-  getLeadEngagements: jest.fn((listId: string, leadId: string, userId: string, limit?: number) =>
-    jest.requireActual('../emma/impl/leads').getLeadEngagements(listId, leadId, userId, limit)),
+  getLeadEngagements: jest.fn((listId: string, leadId: string, userId: string, limit?: number, options?: any) =>
+    jest.requireActual('../emma/impl/leads').getLeadEngagements(listId, leadId, userId, limit, options)),
   getLeadListStatuses: jest.fn((listId: string, userId: string) =>
     jest.requireActual('../emma/impl/leads').getLeadListStatuses(listId, userId)),
 };
 jest.mock('../services/agentModeService', () => ({ agentModeService: mockService }));
 
 import emmaApiRouter from '../routes/emmaApi';
-import { classifyEmmaRoute } from '../middleware/emmaTokenBudget';
+import { classifyEmmaRoute, EMMA_ROUTE_BUDGET } from '../middleware/emmaTokenBudget';
 
 const app = express();
 app.use(express.json());
@@ -99,6 +99,19 @@ describe('POST /api/emma/lead-details (get_lead_details projection)', () => {
     expect(mockCrmDb.getLeadById).not.toHaveBeenCalled();
   });
 
+  it('max_content_fetches on lead-details: passed on when valid, absent otherwise (the readback verifier sends none and is unchanged)', async () => {
+    const post = (body: Record<string, unknown>) => {
+      mockService.getLeadDetails.mockResolvedValueOnce({ success: true, lead: {} });
+      return request(app).post('/api/emma/lead-details').send({ list_id: 'list-1', lead_id: 'l1', ...body });
+    };
+    await post({ max_content_fetches: 10 });
+    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', { maxContentFetches: 10 });
+    await post({});
+    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
+    await post({ max_content_fetches: 999 });
+    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
+  });
+
   it('rejects a request missing list_id or lead_id, or with non-string ids', async () => {
     for (const body of [{ list_id: 'list-1' }, { lead_id: 'l1' }, { list_id: { $ne: '' }, lead_id: 'l1' }, { list_id: 'list-1', lead_id: ['l1'] }]) {
       const res = await request(app).post('/api/emma/lead-details').send(body);
@@ -119,9 +132,11 @@ describe('POST /api/emma/search-leads (unchanged)', () => {
 
 // ENG-2840 (W2-5a): the two routes the MCP tools get_lead_engagements and get_lead_list_statuses call.
 describe('the lead read routes count against the monthly token quota', () => {
-  it('the CRM read routes are metered: an agent that reads leads is counted (an account over its quota is refused on them)', () => {
+  it('each is listed as metered (an account already over its quota is refused on them), like the other CRM reads', () => {
     for (const path of ['/leads', '/lead-details', '/lead-engagements', '/lead-list-statuses', '/search-leads']) {
-      expect({ path, budget: classifyEmmaRoute('POST', path) }).toEqual({ path, budget: 'metered' });
+      // an explicit entry, not the fail-closed default for a route nobody listed
+      expect({ path, listed: EMMA_ROUTE_BUDGET[`POST ${path}`] }).toEqual({ path, listed: 'metered' });
+      expect(classifyEmmaRoute('POST', path)).toBe('metered');
     }
   });
 });
@@ -134,6 +149,37 @@ describe('POST /api/emma/lead-engagements (get_lead_engagements projection)', ()
     expect(res.status).toBe(200);
     expect(res.body.engagements[0].eventId).toBe('e1');
     expect(mockService.getLeadEngagements).toHaveBeenCalledWith('list-1', 'l1', 'caller-1', 7);
+  });
+
+  it('max_content_fetches (a whole number 0 to 50) is passed to the handler as the fetch allowance; anything else is dropped, not clamped', async () => {
+    // a canned answer for ONE call each time: a permanent one would replace the real handler for the tests that follow
+    const post = (body: Record<string, unknown>) => {
+      mockService.getLeadEngagements.mockResolvedValueOnce({ success: true, engagements: [] });
+      return request(app).post('/api/emma/lead-engagements').send({ list_id: 'list-1', lead_id: 'l1', ...body });
+    };
+    await post({ limit: 3, max_content_fetches: 10 });
+    expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', 3, { maxContentFetches: 10 });
+    for (const ok of [0, 50]) {
+      await post({ max_content_fetches: ok });
+      expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', undefined, { maxContentFetches: ok });
+    }
+    for (const bad of [51, -1, 1.5, '10', null, true, [10], { n: 10 }]) {
+      await post({ max_content_fetches: bad });
+      expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', undefined);
+    }
+  });
+
+  it('the allowance reaches the data layer through the real handler', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'caller-1' });
+    mockCrmDb.canOrgMemberAccessList.mockResolvedValue(true);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'l1', firstName: 'A', lastName: 'B' });
+    mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] });
+    mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+    await request(app).post('/api/emma/lead-engagements').send({ list_id: 'list-1', lead_id: 'l1', max_content_fetches: 10 });
+    expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', { maxContentFetches: 10 });
+    await request(app).post('/api/emma/lead-engagements').send({ list_id: 'list-1', lead_id: 'l1' });
+    // without it the data layer is called exactly as before: three arguments, every missing body fetched
+    expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
   });
 
   it('a limit that is not a number is not passed on (the handler default applies)', async () => {

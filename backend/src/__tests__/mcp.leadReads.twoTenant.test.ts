@@ -311,7 +311,8 @@ describe('a stale list id: get_lead_details finds the lead only inside lists the
     expect(o.isError).toBe(true);
     expect(o.text).toMatch(refusal('get_lead_details', 'Lead not found'));
     expectNoVictimContent('member recovery into B', o, TENANT_B, [TENANT_B.leads[0].leadId]);
-    expect(listsLookedIn().filter((id) => id.includes('b'))).toEqual([]);
+    const bLists = [TENANT_B.listId, EXTRA.B.listId];
+    expect(listsLookedIn().filter((id) => bLists.includes(id))).toEqual([]);
   });
 
   it('get_lead_engagements has no recovery: a lead asked for through the wrong list is not found, and no other list is looked in', async () => {
@@ -319,5 +320,78 @@ describe('a stale list id: get_lead_details finds the lead only inside lists the
     expect(o.isError).toBe(true);
     expect(o.text).toMatch(refusal('get_lead_engagements', 'Lead not found'));
     expect(listsLookedIn()).toEqual([]);
+  });
+});
+
+describe('with CRM sharing switched off', () => {
+  const setShareSettings = (t: Tenant, crm: Record<string, unknown>) => {
+    const row = fake.items('AW-Organizations').find((o: any) => o.orgId === t.orgId);
+    fake.seed('AW-Organizations', { ...row, shareSettings: { crm } });
+  };
+
+  it.each([
+    ['get_lead_details', { list_id: EXTRA.AM.listId, lead_id: EXTRA.AM.leadId }],
+    ['get_lead_engagements', { list_id: EXTRA.AM.listId, lead_id: EXTRA.AM.leadId }],
+    ['get_lead_list_statuses', { list_id: EXTRA.AM.listId }],
+  ])("%s: the organization's owner still reads a list that a member owns (the guard admits the organization owner)", async (tool, args) => {
+    setShareSettings(TENANT_A, { enabled: false });
+    const o = await callers[TENANT_A.owner].call(tool, args);
+    expect(o.isError).toBe(false);
+    expect(o.json.success).toBe(true);
+    expectNoVictimContent(`${tool} org owner`, o, TENANT_B);
+  });
+
+  it.each(READS)("$tool: a member who is a listed CRM editor still reads the owner's list; B's list stays refused", async ({ tool, args }) => {
+    setShareSettings(TENANT_A, { enabled: false, editors: [TENANT_A.member] });
+    const own = await callers[TENANT_A.member!].call(tool, args(TENANT_A));
+    expect(own.isError).toBe(false);
+    expect(own.json.success).toBe(true);
+    const foreign = await callers[TENANT_A.member!].call(tool, args(TENANT_B));
+    expect(foreign.isError).toBe(true);
+    expect(foreign.text).toMatch(refusal(tool, 'Access denied'));
+    expectNoVictimContent(`${tool} editor foreign`, foreign, TENANT_B, [TENANT_B.listId, TENANT_B.leads[0].leadId]);
+  });
+
+  it.each(READS)('$tool: with an empty editors list a plain member is still refused', async ({ tool, args }) => {
+    setShareSettings(TENANT_A, { enabled: false, editors: [] });
+    const o = await callers[TENANT_A.member!].call(tool, args(TENANT_A));
+    expect(o.isError).toBe(true);
+    expect(o.text).toMatch(refusal(tool, 'Access denied'));
+  });
+});
+
+describe('what a page holds', () => {
+  /** Twelve hand-recorded events on A's first lead, one a day. */
+  function seedTwelve(): void {
+    const row = fake.items('AW-Leads').find((l: any) => l.leadId === TENANT_A.leads[0].leadId);
+    fake.seed('AW-Leads', {
+      ...row,
+      engagements: Array.from({ length: 12 }, (_, i) => ({
+        eventId: `twelve-${i + 1}`,
+        eventType: 'manual.note',
+        eventData: { note: `${ENG.A} day ${i + 1}` },
+        createdAt: `2026-11-${String(i + 1).padStart(2, '0')}T10:00:00.000Z`,
+      })),
+    });
+  }
+
+  it('get_lead_details lists the 10 most recent engagements, newest first, and counts all of them', async () => {
+    seedTwelve();
+    const o = await callers[TENANT_A.owner].call('get_lead_details', { list_id: TENANT_A.listId, lead_id: TENANT_A.leads[0].leadId });
+    expect(o.json.recentEngagements).toHaveLength(10);
+    expect(o.json.recentEngagements[0].eventData.note).toBe(`${ENG.A} day 12`);
+    expect(o.json.recentEngagements[9].eventData.note).toBe(`${ENG.A} day 3`);
+    expect(o.json.engagementSummary.totalAllMessages).toBe(12);
+  });
+
+  it('get_lead_engagements: a cut page says so in message, and the counts say how many there are', async () => {
+    seedTwelve();
+    const cut = await callers[TENANT_A.owner].call('get_lead_engagements', { list_id: TENANT_A.listId, lead_id: TENANT_A.leads[0].leadId, limit: 5 });
+    expect(cut.json.engagements).toHaveLength(5);
+    expect(cut.json.message).toMatch(/Showing the first 5 of 12 engagement/);
+    expect(cut.json.engagementSummary.totalAllMessages).toBe(12);
+    const whole = await callers[TENANT_A.owner].call('get_lead_engagements', { list_id: TENANT_A.listId, lead_id: TENANT_A.leads[0].leadId, limit: 12 });
+    expect(whole.json.engagements).toHaveLength(12);
+    expect(whole.json.message).toMatch(/^Found 12 engagement/);
   });
 });

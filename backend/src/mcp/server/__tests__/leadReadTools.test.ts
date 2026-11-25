@@ -11,6 +11,7 @@ import { mcpToolRegistry } from '../registry';
 import {
   ENGAGEMENTS_DEFAULT_LIMIT,
   ENGAGEMENTS_MAX_LIMIT,
+  LEAD_READ_MAX_CONTENT_FETCHES,
   leadDetailsRequest,
   leadEngagementsRequest,
   leadListStatusesRequest,
@@ -30,14 +31,21 @@ const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const argsFor = (name: string) => (name === 'get_lead_list_statuses' ? { list_id: 'list_1' } : ids);
 
 describe('the request each tool builds', () => {
-  it('get_lead_details posts both ids to the Emma lead-details route and nothing else', () => {
-    expect(leadDetailsRequest(ids)).toEqual({ path: '/api/emma/lead-details', body: { list_id: 'list_1', lead_id: 'lead_1' } });
+  it('get_lead_details posts both ids and the fetch bound to the Emma lead-details route, and nothing else', () => {
+    expect(LEAD_READ_MAX_CONTENT_FETCHES).toBe(10);
+    expect(leadDetailsRequest(ids)).toEqual({ path: '/api/emma/lead-details', body: { list_id: 'list_1', lead_id: 'lead_1', max_content_fetches: 10 } });
   });
 
-  it('get_lead_engagements posts both ids, and a limit only when one was given', () => {
-    expect(leadEngagementsRequest(ids)).toEqual({ path: '/api/emma/lead-engagements', body: { list_id: 'list_1', lead_id: 'lead_1' } });
-    expect(leadEngagementsRequest({ ...ids, limit: null }).body).toEqual({ list_id: 'list_1', lead_id: 'lead_1' });
-    expect(leadEngagementsRequest({ ...ids, limit: 50 }).body).toEqual({ list_id: 'list_1', lead_id: 'lead_1', limit: 50 });
+  it('get_lead_engagements posts both ids and the fetch bound, and a limit only when one was given', () => {
+    const base = { list_id: 'list_1', lead_id: 'lead_1', max_content_fetches: 10 };
+    expect(leadEngagementsRequest(ids)).toEqual({ path: '/api/emma/lead-engagements', body: base });
+    expect(leadEngagementsRequest({ ...ids, limit: null }).body).toEqual(base);
+    expect(leadEngagementsRequest({ ...ids, limit: 50 }).body).toEqual({ ...base, limit: 50 });
+  });
+
+  it('the fetch bound is not an input: an agent cannot raise it', () => {
+    expect(() => leadDetailsRequest({ ...ids, max_content_fetches: 500 })).toThrow(/"max_content_fetches" is not an input of get_lead_details/);
+    expect(() => leadEngagementsRequest({ ...ids, max_content_fetches: 500 })).toThrow(/"max_content_fetches" is not an input of get_lead_engagements/);
   });
 
   it('get_lead_list_statuses posts the list id', () => {
@@ -168,7 +176,7 @@ describe('a call through the registered tool', () => {
       method: 'POST',
       path: '/api/emma/lead-details',
       context: expect.objectContaining({ userId: 'user-1', sessionId: 'sess-1' }),
-      body: { list_id: 'list_1', lead_id: 'lead_1' },
+      body: { list_id: 'list_1', lead_id: 'lead_1', max_content_fetches: 10 },
     });
     // the self-call context is the narrowed one: nothing about the key or the client is forwarded
     expect(mockFetch.mock.calls[0][0].context).not.toHaveProperty('apiKeyId');
@@ -180,8 +188,9 @@ describe('a call through the registered tool', () => {
     mockFetch.mockResolvedValue({ success: true });
     await call('get_lead_engagements', { ...ids, limit: 5 });
     await call('get_lead_list_statuses', { list_id: 'list_1' });
-    expect(mockFetch.mock.calls[0][0]).toMatchObject({ path: '/api/emma/lead-engagements', body: { list_id: 'list_1', lead_id: 'lead_1', limit: 5 } });
+    expect(mockFetch.mock.calls[0][0]).toMatchObject({ path: '/api/emma/lead-engagements', body: { list_id: 'list_1', lead_id: 'lead_1', limit: 5, max_content_fetches: 10 } });
     expect(mockFetch.mock.calls[1][0]).toMatchObject({ path: '/api/emma/lead-list-statuses', body: { list_id: 'list_1' } });
+    expect(mockFetch.mock.calls[1][0].body).not.toHaveProperty('max_content_fetches');
   });
 
   it.each(TOOLS)('%s: a refusal from the route (HTTP 200, success false) is thrown, not returned', async (name) => {
@@ -199,32 +208,53 @@ describe('a call through the registered tool', () => {
       } catch (err: any) {
         thrown = err.message;
       }
-      expect(thrown).toBe(`${name}: the CRM could not answer (HTTP ${status}). Try again later; nothing was changed.`);
+      expect(thrown).toBe(`${name}: the CRM could not answer (HTTP ${status}). Try again later. No lead or list was changed.`);
       expect(thrown).not.toMatch(/Dynamo|arn:|AW-Leads|Throughput/);
     }
   });
 
-  it.each(TOOLS)('%s: a 4xx from the route (a 429 for an account over its monthly quota, a 400) and a network failure pass through as errors', async (name) => {
+  it.each(TOOLS)('%s: a 4xx from the route (a 429 for an account over its monthly quota, a 400) passes through with the route\'s own words', async (name) => {
     mockFetch.mockRejectedValueOnce(new Error('API error (429): {"error":"usage limit reached"}'));
     await expect(call(name, argsFor(name))).rejects.toThrow('API error (429): {"error":"usage limit reached"}');
     mockFetch.mockRejectedValueOnce(new Error('API error (400): list_id is required'));
     await expect(call(name, argsFor(name))).rejects.toThrow('API error (400): list_id is required');
-    mockFetch.mockRejectedValueOnce(new Error('fetch failed'));
-    await expect(call(name, argsFor(name))).rejects.toThrow('fetch failed');
+  });
+
+  it.each(TOOLS)('%s: a failure to reach the route is a fixed text: the raw message names the internal route and port', async (name) => {
+    mockFetch.mockRejectedValueOnce(new Error('MCP self-call POST /api/emma/lead-details failed after 1 attempt(s) [correlationId=abc]: connect ECONNREFUSED 127.0.0.1:3001'));
+    let thrown = '';
+    try {
+      await call(name, argsFor(name));
+    } catch (err: any) {
+      thrown = err.message;
+    }
+    expect(thrown).toBe(`${name}: the CRM could not be reached. Try again later. No lead or list was changed.`);
+    expect(thrown).not.toMatch(/ECONNREFUSED|127\.0\.0\.1|\/api\/emma|correlationId/);
   });
 });
 
 describe('registration', () => {
-  it.each(TOOLS)('%s is registered for a user account, not read-only, with no opt-in scope and no key-only gate', (name) => {
+  it.each(['get_lead_details', 'get_lead_engagements'])('%s is registered for a user account, not read-only, with no opt-in scope and no key-only gate', (name) => {
     const tool = mcpToolRegistry.getTool(name) as any;
     expect(tool).toBeDefined();
     expect(tool.requiresUserAccount).toBe(true);
-    // a read can store a fetched email body and check a LinkedIn account: a tools:read key must not reach it (same as manage_leads, search_leads)
+    // a read can store a fetched email body and (details) check a LinkedIn account: a tools:read key must not reach it (same as manage_leads, search_leads)
     expect(tool.readOnly).toBeFalsy();
     expect(tool.requiredScope).toBeUndefined();
     expect(tool.apiKeyOnly).toBeFalsy();
     expect(tool.internal).toBeFalsy();
     expect(tool.internalOnly).toBeFalsy();
+  });
+
+  it('get_lead_list_statuses only reads one list (its handler does a list get and the access check), so it is read-only like list_lead_lists', () => {
+    const tool = mcpToolRegistry.getTool('get_lead_list_statuses') as any;
+    expect(tool.readOnly).toBe(true);
+    expect(tool.requiresUserAccount).toBe(true);
+    expect(tool.requiredScope).toBeUndefined();
+    expect(tool.apiKeyOnly).toBeFalsy();
+    expect(tool.internal).toBeFalsy();
+    expect(tool.internalOnly).toBeFalsy();
+    expect(tool.definition.description).toMatch(/Reading changes nothing/);
   });
 
   it('each schema lists exactly the inputs the handler accepts, and requires the ids', () => {
@@ -237,28 +267,48 @@ describe('registration', () => {
     expect(schema('get_lead_list_statuses').required).toEqual(['list_id']);
   });
 
-  it('the descriptions say what the read can touch, what it cannot see, and what is refused', () => {
-    for (const name of ['get_lead_details', 'get_lead_engagements'] as const) {
-      const description = (mcpToolRegistry.getTool(name) as any).definition.description as string;
-      expect(description).toMatch(/Reading never changes the lead/);
-      expect(description).toMatch(/every email event that has none stored yet from the mail provider, all at once/);
-      expect(description).toMatch(/sending-domain setting/);
-      expect(description).toMatch(/does not prove a lead was never emailed/);
-      expect(description).toMatch(/engagementSummary\.total and last7Days count messages SENT/);
-      expect(description).toMatch(/totalAllMessages/);
-      expect(description).toMatch(/refused by name \(userId, sessionId and llmModel are ignored by the server\)/);
+  const description = (name: string) => (mcpToolRegistry.getTool(name) as any).definition.description as string;
+
+  it('both history tools say what a read stores and how much it fetches, what they cannot see, how to read the counts, and what is refused', () => {
+    for (const name of ['get_lead_details', 'get_lead_engagements']) {
+      const d = description(name);
+      expect(d).toMatch(/Reading never changes the lead or the list/);
+      expect(d).toMatch(/stores, as a cache, the content it fetches from the mail provider for the newest received or delivered emails of the lead that have none stored \(at most 10 per call; older ones appear without content until a later call\)/);
+      expect(d).toMatch(/legacy single sending-domain setting/);
+      expect(d).toMatch(/multi-domain setting/);
+      expect(d).toMatch(/does not prove a lead was never emailed/);
+      expect(d).toMatch(/engagementSummary\.total and last7Days count messages SENT; totalAllMessages counts every event; counts that are all 0 beside listed events mean the count failed/);
+      expect(d).toMatch(/Fields named like sessionId, debug, userAgent or ipAddress are removed from answers/);
+      expect(d).toMatch(/refused by name \(userId, sessionId and llmModel are ignored by the server\)/);
+      expect(d).not.toMatch(/every email event|all at once|quota is a bound/);
     }
   });
 
-  it('get_lead_details does not claim the pipeline status or the deal value (its projection has neither) and sends the agent to manage_leads get for them', () => {
-    const description = (mcpToolRegistry.getTool('get_lead_details') as any).definition.description as string;
-    expect(description).toMatch(/does NOT return the pipeline status or the deal value: read those with manage_leads get/);
-    expect(description).not.toMatch(/superset|stored fields only|status, deal value/);
+  it('the stated fetch limit is the one the tools send', () => {
+    expect(description('get_lead_details')).toContain(`at most ${LEAD_READ_MAX_CONTENT_FETCHES} per call`);
+    expect(description('get_lead_engagements')).toContain(`at most ${LEAD_READ_MAX_CONTENT_FETCHES} per call`);
+    expect(leadDetailsRequest(ids).body.max_content_fetches).toBe(LEAD_READ_MAX_CONTENT_FETCHES);
+    expect(leadEngagementsRequest(ids).body.max_content_fetches).toBe(LEAD_READ_MAX_CONTENT_FETCHES);
   });
 
-  it('get_lead_engagements says it has no stale-list recovery, and where the whole-history signal is', () => {
-    const description = (mcpToolRegistry.getTool('get_lead_engagements') as any).definition.description as string;
-    expect(description).toMatch(/Showing the first N of M/);
-    expect(description).toMatch(/get_lead_details finds a lead in another of your lists/);
+  it('only get_lead_details mentions the LinkedIn check: the engagement path never makes one', () => {
+    expect(description('get_lead_details')).toMatch(/can check a connected LinkedIn account/);
+    expect(description('get_lead_engagements')).not.toMatch(/LinkedIn account|check a connected/);
+  });
+
+  it('get_lead_details does not claim fields its projection lacks, and sends the agent to manage_leads get for them', () => {
+    const d = description('get_lead_details');
+    expect(d).toMatch(/does NOT return the pipeline status, the deal value, or fields such as website, domain, role, lifecycle, priority, heat score or expected close date: read the stored lead with manage_leads get/);
+    expect(d).toMatch(/a 200-character preview of the email draft/);
+    expect(d).not.toMatch(/superset|stored fields only|status, deal value, ICP/);
+    expect(d).toMatch(/best-effort search of your other accessible lists \(the first 200\)/);
+    expect(d).toMatch(/capped or failed search reads as Lead not found/);
+  });
+
+  it('get_lead_engagements says where the whole-history signal is, and that it has no search of other lists', () => {
+    const d = description('get_lead_engagements');
+    expect(d).toMatch(/Showing the first N of M/);
+    expect(d).toMatch(/get_lead_details searches your other lists/);
+    expect(d).toMatch(/a sent email may have none/);
   });
 });

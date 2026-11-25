@@ -2175,6 +2175,115 @@ describe('CRM Database Service', () => {
       expect(engagement.emailContent).toBeDefined();
       expect(engagement.emailContent.html).toBe('<p>Email content</p>');
     });
+
+    // ENG-2840 (W2-5a): options.maxContentFetches bounds how many email bodies one read fetches from the mail provider. Without it (Emma, the
+    // portal) every received or delivered event with no stored body is fetched, as before.
+    describe('options.maxContentFetches', () => {
+      const listId = 'list_cap';
+      const leadId = 'lead_cap';
+      const userId = 'user_cap';
+      const event = (id: string, eventType: string, createdAt: string, extra: Record<string, unknown> = {}) => ({
+        eventId: id,
+        eventType,
+        emailDomain: 'example.com',
+        leadEmail: 'lead@example.com',
+        data: { email_id: `email-${id}`, subject: id },
+        createdAt,
+        ...extra,
+      });
+      let resend: { getReceivedEmailContent: jest.Mock; getDeliveredEmailContent: jest.Mock };
+      let updateContent: jest.Mock;
+
+      const arrange = (events: any[]) => {
+        mockDocumentClientMethods.get.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: { leadId, listId, email: 'lead@example.com', engagements: [] } }) });
+        const { emailEventsDb } = require('../services/emailEventsDb');
+        emailEventsDb.getEventsByEmailDomainAndLeadEmail.mockResolvedValue(events);
+        updateContent = emailEventsDb.updateEmailEventContent.mockReset().mockResolvedValue(undefined);
+        resend = require('../services/resendService').resendService;
+        resend.getReceivedEmailContent.mockReset().mockImplementation(async (emailId: string) => ({ html: `<p>${emailId}</p>`, text: emailId }));
+        resend.getDeliveredEmailContent.mockReset().mockImplementation(async (emailId: string) => ({ html: `<p>${emailId}</p>`, text: emailId }));
+        const { userDb } = require('../services/db');
+        jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId, email: 'user@example.com', emailDomain: 'example.com' });
+      };
+      const fetchedIds = () => [...resend.getReceivedEmailContent.mock.calls, ...resend.getDeliveredEmailContent.mock.calls].map((c) => c[0]).sort();
+      const fiveEvents = () => [
+        event('e1', 'email.received', '2024-01-01T00:00:00Z'),
+        event('e2', 'email.delivered', '2024-01-02T00:00:00Z'),
+        event('e3', 'email.received', '2024-01-03T00:00:00Z'),
+        event('e4', 'email.delivered', '2024-01-04T00:00:00Z'),
+        event('e5', 'email.received', '2024-01-05T00:00:00Z'),
+      ];
+
+      it('no option: every event without a stored body is fetched (Emma and the portal are unchanged)', async () => {
+        arrange(fiveEvents());
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId);
+        expect(fetchedIds()).toEqual(['email-e1', 'email-e2', 'email-e3', 'email-e4', 'email-e5']);
+        expect(result.engagements.every((e: any) => e.emailContent)).toBe(true);
+      });
+
+      it('a cap fetches only the newest events that lack a body, stores what it fetched, and returns the rest without a body', async () => {
+        arrange(fiveEvents());
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 2 });
+        expect(fetchedIds()).toEqual(['email-e4', 'email-e5']);
+        expect(updateContent).toHaveBeenCalledTimes(2);
+        expect(updateContent.mock.calls.map((c) => c[0]).sort()).toEqual(['e4', 'e5']);
+        const withBody = result.engagements.filter((e: any) => e.emailContent).map((e: any) => e.eventData.subject).sort();
+        expect(withBody).toEqual(['e4', 'e5']);
+        expect(result.engagements).toHaveLength(5);
+      });
+
+      it('an event whose body is already stored does not use up the allowance', async () => {
+        arrange([
+          event('e1', 'email.received', '2024-01-01T00:00:00Z'),
+          event('e2', 'email.received', '2024-01-02T00:00:00Z'),
+          event('e3', 'email.received', '2024-01-03T00:00:00Z', { emailContent: { html: '<p>stored</p>', text: 'stored' } }),
+        ]);
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 1 });
+        expect(fetchedIds()).toEqual(['email-e2']);
+        expect(result.engagements.find((e: any) => e.eventData.subject === 'e3').emailContent.html).toBe('<p>stored</p>');
+        expect(result.engagements.find((e: any) => e.eventData.subject === 'e1').emailContent).toBeUndefined();
+      });
+
+      it('a cap of 0 fetches nothing, and still returns every event', async () => {
+        arrange(fiveEvents());
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 0 });
+        expect(fetchedIds()).toEqual([]);
+        expect(updateContent).not.toHaveBeenCalled();
+        expect(result.engagements).toHaveLength(5);
+      });
+
+      it('a cap larger than the number of events fetches them all', async () => {
+        arrange(fiveEvents());
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 50 });
+        expect(fetchedIds()).toHaveLength(5);
+      });
+
+      it('a fetch that fails still uses up the allowance (it is not retried for another event) and the event comes back without a body', async () => {
+        arrange(fiveEvents());
+        resend.getReceivedEmailContent.mockRejectedValue(new Error('provider down'));
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 2 });
+        expect(fetchedIds()).toEqual(['email-e4', 'email-e5']);
+        expect(result.engagements.find((e: any) => e.eventData.subject === 'e5').emailContent).toBeUndefined();
+        expect(result.engagements).toHaveLength(5);
+      });
+
+      it.each([Number.NaN, -1, Number.POSITIVE_INFINITY, '2', null, undefined, {}])('a value that is not a finite number of at least 0 (%p) is no cap', async (bad) => {
+        arrange(fiveEvents());
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: bad as any });
+        expect(fetchedIds()).toHaveLength(5);
+      });
+
+      it('only received and delivered events with an email id count: other events never use the allowance', async () => {
+        arrange([
+          event('e1', 'email.received', '2024-01-01T00:00:00Z'),
+          event('e2', 'email.opened', '2024-01-02T00:00:00Z'),
+          event('e3', 'email.clicked', '2024-01-03T00:00:00Z'),
+          event('e4', 'email.received', '2024-01-04T00:00:00Z', { data: { subject: 'no id' } }),
+        ]);
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 1 });
+        expect(fetchedIds()).toEqual(['email-e1']);
+      });
+    });
   });
 
   describe('addLeadEngagement', () => {

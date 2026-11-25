@@ -1,8 +1,9 @@
 /**
- * The in-memory DynamoDB serves BatchGetItem the way DynamoDB does (ENG-2840 W2-5a): every requested key that exists comes back under
- * `Responses[table]`, a key that does not exist is simply absent, and nothing is left in `UnprocessedKeys`. The stale-list recovery of
- * `get_lead_details` (`crmDb.getLeadByIdAcrossLists`) depends on it; before, the fake had no batchGet and the recovery's failure was swallowed
- * as "not found", so a test of it could pass without the recovery ever running.
+ * The in-memory DynamoDB serves BatchGetItem (ENG-2840 W2-5a): every requested key that exists comes back under `Responses[table]`, a key that
+ * does not exist is simply absent, and nothing is left in `UnprocessedKeys`. It models only what the code under test uses: not the 100-key
+ * cap, the duplicate-key error, key-schema validation or unprocessed keys. The stale-list recovery of `get_lead_details`
+ * (`crmDb.getLeadByIdAcrossLists`) depends on it; before, the fake had no batchGet and the recovery's failure was swallowed as "not found",
+ * so a test of it could pass without the recovery ever running.
  */
 import { InMemoryDynamo } from './helpers/inMemoryDynamo';
 
@@ -21,11 +22,11 @@ function makeFake() {
 }
 
 describe('batchGet', () => {
-  it('returns the keys that exist, in request order, and leaves out the ones that do not', async () => {
+  it('returns the keys that exist and leaves out the ones that do not (DynamoDB promises no order, so none is asserted)', async () => {
     const result = await clientOf(makeFake())
       .batchGet({ RequestItems: { 'AW-Leads': { Keys: [{ listId: 'l1', leadId: 'a' }, { listId: 'l3', leadId: 'a' }, { listId: 'l2', leadId: 'a' }] } } })
       .promise();
-    expect(result.Responses['AW-Leads'].map((i: any) => i.email)).toEqual(['a@x.test', 'a2@x.test']);
+    expect(result.Responses['AW-Leads'].map((i: any) => i.email).sort()).toEqual(['a2@x.test', 'a@x.test']);
     expect(result.UnprocessedKeys).toEqual({});
   });
 
