@@ -122,7 +122,7 @@ describe('the social reads', () => {
   });
 
   it.each(['list_connected_account_posts', 'load_connected_account_metrics', 'get_post_analytics'] as const)('%s: another tenant\'s account id is refused before any provider call, and nothing of it comes back', async (tool) => {
-    const args = tool === 'get_post_analytics' ? { account_id: ACCOUNTS.A.li, post_ids: ['p1'] } : { account_id: ACCOUNTS.A.li };
+    const args = tool === 'get_post_analytics' ? { account_id: ACCOUNTS.A.li, post_ids: ['urn:li:share:1'] } : { account_id: ACCOUNTS.A.li };
     const before = snapshotTenant(fake, TENANT_A);
     const o = await callers[TENANT_B.owner].call(tool, args);
     expect(o.isError).toBe(true);
