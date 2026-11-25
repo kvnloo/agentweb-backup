@@ -1,9 +1,9 @@
 /**
- * ENG-3187: how McpClientService starts the Playwright browser server and what its navigate tool may open.
+ * ENG-3187: how McpClientService starts the Playwright browser server and what a browser tool call may carry.
  *
- * The browser server used to start with a copy of the backend's whole environment and in the backend's own working folder. These tests
- * pin the transport it is started with (environment, working folder, flags), that the folder goes away with its pool, and that the
- * navigate tool is checked on both places a tool is registered.
+ * The browser server used to start with a copy of the backend's whole environment and in the backend's own working folder. These tests pin the
+ * transport it is started with (environment, working folder, flags), that each server's folder goes away with exactly that server, that an abandoned
+ * folder is swept but a live one never is, that the navigate tool is checked and `_meta` is dropped on every path a tool is called by.
  */
 process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
 
@@ -21,14 +21,22 @@ jest.mock('axios', () => {
   (m as any).isAxiosError = jest.fn().mockReturnValue(false);
   return m;
 });
-jest.mock('../utils/ssrfGuard', () => ({ assertPublicHostname: (...args: any[]) => mockAssertPublic(...args) }));
+jest.mock('../utils/ssrfGuard', () => {
+  const actual = jest.requireActual('../utils/ssrfGuard');
+  return { ...actual, assertPublicHostname: (...args: any[]) => mockAssertPublic(...args) };
+});
+// Like the SDK's Client: it holds its transport once connected and forgets it when it closes.
 jest.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
-  Client: jest.fn().mockImplementation(() => ({
-    connect: jest.fn().mockResolvedValue(undefined),
-    listTools: (...args: any[]) => mockListTools(...args),
-    callTool: (...args: any[]) => mockCallTool(...args),
-    close: jest.fn().mockResolvedValue(undefined),
-  })),
+  Client: jest.fn().mockImplementation(() => {
+    const client: any = {
+      _transport: undefined,
+      connect: jest.fn().mockImplementation(async (transport: any) => { client._transport = transport; }),
+      listTools: (...args: any[]) => mockListTools(...args),
+      callTool: (...args: any[]) => mockCallTool(...args),
+      close: jest.fn().mockImplementation(async () => { client._transport = undefined; }),
+    };
+    return client;
+  }),
 }));
 jest.mock('@modelcontextprotocol/sdk/client/sse.js', () => ({
   SSEClientTransport: jest.fn().mockImplementation(() => ({ onclose: null, onerror: null })),
@@ -40,19 +48,22 @@ jest.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
   StreamableHTTPClientTransport: jest.fn().mockImplementation(() => ({ onclose: null, onerror: null })),
 }));
 
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { internalMcpServers } from '../mcp/client/mcp_config';
-import { PLAYWRIGHT_BLOCKED_ORIGINS, PLAYWRIGHT_INHERIT_ENV_FLAG, PLAYWRIGHT_WORK_ROOT } from '../mcp/client/playwrightContainment';
+import { PLAYWRIGHT_INHERIT_ENV_FLAG, PLAYWRIGHT_WORK_ROOT } from '../mcp/client/playwrightContainment';
 
 const NONCE = `eng3187-${process.pid}`;
+const DAY = 24 * 60 * 60 * 1000;
 const PLAYWRIGHT_CONFIG = { transport: 'stdio' as const, command: 'npx', args: ['@playwright/mcp@0.0.70'] };
 const SECRETS = { JWT_SECRET: 'jwt-value', STRIPE_SECRET_KEY: 'sk-value', AWS_SECRET_ACCESS_KEY: 'aws-value', SLACK_BOT_TOKEN: 'xoxb-value' };
 
 describe('Playwright MCP containment (ENG-3187)', () => {
   let service: McpClientService;
   const savedEnv = { ...process.env };
+  const extraFolders: string[] = [];
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -65,13 +76,16 @@ describe('Playwright MCP containment (ENG-3187)', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     await service.shutdown();
+    for (const dir of extraFolders.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
     for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
     Object.assign(process.env, savedEnv);
   });
 
   const transportOptions = () => mockStdio.mock.calls[mockStdio.mock.calls.length - 1][0];
   const makeTransport = (name: string, config: any, poolKey?: string) => (service as any).createStdioTransport(name, config, poolKey);
+  const liveFolders = (): string[] => Array.from((service as any).playwrightLiveWorkDirs) as string[];
 
   describe('the browser server\'s transport', () => {
     it('starts without the backend\'s secrets in its environment, and with what a headless browser needs', () => {
@@ -86,42 +100,60 @@ describe('Playwright MCP containment (ENG-3187)', () => {
       expect(transportOptions().env.PLAYWRIGHT_BROWSERS_PATH).toBe('/opt/browsers');
     });
 
-    it('runs the server in its own empty, owner-only working folder that is also its output folder', () => {
-      const poolKey = `user-${NONCE}::c`;
-      makeTransport('playwright', PLAYWRIGHT_CONFIG, poolKey);
+    it('runs the server in its own fresh, empty, owner-only working folder that is also its output folder', () => {
+      makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::c`);
       const options = transportOptions();
-      expect(options.cwd.startsWith(`${PLAYWRIGHT_WORK_ROOT}${path.sep}`)).toBe(true);
+      expect(path.dirname(options.cwd)).toBe(PLAYWRIGHT_WORK_ROOT);
+      expect(path.basename(options.cwd).startsWith(`${process.pid}-`)).toBe(true);
       expect(options.cwd).not.toBe(process.cwd());
       expect(fs.readdirSync(options.cwd)).toEqual([]);
       expect(fs.statSync(options.cwd).mode & 0o777).toBe(0o700);
       expect(options.args[options.args.indexOf('--output-dir') + 1]).toBe(options.cwd);
     });
 
-    it('blocks the cloud metadata origins at the browser', () => {
+    it('does not start the browser with --blocked-origins (it switches request interception, and with it cache-less loading, on for every session)', () => {
       makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::d`);
-      const { args } = transportOptions();
-      expect(args[args.indexOf('--blocked-origins') + 1]).toBe(PLAYWRIGHT_BLOCKED_ORIGINS);
-      expect(PLAYWRIGHT_BLOCKED_ORIGINS).toContain('http://169.254.169.254');
+      expect(transportOptions().args.some((arg: string) => arg.startsWith('--blocked-origins'))).toBe(false);
     });
 
-    it('does not add an output folder or blocked origins the server\'s configuration already names', () => {
-      makeTransport('playwright', { ...PLAYWRIGHT_CONFIG, args: ['@playwright/mcp@0.0.70', '--output-dir=/srv/out', '--blocked-origins', 'https://x.test'] }, `user-${NONCE}::e`);
+    it('does not add an output folder the server\'s configuration already names', () => {
+      makeTransport('playwright', { ...PLAYWRIGHT_CONFIG, args: ['@playwright/mcp@0.0.70', '--output-dir=/srv/out'] }, `user-${NONCE}::e`);
       const { args } = transportOptions();
       expect(args.filter((arg: string) => arg === '--output-dir' || arg.startsWith('--output-dir='))).toEqual(['--output-dir=/srv/out']);
-      expect(args.filter((arg: string) => arg === '--blocked-origins')).toHaveLength(1);
-      expect(args[args.indexOf('--blocked-origins') + 1]).toBe('https://x.test');
     });
 
-    it('gives each pool its own folder', () => {
-      makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::f1`);
-      const first = transportOptions().cwd;
-      makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::f2`);
-      expect(transportOptions().cwd).not.toBe(first);
+    it('gives every browser server a folder of its own, even for the same pool key and the same name', () => {
+      const first = makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::f`);
+      const firstDir = transportOptions().cwd;
+      const second = makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::f`);
+      const secondDir = transportOptions().cwd;
+      const third = makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::f2`);
+      const thirdDir = transportOptions().cwd;
+      expect(new Set([firstDir, secondDir, thirdDir]).size).toBe(3);
+      expect(first).not.toBe(second);
+      expect(third).toBeDefined();
     });
 
-    it('returns the whole environment only when the rollback switch is set', () => {
-      process.env[PLAYWRIGHT_INHERIT_ENV_FLAG] = 'true';
+    it('gives pool keys that clean up to the same folder-safe name different folders', () => {
       makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::g`);
+      const a = transportOptions().cwd;
+      makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}__g`);
+      expect(transportOptions().cwd).not.toBe(a);
+    });
+
+    it('also gives a server started without a pool key a folder of its own', () => {
+      makeTransport('playwright', PLAYWRIGHT_CONFIG);
+      const { cwd, env } = transportOptions();
+      expect(path.basename(cwd).startsWith(`${process.pid}-playwright-`)).toBe(true);
+      expect(env).not.toHaveProperty('JWT_SECRET');
+    });
+
+    it('returns the whole environment only when the rollback switch is exactly "true"', () => {
+      process.env[PLAYWRIGHT_INHERIT_ENV_FLAG] = '1';
+      makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::h1`);
+      expect(transportOptions().env).not.toHaveProperty('JWT_SECRET');
+      process.env[PLAYWRIGHT_INHERIT_ENV_FLAG] = 'true';
+      makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::h2`);
       const { env, cwd } = transportOptions();
       expect(env.JWT_SECRET).toBe('jwt-value');
       expect(cwd).toBeTruthy();
@@ -135,6 +167,19 @@ describe('Playwright MCP containment (ENG-3187)', () => {
       expect(options).not.toHaveProperty('cwd');
       expect(options.args).toEqual(['server.js']);
     });
+
+    it('refuses to start in a working root that is not a folder this process owns', () => {
+      const real = fs.lstatSync;
+      jest.spyOn(fs, 'lstatSync').mockImplementation(((p: any, ...rest: any[]) => (p === PLAYWRIGHT_WORK_ROOT
+        ? { isDirectory: () => false, uid: process.getuid?.() }
+        : (real as any)(p, ...rest))) as any);
+      expect(() => makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::i1`)).toThrow(/not a folder owned by this process/);
+      jest.restoreAllMocks();
+      jest.spyOn(fs, 'lstatSync').mockImplementation(((p: any, ...rest: any[]) => (p === PLAYWRIGHT_WORK_ROOT
+        ? { isDirectory: () => true, uid: (process.getuid?.() ?? 0) + 1 }
+        : (real as any)(p, ...rest))) as any);
+      expect(() => makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::i2`)).toThrow(/not a folder owned by this process/);
+    });
   });
 
   describe('the working folder\'s life', () => {
@@ -142,101 +187,206 @@ describe('Playwright MCP containment (ENG-3187)', () => {
       (service as any).serverConfigs.set('playwright', { config: PLAYWRIGHT_CONFIG, toolPrefix: 'playwright' });
     });
 
-    it('is removed when its pool is released', async () => {
+    const folderOf = (poolKey: string): string => {
+      const client = (service as any).sessionClientPools.get(poolKey).clients.get('playwright');
+      const dir = (service as any).playwrightTransportDirs.get(client._transport);
+      expect(dir).toBeTruthy();
+      return dir;
+    };
+
+    it('is removed with everything in it when its pool is released', async () => {
       const poolKey = `user-${NONCE}::life-a`;
       await (service as any).getSessionClient('playwright', 'life-a', `user-${NONCE}`);
-      const dir = (service as any).playwrightWorkDirs.get(poolKey);
-      expect(dir).toBeTruthy();
-      expect(fs.existsSync(dir)).toBe(true);
+      const dir = folderOf(poolKey);
+      fs.mkdirSync(path.join(dir, 'sub', 'deeper'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'sub', 'deeper', 'shot.png'), 'x');
+      fs.writeFileSync(path.join(dir, 'page.yml'), 'x');
       await (service as any).releasePool(poolKey);
       expect(fs.existsSync(dir)).toBe(false);
-      expect((service as any).playwrightWorkDirs.has(poolKey)).toBe(false);
+      expect(liveFolders()).not.toContain(dir);
     });
 
-    it('is removed for every pool on shutdown', async () => {
-      await (service as any).getSessionClient('playwright', 'life-b', `user-${NONCE}`);
-      await (service as any).getSessionClient('playwright', 'life-c', `user-${NONCE}`);
-      const dirs = Array.from((service as any).playwrightWorkDirs.values()) as string[];
-      expect(dirs).toHaveLength(2);
+    it('leaves another live pool\'s folder alone when one pool is released', async () => {
+      await (service as any).getSessionClient('playwright', 'life-b1', `user-${NONCE}`);
+      await (service as any).getSessionClient('playwright', 'life-b2', `user-${NONCE}`);
+      const first = folderOf(`user-${NONCE}::life-b1`);
+      const second = folderOf(`user-${NONCE}::life-b2`);
+      await (service as any).releasePool(`user-${NONCE}::life-b1`);
+      expect(fs.existsSync(first)).toBe(false);
+      expect(fs.existsSync(second)).toBe(true);
+    });
+
+    it('is removed only for the browser server that made it, never for a newer one under the same pool key', () => {
+      const poolKey = `user-${NONCE}::life-c`;
+      const old = makeTransport('playwright', PLAYWRIGHT_CONFIG, poolKey);
+      const oldDir = transportOptions().cwd;
+      const fresh = makeTransport('playwright', PLAYWRIGHT_CONFIG, poolKey);
+      const freshDir = transportOptions().cwd;
+      (service as any).removePlaywrightWorkDirOf(old);
+      expect(fs.existsSync(oldDir)).toBe(false);
+      expect(fs.existsSync(freshDir)).toBe(true);
+      (service as any).removePlaywrightWorkDirOf(fresh);
+      expect(fs.existsSync(freshDir)).toBe(false);
+    });
+
+    it('is removed when a client is closed because it failed to connect or was evicted', async () => {
+      const failed = makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::life-d1`);
+      const failedDir = transportOptions().cwd;
+      await (service as any).closeClient({ _transport: failed, close: jest.fn().mockRejectedValue(new Error('already closed')) });
+      expect(fs.existsSync(failedDir)).toBe(false);
+
+      await (service as any).getSessionClient('playwright', 'life-d2', `user-${NONCE}`);
+      const evictedDir = folderOf(`user-${NONCE}::life-d2`);
+      await (service as any).evictSessionClient(`user-${NONCE}::life-d2`, 'playwright');
+      expect(fs.existsSync(evictedDir)).toBe(false);
+    });
+
+    it('is removed for every pool, and for a server without a pool, on shutdown', async () => {
+      await (service as any).getSessionClient('playwright', 'life-e1', `user-${NONCE}`);
+      await (service as any).getSessionClient('playwright', 'life-e2', `user-${NONCE}`);
+      makeTransport('playwright', PLAYWRIGHT_CONFIG);
+      const unpooled = transportOptions().cwd;
+      const dirs = [...liveFolders()];
+      expect(dirs.length).toBeGreaterThanOrEqual(3);
+      expect(dirs).toContain(unpooled);
       await service.shutdown();
       dirs.forEach((dir) => expect(fs.existsSync(dir)).toBe(false));
+      expect(liveFolders()).toEqual([]);
     });
 
-    it('is swept when a hard kill left it behind, but not while a starting process may still use it', () => {
-      const stale = path.join(PLAYWRIGHT_WORK_ROOT, `${NONCE}-stale`);
-      const fresh = path.join(PLAYWRIGHT_WORK_ROOT, `${NONCE}-fresh`);
-      for (const dir of [stale, fresh]) {
-        fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(path.join(dir, 'shot.png'), 'x');
-      }
-      const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
-      fs.utimesSync(stale, old, old);
-      (service as any).sweepStalePlaywrightWorkDirs();
-      expect(fs.existsSync(stale)).toBe(false);
-      expect(fs.existsSync(fresh)).toBe(true);
-      fs.rmSync(fresh, { recursive: true, force: true });
-    });
+    describe('the sweep of what a hard kill left behind', () => {
+      const deadPid = (): number => spawnSync(process.execPath, ['-e', '0']).pid as number;
+      const folder = (name: string, ageMs = 0): string => {
+        const dir = path.join(PLAYWRIGHT_WORK_ROOT, name);
+        fs.mkdirSync(path.join(dir, 'sub'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'sub', 'shot.png'), 'x');
+        const when = new Date(Date.now() - ageMs);
+        fs.utimesSync(dir, when, when);
+        extraFolders.push(dir);
+        return dir;
+      };
 
-    it('does not throw when the working root does not exist yet', () => {
-      const original = fs.existsSync;
-      jest.spyOn(fs, 'existsSync').mockImplementation((p: any) => (p === PLAYWRIGHT_WORK_ROOT ? false : original(p)));
-      expect(() => (service as any).sweepStalePlaywrightWorkDirs()).not.toThrow();
-      jest.restoreAllMocks();
+      it('removes a folder whose owning process is gone, with its contents, even when it is new', () => {
+        const abandoned = folder(`${deadPid()}-${NONCE}-a-xyz`);
+        (service as any).sweepStalePlaywrightWorkDirs();
+        expect(fs.existsSync(abandoned)).toBe(false);
+      });
+
+      it('never removes this process\'s own folder or a live process\'s, however old', () => {
+        const own = folder(`${process.pid}-${NONCE}-own-xyz`, 40 * DAY);
+        const live = folder(`${process.ppid}-${NONCE}-live-xyz`, 40 * DAY);
+        (service as any).sweepStalePlaywrightWorkDirs();
+        expect(fs.existsSync(own)).toBe(true);
+        expect(fs.existsSync(live)).toBe(true);
+      });
+
+      it('removes a folder with no owner in its name only when it is a week old', () => {
+        const young = folder(`${NONCE}-young`, DAY);
+        const old = folder(`${NONCE}-old`, 8 * DAY);
+        (service as any).sweepStalePlaywrightWorkDirs();
+        expect(fs.existsSync(young)).toBe(true);
+        expect(fs.existsSync(old)).toBe(false);
+      });
+
+      it('runs at startup', async () => {
+        const abandoned = folder(`${deadPid()}-${NONCE}-startup-xyz`);
+        mockStdio.mockClear();
+        await service.initialize();
+        expect(fs.existsSync(abandoned)).toBe(false);
+      });
+
+      it('reads nothing when the working root does not exist yet', () => {
+        const realExists = fs.existsSync;
+        jest.spyOn(fs, 'existsSync').mockImplementation(((p: any) => (p === PLAYWRIGHT_WORK_ROOT ? false : realExists(p))) as any);
+        const readdir = jest.spyOn(fs, 'readdirSync');
+        (service as any).sweepStalePlaywrightWorkDirs();
+        expect(readdir).not.toHaveBeenCalledWith(PLAYWRIGHT_WORK_ROOT);
+      });
     });
   });
 
-  describe('the navigate tool', () => {
+  describe('a browser tool call', () => {
     const CONTEXT = { userId: 'user1', sessionId: 'sess1', llmModel: 'gpt-4' };
+    const BROWSER_TOOLS = [
+      { name: 'browser_navigate', description: 'Navigate', inputSchema: { type: 'object', properties: { url: { type: 'string' } } } },
+      { name: 'browser_file_upload', description: 'Upload', inputSchema: { type: 'object', properties: { paths: { type: 'array' } } } },
+      { name: 'some_other_tool', description: 'Other', inputSchema: { type: 'object', properties: {} } },
+    ];
 
-    async function navigateTool(): Promise<any> {
-      mockListTools.mockResolvedValue({
-        tools: [
-          { name: 'browser_navigate', description: 'Navigate', inputSchema: { type: 'object', properties: { url: { type: 'string' } } } },
-          { name: 'browser_snapshot', description: 'Snapshot', inputSchema: { type: 'object', properties: {} } },
-        ],
-      });
+    async function tools(): Promise<Record<string, any>> {
+      mockListTools.mockResolvedValue({ tools: BROWSER_TOOLS });
       mockCallTool.mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
       (internalMcpServers as any)['playwright-server'] = { transport: 'sse', url: 'http://localhost:3100/sse', isInternal: false };
       await service.initialize();
-      return (service as any).mcpTools.find((t: any) => t.definition.function.name === 'browser_navigate');
+      const byName: Record<string, any> = {};
+      for (const tool of (service as any).mcpTools) byName[tool.definition.function.name] = tool;
+      return byName;
     }
 
     afterEach(() => {
       for (const key of Object.keys(internalMcpServers)) delete (internalMcpServers as any)[key];
     });
 
-    it('refuses an address that is not a public web page, and never calls the browser or retries', async () => {
-      const tool = await navigateTool();
-      await expect(tool.execute({ url: 'file:///etc/passwd' }, CONTEXT)).rejects.toThrow(/only open public web pages \(http or https\)/);
-      await expect(tool.execute({ url: 'view-source:file:///etc/hostname' }, CONTEXT)).rejects.toThrow(/only open public web pages/);
+    it('refuses a navigate to an address that is not a public web page, and never calls the browser or retries', async () => {
+      const { browser_navigate } = await tools();
+      await expect(browser_navigate.execute({ url: 'file:///etc/passwd' }, CONTEXT)).rejects.toThrow(/only open public web pages \(http or https\)/);
+      await expect(browser_navigate.execute({ url: 'view-source:file:///etc/hostname' }, CONTEXT)).rejects.toThrow(/only open public web pages/);
       mockAssertPublic.mockRejectedValueOnce(new Error('URL resolves to a private/internal address'));
-      await expect(tool.execute({ url: 'http://169.254.169.254/latest/meta-data/' }, CONTEXT)).rejects.toThrow(/cannot open internal/);
+      await expect(browser_navigate.execute({ url: 'https://metadata.example/latest/meta-data/' }, CONTEXT)).rejects.toThrow(/cannot open internal/);
       expect(mockCallTool).not.toHaveBeenCalled();
     });
 
-    it('still opens a public page', async () => {
-      const tool = await navigateTool();
-      await expect(tool.execute({ url: 'https://example.com/' }, CONTEXT)).resolves.toBeDefined();
+    it('opens a public page', async () => {
+      const { browser_navigate } = await tools();
+      await expect(browser_navigate.execute({ url: 'https://example.com/' }, CONTEXT)).resolves.toBeDefined();
       expect(mockAssertPublic).toHaveBeenCalledWith('https://example.com/');
       expect(mockCallTool).toHaveBeenCalledTimes(1);
     });
-  });
 
-  describe('wiring (both places a tool is registered)', () => {
-    const source = fs.readFileSync(path.join(__dirname, '../mcp/client/mcpClientService.ts'), 'utf8');
-
-    it('checks the address before the retry loop in every registered tool\'s execute', () => {
-      const registrations = source.match(/^\s*execute: async \(args: any, context: ToolContext\) => \{$/gm) || [];
-      const guarded = source.match(
-        /^\s*execute: async \(args: any, context: ToolContext\) => \{\n\s*\/\/ ENG-3187:[^\n]*\n\s*const navigationRefusal = await browserNavigationRefusal\(originalToolName, args\);\n\s*if \(navigationRefusal\) throw new Error\(navigationRefusal\);\n\s*const maxAttempts = /gm,
-      ) || [];
-      expect(registrations.length).toBeGreaterThanOrEqual(2);
-      expect(guarded).toHaveLength(registrations.length);
+    it('is sent without `_meta`, which would move the folder Playwright checks upload paths against', async () => {
+      const { browser_file_upload, browser_navigate } = await tools();
+      await browser_file_upload.execute({ paths: ['../../../../etc/passwd'], _meta: { cwd: '/tmp/playwright-mcp-work/x/a/b/c/d' } }, CONTEXT);
+      expect(mockCallTool.mock.calls[0][0]).toEqual({ name: 'browser_file_upload', arguments: { paths: ['../../../../etc/passwd'] } });
+      await browser_navigate.execute({ url: 'https://example.com/', _meta: { cwd: '/' } }, CONTEXT);
+      expect(mockCallTool.mock.calls[1][0]).toEqual({ name: 'browser_navigate', arguments: { url: 'https://example.com/' } });
     });
 
-    it('starts the browser server from the contained environment, in its own folder', () => {
+    it('leaves the arguments of a tool that is not a browser tool unchanged', async () => {
+      const { some_other_tool } = await tools();
+      await some_other_tool.execute({ a: 1, _meta: { progressToken: 't' } }, CONTEXT);
+      expect(mockCallTool.mock.calls[0][0]).toEqual({ name: 'some_other_tool', arguments: { a: 1, _meta: { progressToken: 't' } } });
+    });
+  });
+
+  describe('wiring (every place a tool is registered or called)', () => {
+    const source = fs.readFileSync(path.join(__dirname, '../mcp/client/mcpClientService.ts'), 'utf8');
+    const count = (pattern: RegExp): number => (source.match(pattern) || []).length;
+
+    it('prepares the call before the retry loop in every registered tool\'s execute, and sends only the prepared arguments', () => {
+      const registrations = count(/^\s*execute: async \(args: any, context: ToolContext\) => \{$/gm);
+      const guarded = count(
+        /^\s*execute: async \(args: any, context: ToolContext\) => \{\n\s*\/\/ ENG-3187:[^\n]*\n\s*const callArgs = await this\.prepareBrowserCall\(originalToolName, args, context\);\n\s*const maxAttempts = /gm,
+      );
+      expect(registrations).toBeGreaterThanOrEqual(2);
+      expect(guarded).toBe(registrations);
+      expect(count(/const toolArgs = \{ \.\.\.callArgs \};/g)).toBe(registrations);
+      expect(count(/const toolArgs = \{ \.\.\.args \};/g)).toBe(0);
+    });
+
+    it('prepares the call in the two direct paths too', () => {
+      expect(count(/arguments: await this\.prepareBrowserCall\(toolName, args\) \}/g)).toBe(1);
+      expect(count(/const preparedArgs = await this\.prepareBrowserCall\(toolName, args\);/g)).toBe(1);
+      expect(count(/client\.callTool\(\{ name: toolName, arguments: preparedArgs \}/g)).toBe(1);
+    });
+
+    it('starts the browser server from the contained environment, in its own folder, and remembers the folder by transport', () => {
       expect(source).toMatch(/env: isPlaywrightMcp\n\s*\? playwrightChildEnv\(process\.env, resolvedEnv, \{ inheritFullEnv: process\.env\[PLAYWRIGHT_INHERIT_ENV_FLAG\] === 'true' \}\)\n\s*: \{ \.\.\.process\.env, \.\.\.resolvedEnv \} as Record<string, string>,\n\s*\.\.\.\(playwrightWorkDir \? \{ cwd: playwrightWorkDir \} : \{\}\),/);
-      expect(source).toMatch(/this\.removePlaywrightConfigFiles\(poolKey\);\n\s*this\.removePlaywrightWorkDir\(poolKey\);/);
+      expect(source).toMatch(/if \(playwrightWorkDir\) this\.playwrightTransportDirs\.set\(transport, playwrightWorkDir\);\n\s*return transport;/);
+    });
+
+    it('removes a client\'s own folder wherever a client is closed, and every folder on shutdown, and sweeps at startup', () => {
+      expect(count(/this\.removePlaywrightWorkDirOf\(transport\);/g)).toBe(3);
+      expect(source).toMatch(/this\.removeAllPlaywrightWorkDirs\(\);/);
       expect(source).toMatch(/this\.sweepStalePlaywrightConfigs\(\);\n\s*this\.sweepStalePlaywrightWorkDirs\(\);/);
     });
   });
