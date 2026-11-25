@@ -2167,7 +2167,7 @@ async function scheduleAutoMediaContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillDeferred = !resolved?.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
+      stillDeferred = !resolved?.truncatedByStepBudget && !resolved?.pausedBySessionLimit && hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
       if (resolved?.content) {
         const { io } = await import('../server');
         // ENG-1495: resolved is this call's own generateSessionResponse result, so its
@@ -2900,7 +2900,7 @@ async function scheduleAutoWorkPlanContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillStalled = !resolved?.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
+      stillStalled = !resolved?.truncatedByStepBudget && !resolved?.pausedBySessionLimit && hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
       if (resolved?.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(resolved?.toolCalls)) {
         await postWorkPlanNeedsYouMessage(sessionId, userId);
       }
@@ -4925,7 +4925,8 @@ type RunVerifiedChatResult = {
   attempts: number;
   workPlanCompleted: boolean;
   // ENG-2854: why a failed run stopped when it was not a requirements miss.
-  terminationReason?: 'iteration_limit';
+  terminationReason?: 'iteration_limit' | 'session_limit';
+  workPlanBlockReason?: string;
   // ENG-396: set when a headless turn left an unanswered blocking question. The
   // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
@@ -4973,6 +4974,11 @@ type RunVerifiedChatResult = {
   sendPressExhausted?: boolean;
 };
 
+// Read-only normalization shared by completion and blocked-plan retry decisions.
+function workPlanStepStatus(step: any): string {
+  return typeof step?.status === 'string' ? step.status.trim().toLowerCase() : '';
+}
+
 // ENG-1811: is this work plan ACTUALLY finished -- every step terminal AND no
 // outstanding debt from a removed step's required function call that never
 // genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against
@@ -4984,7 +4990,7 @@ type RunVerifiedChatResult = {
 // breaks any of them that happen to exercise this retry loop.
 function workPlanCompletedWithoutDebt(workPlan: any, calledFunctions?: Record<string, number>): boolean {
   if (!workPlan || !Array.isArray(workPlan.steps)) return true;
-  const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+  const allStepsTerminal = workPlan.steps.every((s: any) => ['completed', 'skipped'].includes(workPlanStepStatus(s)));
   if (!allStepsTerminal) return false;
   const called = calledFunctions || {};
   const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
@@ -5391,9 +5397,9 @@ async function runVerifiedChatInner(
   // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
   // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
   // or null when no question is awaiting.
-  const iterationLimitStopResult = (): RunVerifiedChatResult => ({
+  const iterationLimitStopResult = (terminationReason: 'iteration_limit' | 'session_limit' = 'iteration_limit'): RunVerifiedChatResult => ({
     success: false,
-    terminationReason: 'iteration_limit',
+    terminationReason,
     content: allContent,
     toolCalls: allToolCalls,
     // Score against the truncated turn's content: remainingKeywords is only pruned later.
@@ -5513,6 +5519,36 @@ async function runVerifiedChatInner(
     }
 
     return null;
+  };
+
+  // ENG-2998: no runnable steps remain. Stop unattended pressing without
+  // crediting blocked prerequisites as completion; pending/transient work retries.
+  const stopForBlockedPlan = (workPlan: any): RunVerifiedChatResult | null => {
+    const steps = Array.isArray(workPlan?.steps) ? workPlan.steps : [];
+    const notesOf = (step: any): string => typeof step?.notes === 'string' ? step.notes
+      : Array.isArray(step?.notes) ? step.notes.filter((note: unknown) => typeof note === 'string').join('; ') : '';
+    const blockedSteps = steps.filter((s: any) => ['blocked', 'pending'].includes(workPlanStepStatus(s)));
+    // The tool contract represents unfinished steps as pending; legacy callers
+    // also store blocked. Derive terminality from the existing prerequisite note
+    // for either representation, without changing the persisted status contract.
+    // Unknown/transient causes still use the bounded retry path.
+    if (!isUnattendedRun || blockedSteps.length === 0 ||
+        !steps.every((s: any) => ['blocked', 'pending', 'completed', 'skipped'].includes(workPlanStepStatus(s))) ||
+        !blockedSteps.every((s: any) => /\breason\s*[:=]\s*no_key\b/i.test(notesOf(s)))) return null;
+    const functionStatus = requiredFunctions.map(f => {
+      const actualCount = countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting);
+      return { functionName: f.functionName, requiredCount: f.minCount, actualCount, met: actualCount >= f.minCount };
+    });
+    return {
+      success: false, content: allContent, toolCalls: allToolCalls,
+      keywordMatches: keywords.filter(k => allContent.toLowerCase().includes(k.toLowerCase())),
+      keywordMisses: keywords.filter(k => !allContent.toLowerCase().includes(k.toLowerCase())),
+      functionCallMatches: functionStatus.filter(f => f.met).map(f => f.functionName),
+      functionCallMisses: functionStatus.filter(f => !f.met).map(f => f.functionName),
+      functionStatus, attempts: attempt, workPlanCompleted: false,
+      workPlanBlockReason: blockedSteps
+        .map((s: any) => `${s.stepCount}${s.title ? ` ${s.title}` : ''}: reason=no_key`).join('; '),
+    };
   };
 
   while (attempt < maxAttempts) {
@@ -5665,6 +5701,8 @@ async function runVerifiedChatInner(
           ...continuationToolCalls.filter((call: any) => call?.name)
         );
         if (continuationResponse.truncatedByStepBudget) return iterationLimitStopResult();
+        // ENG-2812: paused at the session limit — a person must confirm; never press again.
+        if (continuationResponse.pausedBySessionLimit) return iterationLimitStopResult('session_limit');
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
         // main turn instead of falling through and returning success on an
@@ -5677,6 +5715,8 @@ async function runVerifiedChatInner(
         if (continuationQuestion?.action === 'park') {
           return continuationQuestion.result;
         }
+        const blockedContinuation = stopForBlockedPlan(continuationResponse.workPlan);
+        if (blockedContinuation) return blockedContinuation;
         // Re-evaluate the gate against the continuation's own output. Pass the
         // whole run's accumulated tool-call objects (name + arguments + result) so a
         // still-uncommitted per-list preview→execute gap (ENG-518) keeps the gate
@@ -5712,6 +5752,14 @@ async function runVerifiedChatInner(
             `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
             `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
           );
+        }
+        // A transient/unknown blocked continuation is not completion. Re-enter
+        // the existing bounded work-plan retry path, never credit unfinished work.
+        if (continuationResponse.workPlan && !workPlanCompletedWithoutDebt(
+          continuationResponse.workPlan, continuationResponse.calledFunctions
+        )) {
+          await waitForVerifiedChatRetry(attempt);
+          continue;
         }
         // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
@@ -5817,6 +5865,8 @@ async function runVerifiedChatInner(
       allActualFunctionCallsForReporting.push(...toolCalls.filter((call: any) => call?.name));
       // Exhaustion requires explicit review/resume, never a requirements-driven retry.
       if (response.truncatedByStepBudget) return iterationLimitStopResult();
+      // ENG-2812: paused at the session limit — a person must confirm; never retry into the pause.
+      if (response.pausedBySessionLimit) return iterationLimitStopResult('session_limit');
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -5833,6 +5883,9 @@ async function runVerifiedChatInner(
       // Check work plan status
       const workPlan = response.workPlan;
       const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, response.calledFunctions);
+
+      const blockedPlanResult = stopForBlockedPlan(workPlan);
+      if (blockedPlanResult) return blockedPlanResult;
 
       // Only evaluate keywords and function calls if work plan is completed or doesn't exist
       let keywordMatches: string[] = [];
@@ -8567,6 +8620,8 @@ export async function runScheduledChat(
       // was left unwritten — marked so the waived minimum is still observable in
       // runResults rather than looking like every requirement was met.
       ...(result.readOnlyRequirementWaived ? { readOnlyRequirementWaived: true } : {}),
+      // ENG-2812: keep why the run stopped (session_limit pause / iteration_limit) on the stored run record.
+      ...(result.terminationReason ? { terminationReason: result.terminationReason } : {}),
       // ENG-2816 (step 3): see skippedRequiredCalls on this function's return type.
       ...(runRequired.skipped.length > 0 ? { skippedRequiredCalls: runRequired.skipped } : {}),
       // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
@@ -8689,7 +8744,8 @@ export async function runScheduledChat(
     // rewrite the schedule's prompt so future runs do better. Runs on test runs too so
     // it's easy to try out. Best-effort — never fails the run.
     // ENG-2854: an iteration-limit report is the terminal turn; no further model turn.
-    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit') {
+    // ENG-2812: nor after a session-limit pause, which is waiting for a person.
+    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit' && result.terminationReason !== 'session_limit') {
       try {
         await runScheduleSelfImprovement({
           schedule,
@@ -10076,6 +10132,8 @@ async function runSessionTurn(
   // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
   // partial answer from a forced synthesis turn instead of the full deliverable.
   truncatedByTimeBudget?: boolean;
+  // ENG-2812: the run stopped at the session's turn/spend limit; no automatic follow-up turn.
+  pausedBySessionLimit?: boolean;
   // ENG-1239: true when the run was cooperatively cancelled (e.g. preempted by a genuine
   // customer message) before it could compose a closing reply — content may be empty
   // even though toolCalls shows real work (an already-dispatched call can't be aborted).
@@ -12218,7 +12276,7 @@ export const agentModeController = {
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
       // ENG-2113: automatic follow-up turns would run on AgentWeb's models; on the plan route the user is asked to continue instead.
-      if (!planRoute && !response.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+      if (!planRoute && !response.truncatedByStepBudget && !response.pausedBySessionLimit && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
         setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
@@ -12230,7 +12288,7 @@ export const agentModeController = {
       // "retry" instead of just continuing per the plan's own "never wait on the user"
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
-      if (!planRoute && !response.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
+      if (!planRoute && !response.truncatedByStepBudget && !response.pausedBySessionLimit && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
@@ -18681,6 +18739,8 @@ export const agentModeController = {
         success: result.success,
         message: result.success
           ? `All required functions were called successfully.`
+          : result.terminationReason === 'session_limit'
+          ? 'Paused at the session turn/spend limit; reply "continue" in the session to keep going.'
           : result.terminationReason === 'iteration_limit'
           ? `Stopped at the iteration limit after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}; see the resumable report in content.`
           : `Some required functions were not called enough times after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}.`,

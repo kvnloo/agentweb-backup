@@ -1231,6 +1231,41 @@ function linkedInSearchUnavailableResponse() {
   };
 }
 
+/**
+ * ENG-2984: shadow-only duplicate check for send-message WITHOUT list_id/lead_id (the CRM-linked
+ * path already blocks identical re-sends). Reads the chat the send just went to — no new storage,
+ * no extra profile lookup — and logs a would-block warning if an identical outbound message was
+ * already in that history. Never throws and never changes the send's outcome.
+ * Returns whether a would-block was logged (for tests).
+ */
+export async function shadowCheckUnlinkedLinkedInDuplicate(params: {
+  chatId: string | undefined;
+  sentMessageId: string | undefined;
+  message: string;
+  accountId: string;
+  target: string;
+}): Promise<boolean> {
+  try {
+    if (!params.chatId) return false;
+    const normalized = params.message.trim().toLowerCase();
+    const outbound = await linkedInOutreachService.getOutboundMessagesInChat(params.chatId);
+    const identical = outbound.filter((m) => (m.text ?? '').trim().toLowerCase() === normalized);
+    // Exclude the message we just sent; without its id, require it plus one earlier copy.
+    const prior = params.sentMessageId
+      ? identical.filter((m) => m.id !== params.sentMessageId && m.provider_id !== params.sentMessageId)
+      : identical.slice(1);
+    if (prior.length === 0) return false;
+    console.warn(
+      `[AgentMode] send-message SHADOW would-block (ENG-2984): identical message already sent to ${params.target} ` +
+      `from account ${params.accountId} (chat ${params.chatId}, ${prior.length} prior copy/copies, first at ${prior[0].timestamp ?? 'unknown'}) — not blocked, shadow mode`,
+    );
+    return true;
+  } catch (err) {
+    console.warn('[AgentMode] send-message shadow duplicate check failed (ENG-2984, ignored):', err instanceof Error ? err.message : err);
+    return false;
+  }
+}
+
 export async function linkedinOutreach(
   callLLM: Pick<AgentModeService, 'callLLM'>['callLLM'],
   userId: string,
@@ -2163,6 +2198,17 @@ export async function linkedinOutreach(
         const messagePaced = await paceWrite();
         if (messagePaced) return messagePaced.refusal;
         const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
+
+        // ENG-2984: shadow duplicate check for unlinked sends — logs only, fire-and-forget.
+        if (!(sendListId && sendLeadId)) {
+          void shadowCheckUnlinkedLinkedInDuplicate({
+            chatId: messageResponse?.chat_id,
+            sentMessageId: messageResponse?.message_id ?? messageResponse?.id,
+            message,
+            accountId: account_id,
+            target,
+          });
+        }
 
         // Persist the sent message to the CRM so it shows up in engagement history.
         // The Unipile response may contain the message ID; fall back to a timestamp-based ID.
