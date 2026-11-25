@@ -47,14 +47,17 @@
 - Cost of a history read. `crmDb.getLeadEngagements` fetches the body of every received or delivered email event that has no stored body from
   the mail provider (Resend, with the platform's key; two provider calls per received event, with retries) and stores it as a cache. Emma and
   the portal do this for every such event at once, whatever `limit` is. A failed fetch is not stored and is tried again on the next read. The
-  provider fetch path is not paced like sending (sends go out at most 2 a second). For the MCP tools the data layer takes an allowance
+  provider fetch path is not paced like sending (sends go out at most 2 a second) for Emma and the portal. For the MCP tools the data layer takes an allowance
   (`options.maxContentFetches`, sent by the tools as 10; the routes take `max_content_fetches`, a whole number 0 to 50, and answer 400 to
   anything else, so a bad value is never a silent "no cap"): only the newest 10 such events without a stored body are fetched per call, through
   ONE chain for the whole process (`runCappedFetch` in `services/db.ts`): one at a time, 500 ms apart (the gap the platform's own sends keep),
-  at most 20 waiting; a fetch that would wait behind more is skipped and its event comes back without a body. An uncapped read (Emma, the
-  portal) does not use the chain and runs every fetch at once, as before. Resend's limit is shared with the platform's sends and the chain
-  paces only these fetches: it cannot guarantee that fetches plus sends stay under that limit, it stops a key's reads from adding a burst.
-  The other events come back without a body. A body already stored never uses the
+  at most 20 in the chain (one running, 19 waiting) and at most 10 per account (so one account crawling its leads cannot fill it and starve the
+  others), each fetch given up on after 30 s (the Resend reads set no timeout, so one request that never answered would otherwise block every
+  later read in the process; the abandoned request is not cancelled). A fetch that does not fit is skipped and its event comes back without a
+  body; fetches are handed to the chain newest first, so what a busy chain skips is the oldest of the allowed events. An uncapped read (Emma,
+  the portal) does not use the chain, is not paced and runs every fetch at once, as before. Resend's limit is shared with the platform's sends
+  and the chain paces only these fetches: it cannot guarantee that fetches plus sends stay under that limit, it stops a key's reads from adding
+  a burst. The other events come back without a body. A body already stored never uses the
   allowance, and a body that cannot be fetched is not remembered: it uses the allowance again on every call, so a lead whose 10 newest bodies
   fail never reaches older ones. Emma and the portal send nothing and are unchanged. `limit` does not bound reading: the email events of the
   lead's address are read in full (twice, count and list) before the page is cut. `get_lead_details` can also check a connected LinkedIn
@@ -63,9 +66,9 @@
 - Known limit, inherited from `crmDb.getLeadEngagements` / `getLeadEngagementCount` and unchanged here: email events are looked up through the
   CALLING account's single legacy `emailDomain` setting, not the list owner's (an organization member reading a shared list sees only emails
   under their own domain). An account whose sending domains are stored only in the multi-domain setting (`emailDomains[]`), or that sends from
-  a connected mailbox, gets none of its own emails from these tools (Smartlead emails, LinkedIn events and hand-recorded events live on the
-  lead and are included; LinkedIn events only for a lead with a LinkedIn URL), so an empty history is not proof that a lead was never
-  emailed. The lookup is keyed by that domain string, not by account;
+  a connected mailbox, gets none of its own emails from these tools (what lives on the lead is included: Smartlead replies, bounces and
+  opt-outs, which have no bodies and are not the emails Smartlead sent, LinkedIn invites, hand-recorded events; LinkedIn messages come from the
+  event table, for a lead with a LinkedIn URL), so an empty history is not proof that a lead was never emailed. The lookup is keyed by that domain string, not by account;
   a new-style domain is claimed by one account only, the legacy field is set by an admin without a uniqueness check. Another pre-existing
   flaw seen on the way: the LinkedIn connection lookup applies `Limit: 5` before filtering by account, so a profile that is a connection of
   more than five accounts can read as not connected. The Resend content fetch sets no timeout.
