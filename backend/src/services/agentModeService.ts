@@ -11062,7 +11062,7 @@ export class AgentModeService {
     return leadsImpl.searchLeads(listId, filters, userId, limit, options);
   }
 
-  public async getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number }): Promise<any> {
+  public async getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number; recoverStaleList?: boolean }): Promise<any> {
     return options ? leadsImpl.getLeadDetails(listId, leadId, userId, options) : leadsImpl.getLeadDetails(listId, leadId, userId);
   }
 

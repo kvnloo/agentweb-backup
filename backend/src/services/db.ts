@@ -9922,7 +9922,8 @@ export const crmDb = {
   /**
    * `options.maxContentFetches` (ENG-2840 W2-5a, set only by the MCP lead tools): the most email bodies this call may fetch from the mail
    * provider. Without it (Emma, the portal) every received or delivered event that has no stored body is fetched, all at once. With it, only
-   * the NEWEST that many such events are fetched (and stored, so a later call reaches the next ones); the others are returned without a body.
+   * the NEWEST that many such events are fetched, one at a time, and stored (so a later call reaches the next ones, as long as these succeed:
+   * a body that cannot be fetched is not remembered and uses the allowance again on every call); the others are returned without a body.
    * An event whose body is already stored never uses up the allowance. A value that is not a finite number of at least 0 is no cap.
    */
   async getLeadEngagements(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number }) {
@@ -9968,6 +9969,17 @@ export const crmDb = {
         for (const e of needContent.slice(0, Math.floor(maxContentFetches as number))) fetchAllowed.add(e);
       }
 
+      // A capped read (the MCP lead tools) fetches its bodies ONE AT A TIME: the provider's request limit is shared with the platform's sends
+      // (paced at 2 a second), so a burst of parallel fetches from an agent's read could slow them. An uncapped read (Emma, the portal) runs
+      // every fetch at once, as before.
+      let fetchChain: Promise<unknown> = Promise.resolve();
+      const runFetch = <T>(fetch: () => Promise<T>): Promise<T> => {
+        if (!capFetches) return fetch();
+        const run = fetchChain.then(fetch, fetch);
+        fetchChain = run.catch(() => undefined);
+        return run;
+      };
+
       // Transform email events to engagement format
       // For email.received events, fetch the email content
       const emailEngagements = await Promise.all(
@@ -10008,9 +10020,9 @@ export const crmDb = {
               const resendService = require('./resendService').resendService;
 
               if (event.eventType === 'email.received') {
-                emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+                emailContent = await runFetch(() => resendService.getReceivedEmailContent(event.data.email_id));
               } else if (event.eventType === 'email.delivered') {
-                emailContent = await resendService.getDeliveredEmailContent(event.data.email_id);
+                emailContent = await runFetch(() => resendService.getDeliveredEmailContent(event.data.email_id));
               }
 
               if (emailContent) {
