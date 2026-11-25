@@ -190,11 +190,27 @@ describe('a call through the registered tool', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  it.each(TOOLS)('%s: an HTTP error from the route (a 5xx, a 402 for an account over its quota) passes through as an error', async (name) => {
-    mockFetch.mockRejectedValueOnce(new Error('API error (500): boom'));
-    await expect(call(name, argsFor(name))).rejects.toThrow('API error (500): boom');
-    mockFetch.mockRejectedValueOnce(new Error('API error (402): quota'));
-    await expect(call(name, argsFor(name))).rejects.toThrow('API error (402): quota');
+  it.each(TOOLS)('%s: a 5xx from the route is replaced by a fixed text: the route answers it with the exception\'s own message', async (name) => {
+    for (const status of [500, 502, 503]) {
+      mockFetch.mockRejectedValueOnce(new Error(`API error (${status}): ProvisionedThroughputExceededException on table AW-Leads arn:aws:dynamodb:us-west-2:992382574572`));
+      let thrown = '';
+      try {
+        await call(name, argsFor(name));
+      } catch (err: any) {
+        thrown = err.message;
+      }
+      expect(thrown).toBe(`${name}: the CRM could not answer (HTTP ${status}). Try again later; nothing was changed.`);
+      expect(thrown).not.toMatch(/Dynamo|arn:|AW-Leads|Throughput/);
+    }
+  });
+
+  it.each(TOOLS)('%s: a 4xx from the route (a 429 for an account over its monthly quota, a 400) and a network failure pass through as errors', async (name) => {
+    mockFetch.mockRejectedValueOnce(new Error('API error (429): {"error":"usage limit reached"}'));
+    await expect(call(name, argsFor(name))).rejects.toThrow('API error (429): {"error":"usage limit reached"}');
+    mockFetch.mockRejectedValueOnce(new Error('API error (400): list_id is required'));
+    await expect(call(name, argsFor(name))).rejects.toThrow('API error (400): list_id is required');
+    mockFetch.mockRejectedValueOnce(new Error('fetch failed'));
+    await expect(call(name, argsFor(name))).rejects.toThrow('fetch failed');
   });
 });
 
@@ -221,12 +237,28 @@ describe('registration', () => {
     expect(schema('get_lead_list_statuses').required).toEqual(['list_id']);
   });
 
-  it('the descriptions say what the read can touch, and what is refused', () => {
+  it('the descriptions say what the read can touch, what it cannot see, and what is refused', () => {
     for (const name of ['get_lead_details', 'get_lead_engagements'] as const) {
       const description = (mcpToolRegistry.getTool(name) as any).definition.description as string;
       expect(description).toMatch(/Reading never changes the lead/);
-      expect(description).toMatch(/mail provider/);
-      expect(description).toMatch(/refused by name/);
+      expect(description).toMatch(/every email event that has none stored yet from the mail provider, all at once/);
+      expect(description).toMatch(/sending-domain setting/);
+      expect(description).toMatch(/does not prove a lead was never emailed/);
+      expect(description).toMatch(/engagementSummary\.total and last7Days count messages SENT/);
+      expect(description).toMatch(/totalAllMessages/);
+      expect(description).toMatch(/refused by name \(userId, sessionId and llmModel are ignored by the server\)/);
     }
+  });
+
+  it('get_lead_details does not claim the pipeline status or the deal value (its projection has neither) and sends the agent to manage_leads get for them', () => {
+    const description = (mcpToolRegistry.getTool('get_lead_details') as any).definition.description as string;
+    expect(description).toMatch(/does NOT return the pipeline status or the deal value: read those with manage_leads get/);
+    expect(description).not.toMatch(/superset|stored fields only|status, deal value/);
+  });
+
+  it('get_lead_engagements says it has no stale-list recovery, and where the whole-history signal is', () => {
+    const description = (mcpToolRegistry.getTool('get_lead_engagements') as any).definition.description as string;
+    expect(description).toMatch(/Showing the first N of M/);
+    expect(description).toMatch(/get_lead_details finds a lead in another of your lists/);
   });
 });
