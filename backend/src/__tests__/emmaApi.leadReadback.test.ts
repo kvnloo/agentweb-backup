@@ -115,8 +115,31 @@ describe('POST /api/emma/lead-details (get_lead_details projection)', () => {
     expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', { maxContentFetches: 10 });
     await post({});
     expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
-    await post({ max_content_fetches: 999 });
-    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
+    mockService.getLeadDetails.mockClear();
+    const res = await request(app).post('/api/emma/lead-details').send({ list_id: 'list-1', lead_id: 'l1', max_content_fetches: 999 });
+    expect(res.status).toBe(400);
+    expect(mockService.getLeadDetails).not.toHaveBeenCalled();
+  });
+
+  it('recover_stale_list: false (the MCP tool always sends it) skips the search of the caller\'s other lists; true, null or absent keep it; anything else is a 400', async () => {
+    const post = (body: Record<string, unknown>) => {
+      mockService.getLeadDetails.mockResolvedValueOnce({ success: true, lead: {} });
+      return request(app).post('/api/emma/lead-details').send({ list_id: 'list-1', lead_id: 'l1', ...body });
+    };
+    await post({ max_content_fetches: 10, recover_stale_list: false });
+    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', { maxContentFetches: 10, recoverStaleList: false });
+    await post({ recover_stale_list: false });
+    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', { recoverStaleList: false });
+    for (const keep of [{ recover_stale_list: true }, { recover_stale_list: null }, {}]) {
+      await post(keep);
+      expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
+    }
+    mockService.getLeadDetails.mockClear();
+    for (const bad of ['false', 0, 1, [false], { v: false }]) {
+      const res = await request(app).post('/api/emma/lead-details').send({ list_id: 'list-1', lead_id: 'l1', recover_stale_list: bad });
+      expect({ bad, status: res.status, message: res.body.message }).toEqual({ bad, status: 400, message: 'recover_stale_list must be true or false' });
+    }
+    expect(mockService.getLeadDetails).not.toHaveBeenCalled();
   });
 
   it('rejects a request missing list_id or lead_id, or with non-string ids', async () => {
@@ -158,7 +181,7 @@ describe('POST /api/emma/lead-engagements (get_lead_engagements projection)', ()
     expect(mockService.getLeadEngagements).toHaveBeenCalledWith('list-1', 'l1', 'caller-1', 7);
   });
 
-  it('max_content_fetches (a whole number 0 to 50) is passed to the handler as the fetch allowance; anything else is dropped, not clamped', async () => {
+  it('max_content_fetches (a whole number 0 to 50) is passed to the handler as the fetch allowance; null or absent means none; anything else is a 400, never a silent "no cap"', async () => {
     // a canned answer for ONE call each time: a permanent one would replace the real handler for the tests that follow
     const post = (body: Record<string, unknown>) => {
       mockService.getLeadEngagements.mockResolvedValueOnce({ success: true, engagements: [] });
@@ -170,10 +193,15 @@ describe('POST /api/emma/lead-engagements (get_lead_engagements projection)', ()
       await post({ max_content_fetches: ok });
       expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', undefined, { maxContentFetches: ok });
     }
-    for (const bad of [51, -1, 1.5, '10', null, true, [10], { n: 10 }]) {
-      await post({ max_content_fetches: bad });
-      expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', undefined);
+    await post({ max_content_fetches: null });
+    expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', undefined);
+    mockService.getLeadEngagements.mockClear();
+    for (const bad of [51, -1, 1.5, '10', true, [10], { n: 10 }]) {
+      // no canned answer here: the route must refuse before the handler, and a queued answer nobody consumes would leak into the next test
+      const res = await request(app).post('/api/emma/lead-engagements').send({ list_id: 'list-1', lead_id: 'l1', max_content_fetches: bad });
+      expect({ bad, status: res.status, message: res.body.message }).toEqual({ bad, status: 400, message: 'max_content_fetches must be a whole number from 0 to 50' });
     }
+    expect(mockService.getLeadEngagements).not.toHaveBeenCalled();
   });
 
   it('an identity in the body changes nothing when the allowance is present either', async () => {

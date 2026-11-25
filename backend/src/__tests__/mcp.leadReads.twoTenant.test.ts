@@ -9,7 +9,8 @@
  *
  * Not provable here, said plainly: AW-EmailEvents is not part of the fake (no lead below has an email domain, so the email-history half of
  * an engagement read, including the mail provider fetch and its cache write, is not exercised), and the fake database ignores Limit and
- * ExclusiveStartKey. It does serve BatchGetItem, which the stale-list recovery uses: the tests below read which lists that lookup asked for.
+ * ExclusiveStartKey. It does serve BatchGetItem, which Emma's stale-list search uses (that search is switched off over MCP): the tests below read
+ * which lists were asked for, to show it never runs.
  */
 jest.mock('aws-sdk', () => {
   const actual = jest.requireActual('aws-sdk');
@@ -252,70 +253,50 @@ describe('an organization member', () => {
   });
 });
 
-describe('a stale list id: get_lead_details finds the lead only inside lists the caller can access', () => {
+describe('a lead asked for through the wrong list: no search of any other list over MCP', () => {
+  // Emma's get_lead_details looks for such a lead in the caller's other accessible lists (ENG-969). Over MCP that search is switched off: it costs a
+  // query per organization member on AW-LeadLists, which is provisioned at 5 read units. These tests read off the database which lists were asked for.
   const details = (caller: McpCaller, list_id: string, lead_id: string) => caller.call('get_lead_details', { list_id, lead_id });
 
-  it('the owner of two lists asks for a lead through the wrong one: it is found, with a note naming the right list', async () => {
-    const o = await details(callers[TENANT_A.owner], TENANT_A.listId, EXTRA.A.leadId);
-    expect(o.isError).toBe(false);
-    expect(o.json.success).toBe(true);
-    expect(o.json.lead.email).toBe(EXTRA.A.email);
-    expect(o.json.note).toContain(EXTRA.A.listId);
-    expect(o.json.listName).toBe(EXTRA.A.name);
-    expect(listsLookedIn()).toEqual([EXTRA.A.listId]);
+  it.each([
+    ['the owner of two lists', () => callers[TENANT_A.owner], TENANT_A.listId, EXTRA.A],
+    ['the owner of two lists (tenant B)', () => callers[TENANT_B.owner], TENANT_B.listId, EXTRA.B],
+  ] as const)('%s asks for a lead that is in their OTHER list: refused as not found, and no other list is looked in', async (_label, caller, listId, other) => {
+    const o = await details(caller(), listId, other.leadId);
+    expect(o.isError).toBe(true);
+    expect(o.text).toMatch(refusal('get_lead_details', 'Lead not found'));
+    expect(o.text).not.toContain(other.email);
+    expect(listsLookedIn()).toEqual([]);
+    // the same lead through its own list answers (the lead is there; only the search is off)
+    const right = await details(caller(), other.listId, other.leadId);
+    expect(right.isError).toBe(false);
+    expect(right.json.lead.email).toBe(other.email);
   });
 
-  it("the same for tenant B, so the next test's refusal is a recovery that ran and found nothing, not one that never ran", async () => {
-    const o = await details(callers[TENANT_B.owner], TENANT_B.listId, EXTRA.B.leadId);
-    expect(o.json.success).toBe(true);
-    expect(o.json.lead.email).toBe(EXTRA.B.email);
-    expect(o.json.note).toContain(EXTRA.B.listId);
-    expect(listsLookedIn()).toEqual([EXTRA.B.listId]);
-  });
-
-  it("another tenant's lead id, asked through the caller's own list, is not found: the recovery looks only in the caller's own lists", async () => {
+  it("another tenant's lead id, asked through the caller's own list, is not found, and nothing is looked up in any list", async () => {
     const before = snapshotTenant(fake, TENANT_A);
     for (const leadId of [EXTRA.A.leadId, TENANT_A.leads[0].leadId]) {
-      batchGetSpy.mockClear();
       const o = await details(callers[TENANT_B.owner], TENANT_B.listId, leadId);
       expect(o.isError).toBe(true);
       expect(o.text).toMatch(refusal('get_lead_details', 'Lead not found'));
-      expectNoVictimContent('recovery across tenants', o, TENANT_A, [leadId]);
-      // the lookup really ran (B has another list), and asked for B's list only: never for a list of A
-      expect(listsLookedIn()).toEqual([EXTRA.B.listId]);
+      expectNoVictimContent('no search across tenants', o, TENANT_A, [leadId]);
     }
+    expect(listsLookedIn()).toEqual([]);
     expect(snapshotTenant(fake, TENANT_A)).toBe(before);
   });
 
-  it("an organization member recovers into the owner's list while the organization shares its CRM", async () => {
-    const o = await details(callers[TENANT_A.member!], EXTRA.AM.listId, TENANT_A.leads[0].leadId);
-    expect(o.isError).toBe(false);
-    expect(o.json.lead.email).toBe(TENANT_A.leads[0].email);
-    expect(o.json.note).toContain(TENANT_A.listId);
-    expect(listsLookedIn().sort()).toEqual([TENANT_A.listId, EXTRA.A.listId].sort());
-    expectNoVictimContent('member recovery', o, TENANT_B);
-  });
-
-  it("the same member does not recover into the owner's list once CRM sharing is switched off", async () => {
-    setCrmSharing(TENANT_A, false);
-    const o = await details(callers[TENANT_A.member!], EXTRA.AM.listId, TENANT_A.leads[0].leadId);
-    expect(o.isError).toBe(true);
-    expect(o.text).toMatch(refusal('get_lead_details', 'Lead not found'));
-    expect(o.text).not.toContain(TENANT_A.leads[0].email);
-    // the member's only list is the one asked for: there was nowhere else to look, and no list of the owner was asked for
+  it("an organization member asking for the owner's lead through their own list is refused too, with sharing on or off", async () => {
+    for (const sharing of [true, false]) {
+      setCrmSharing(TENANT_A, sharing);
+      const o = await details(callers[TENANT_A.member!], EXTRA.AM.listId, TENANT_A.leads[0].leadId);
+      expect(o.isError).toBe(true);
+      expect(o.text).toMatch(refusal('get_lead_details', 'Lead not found'));
+      expect(o.text).not.toContain(TENANT_A.leads[0].email);
+    }
     expect(listsLookedIn()).toEqual([]);
   });
 
-  it("a member of A never recovers into B's lists", async () => {
-    const o = await details(callers[TENANT_A.member!], EXTRA.AM.listId, TENANT_B.leads[0].leadId);
-    expect(o.isError).toBe(true);
-    expect(o.text).toMatch(refusal('get_lead_details', 'Lead not found'));
-    expectNoVictimContent('member recovery into B', o, TENANT_B, [TENANT_B.leads[0].leadId]);
-    const bLists = [TENANT_B.listId, EXTRA.B.listId];
-    expect(listsLookedIn().filter((id) => bLists.includes(id))).toEqual([]);
-  });
-
-  it('get_lead_engagements has no recovery: a lead asked for through the wrong list is not found, and no other list is looked in', async () => {
+  it('get_lead_engagements has no such search either: a lead asked for through the wrong list is not found', async () => {
     const o = await callers[TENANT_A.owner].call('get_lead_engagements', { list_id: TENANT_A.listId, lead_id: EXTRA.A.leadId });
     expect(o.isError).toBe(true);
     expect(o.text).toMatch(refusal('get_lead_engagements', 'Lead not found'));

@@ -986,6 +986,29 @@ describe('AgentModeService - CRM Tools', () => {
       expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([], leadId);
     });
 
+    it('ENG-2840 W2-5a: recoverStaleList false skips the search of the caller\'s other lists entirely (the MCP tool sends it); the default still searches', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockClear();
+      mockCrmDb.getLeadListsForUser.mockClear();
+      mockCrmDb.getLeadByIdAcrossLists.mockClear();
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
+
+      const skipped = await service.getLeadDetails(listId, leadId, userId, { maxContentFetches: 10, recoverStaleList: false });
+      expect(skipped.success).toBe(false);
+      expect(skipped.message).toBe('Lead not found');
+      expect(mockCrmDb.getLeadListsByUserId).not.toHaveBeenCalled();
+      expect(mockCrmDb.getLeadListsForUser).not.toHaveBeenCalled();
+      expect(mockCrmDb.getLeadByIdAcrossLists).not.toHaveBeenCalled();
+
+      const searched = await service.getLeadDetails(listId, leadId, userId, { maxContentFetches: 10, recoverStaleList: true });
+      expect(searched.success).toBe(false);
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalled();
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalled();
+    });
+
     it('ENG-969: corrects a stale list_id when the lead is in one of the caller\'s OWN other lists (tier 1, no org fan-out)', async () => {
       // The actual production case (session 6082779b-f9f1-4e38-a8eb-34abbc3da419) was
       // always a same-user list mixup, so tier 1 (getLeadListsByUserId — one cheap

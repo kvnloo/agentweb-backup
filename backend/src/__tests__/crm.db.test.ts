@@ -2214,6 +2214,45 @@ describe('CRM Database Service', () => {
         event('e5', 'email.received', '2024-01-05T00:00:00Z'),
       ];
 
+      /** Resend double that records how many fetches are in flight at once. */
+      const trackConcurrency = () => {
+        const state = { inFlight: 0, max: 0 };
+        const slow = async (emailId: string) => {
+          state.inFlight++;
+          state.max = Math.max(state.max, state.inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          state.inFlight--;
+          return { html: `<p>${emailId}</p>`, text: emailId };
+        };
+        resend.getReceivedEmailContent.mockImplementation(slow);
+        resend.getDeliveredEmailContent.mockImplementation(slow);
+        return state;
+      };
+
+      it('a capped read fetches one body at a time (the provider limit is shared with the platform\'s sends); an uncapped read fetches them all at once, as before', async () => {
+        arrange(fiveEvents());
+        const capped = trackConcurrency();
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 5 });
+        expect(fetchedIds()).toHaveLength(5);
+        expect(capped.max).toBe(1);
+
+        arrange(fiveEvents());
+        const uncapped = trackConcurrency();
+        await crmDb.getLeadEngagements(listId, leadId, userId);
+        expect(fetchedIds()).toHaveLength(5);
+        expect(uncapped.max).toBeGreaterThan(1);
+      });
+
+      it('a capped read goes on to the next fetch after one fails, and still returns every event', async () => {
+        arrange(fiveEvents());
+        resend.getDeliveredEmailContent.mockRejectedValue(new Error('provider down'));
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 5 });
+        expect(fetchedIds()).toHaveLength(5);
+        const withBody = result.engagements.filter((e: any) => e.emailContent).map((e: any) => e.eventData.subject).sort();
+        expect(withBody).toEqual(['e1', 'e3', 'e5']);
+        expect(result.engagements).toHaveLength(5);
+      });
+
       it('no option: every event without a stored body is fetched (Emma and the portal are unchanged)', async () => {
         arrange(fiveEvents());
         const result = await crmDb.getLeadEngagements(listId, leadId, userId);
