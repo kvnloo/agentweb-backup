@@ -392,23 +392,24 @@ export class McpClientService {
         timeout,
       ]);
     } catch (error) {
-      await this.closeClient(client);
+      await this.closeClient(client, transport);
       throw error;
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
 
-  private async closeClient(client: Client): Promise<void> {
-    // ENG-3187: the client forgets its transport when it closes, so take it first; its working folder goes with it.
-    const transport = (client as any)._transport;
+  private async closeClient(client: Client, transport?: unknown): Promise<void> {
+    // ENG-3187: the client forgets its transport when it closes (or when the child process exits by itself), so the caller's own transport is preferred
+    // and the client's is taken before closing; the working folder goes with it.
+    const ownTransport = transport ?? (client as any)._transport;
     try {
       await client.close();
     } catch (error) {
       // Preserve the original lifecycle error while making cleanup failures visible.
       console.error('MCP: Failed to close client during lifecycle cleanup:', error);
     }
-    this.removePlaywrightWorkDirOf(transport);
+    this.removePlaywrightWorkDirOf(ownTransport);
   }
 
   private async evictSessionClient(poolKey: string, serverName: string, expectedClient?: Client): Promise<void> {
@@ -610,12 +611,17 @@ export class McpClientService {
 
   /** Best-effort delete of one working folder. */
   private removePlaywrightWorkDir(dir: string): void {
-    this.playwrightLiveWorkDirs.delete(dir);
     try {
       fs.rmSync(dir, { recursive: true, force: true });
+      this.playwrightLiveWorkDirs.delete(dir);
     } catch (error) {
       console.warn(`MCP: Could not remove Playwright working folder ${dir}:`, (error as Error).message);
     }
+  }
+
+  /** For a caller that built a transport with createTransport and manages its client itself: remove that transport's working folder once it is done. */
+  public releaseTransportResources(transport: unknown): void {
+    this.removePlaywrightWorkDirOf(transport);
   }
 
   /** Delete the folder that belongs to this transport (a no-op for any other). */
@@ -669,11 +675,13 @@ export class McpClientService {
     try {
       if (!fs.existsSync(root)) return;
       const now = Date.now();
+      const processStartMs = now - process.uptime() * 1000;
+      const liveNames = new Set(Array.from(this.playwrightLiveWorkDirs).map((dir) => path.basename(dir)));
       let removed = 0;
       for (const entry of fs.readdirSync(root)) {
         const dir = path.join(root, entry);
         try {
-          if (isAbandonedPlaywrightWorkDir(entry, fs.statSync(dir).mtimeMs, now, process.pid, processIsAlive)) {
+          if (isAbandonedPlaywrightWorkDir(entry, fs.statSync(dir).mtimeMs, now, process.pid, processIsAlive, liveNames, processStartMs)) {
             fs.rmSync(dir, { recursive: true, force: true });
             removed++;
           }
@@ -1009,6 +1017,8 @@ export class McpClientService {
     const transportType = getTransportType(serverConfig.config);
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
     transport.onclose = () => {
+      // ENG-3187: the child process is gone, so its working folder is too (the client forgets its transport on this event, so nothing else could find it).
+      this.removePlaywrightWorkDirOf(transport);
       console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
       const pool = this.sessionClientPools.get(poolKey);
       if (pool?.clients.get(serverName) === client) {
@@ -1174,13 +1184,13 @@ export class McpClientService {
         console.log(`[MCP-SESSION] Discovered tools for secret-placeholder server "${serverName}"`);
       } catch (error) {
         console.error(`[MCP-SESSION] Failed to discover tools for "${serverName}":`, error);
-        await this.closeClient(client);
+        await this.closeClient(client, transport);
         throw error;
       }
     }
 
     if (sessionPool.released) {
-      await this.closeClient(client);
+      await this.closeClient(client, transport);
       throw new Error(`MCP: Client pool "${poolKey}" was released while connecting to "${serverName}"`);
     }
 
@@ -1692,7 +1702,11 @@ export class McpClientService {
 
     // Stdio subprocesses (e.g. Playwright) need more time to start than HTTP servers
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
-    transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
+    transport.onclose = () => {
+      // ENG-3187: the child process is gone, so its working folder is too.
+      this.removePlaywrightWorkDirOf(transport);
+      console.warn(`MCP: Transport for ${name} closed`);
+    };
     transport.onerror = (err: any) => {
       // Suppress expected errors during shutdown/reload
       const errorMessage = err?.message || '';
@@ -1728,7 +1742,7 @@ export class McpClientService {
 
     // Discover tools
     const response = await client.listTools().catch(async error => {
-      await this.closeClient(client);
+      await this.closeClient(client, transport);
       throw error;
     });
     this.clients.set(name, client);
@@ -1918,6 +1932,8 @@ export class McpClientService {
       throw new Error(`MCP server not found: ${serverName}`);
     }
 
+    // ENG-3187: a refused call must not start a server first.
+    const preparedArgs = await this.prepareBrowserCall(toolName, args);
     const transport = await this.createTransport(serverName, config as any);
     const client = new Client(
       { name: "AgentWeb-Backend", version: "1.0.0" },
@@ -1930,12 +1946,12 @@ export class McpClientService {
       connected = true;
 
       return await client.callTool(
-        { name: toolName, arguments: await this.prepareBrowserCall(toolName, args) },
+        { name: toolName, arguments: preparedArgs },
         undefined,
         { timeout: options?.timeoutMs ?? 3600000 }
       );
     } finally {
-      if (connected) await this.closeClient(client);
+      if (connected) await this.closeClient(client, transport);
     }
   }
 
@@ -1997,7 +2013,7 @@ export class McpClientService {
 
       return await fn(callTool);
     } finally {
-      if (connected) await this.closeClient(client);
+      if (connected) await this.closeClient(client, transport);
     }
   }
 

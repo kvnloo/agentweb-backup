@@ -64,7 +64,9 @@ const FOREIGN_WORK_DIR_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Whether a folder under PLAYWRIGHT_WORK_ROOT was left behind: its owning process is gone. A live process's folders are never touched, however old
- * (a folder's own modification time only changes when entries are added directly to it). A name without an owner is removed only when very old.
+ * (a folder's own modification time only changes when entries are added directly to it). A folder named for THIS process is abandoned only when this
+ * process does not know it and it is older than this process (a restart in a container reuses the same process id). A name without an owner is removed
+ * only when very old. Assumes every process that shares the root also shares the process-id space (true on one host).
  */
 export function isAbandonedPlaywrightWorkDir(
   entryName: string,
@@ -72,11 +74,13 @@ export function isAbandonedPlaywrightWorkDir(
   nowMs: number,
   ownPid: number,
   pidAlive: (pid: number) => boolean,
+  ownLiveNames: ReadonlySet<string> = new Set(),
+  processStartMs: number = 0,
 ): boolean {
   const owner = /^(\d+)-/.exec(entryName);
   if (!owner) return nowMs - mtimeMs > FOREIGN_WORK_DIR_MAX_AGE_MS;
   const pid = Number(owner[1]);
-  if (pid === ownPid) return false;
+  if (pid === ownPid) return !ownLiveNames.has(entryName) && mtimeMs < processStartMs;
   return !pidAlive(pid);
 }
 
@@ -112,6 +116,13 @@ const REFUSAL_UNRESOLVED = 'The browser could not check that address just now (i
 /** How long the host check may take before the address is treated as not checkable. */
 const HOST_CHECK_TIMEOUT_MS = 5000;
 
+/**
+ * How many host checks may be waiting at once. A name lookup holds one of the process's few lookup threads until it answers, so a burst of navigates
+ * to names that never answer must not starve the rest of the backend; past this many, the address is refused as "could not check just now".
+ */
+const MAX_CONCURRENT_HOST_CHECKS = 8;
+let activeHostChecks = 0;
+
 /** Names Chrome or the network treat as local without asking the public DNS (`*.localhost` is loopback in Chrome; `.local` is mDNS; `.internal` is private by convention). */
 const LOCAL_NAME_SUFFIXES = ['.localhost', '.local', '.internal', '.localdomain', '.lan', '.home.arpa'];
 
@@ -146,6 +157,7 @@ export async function browserNavigationRefusal(
     log?: (line: string) => void;
     who?: { userId?: string; sessionId?: string };
     timeoutMs?: number;
+    maxConcurrentChecks?: number;
   } = {},
 ): Promise<string | null> {
   if (toolName !== BROWSER_NAVIGATE_TOOL) return null;
@@ -178,6 +190,11 @@ export async function browserNavigationRefusal(
     refused('address');
     return REFUSAL_ADDRESS;
   }
+  if (activeHostChecks >= (options.maxConcurrentChecks ?? MAX_CONCURRENT_HOST_CHECKS)) {
+    refused('unresolved');
+    return REFUSAL_UNRESOLVED;
+  }
+  activeHostChecks += 1;
   let timer: NodeJS.Timeout | undefined;
   try {
     await Promise.race([
@@ -191,6 +208,7 @@ export async function browserNavigationRefusal(
     refused(couldNotCheck ? 'unresolved' : 'address');
     return couldNotCheck ? REFUSAL_UNRESOLVED : REFUSAL_ADDRESS;
   } finally {
+    activeHostChecks -= 1;
     if (timer) clearTimeout(timer);
   }
   return null;
