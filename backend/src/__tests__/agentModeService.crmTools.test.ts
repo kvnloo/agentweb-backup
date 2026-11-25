@@ -16,6 +16,9 @@ jest.mock('../services/db', () => ({
     getLeadListsByUserId: jest.fn(),
     getLeadListsForUser: jest.fn(),
     updateLead: jest.fn(),
+    claimLeadEmailDraft: jest.fn(async () => 'claim-token'),
+    releaseLeadEmailDraftClaim: jest.fn(async () => undefined),
+    completeLeadEmailDraftSend: jest.fn(async () => true),
     batchCreateLeads: jest.fn(),
     deleteLead: jest.fn(),
     updateLeadList: jest.fn(),
@@ -2192,7 +2195,7 @@ describe('AgentModeService - CRM Tools', () => {
         text: 'Hi John'
       });
       // Should clear draft after sending
-      expect(mockCrmDb.updateLead).toHaveBeenCalledWith(listId, leadId, { emailDraft: null });
+      expect(mockCrmDb.completeLeadEmailDraftSend).toHaveBeenCalledWith(listId, leadId, expect.any(String), expect.any(Object));
     });
 
     it('ENG-673: refuses to email a lead pushed to Smartlead, and says why; a released marker is fine', async () => {
@@ -2318,7 +2321,7 @@ describe('AgentModeService - CRM Tools', () => {
         })
       );
       expect(mockResend.sendEmail).not.toHaveBeenCalled();
-      expect(mockCrmDb.updateLead).toHaveBeenCalledWith(listId, leadId, { emailDraft: null });
+      expect(mockCrmDb.completeLeadEmailDraftSend).toHaveBeenCalledWith(listId, leadId, expect.any(String), expect.any(Object));
     });
 
     it('should return error when Gmail sender is missing gmailAccountId', async () => {
