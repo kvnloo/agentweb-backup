@@ -38,7 +38,7 @@
  * (the newest ones; the rest come back without a body, and a later call fetches the next newest once these are stored: a body that cannot be
  * fetched is not remembered and uses the allowance again). The provider's request limit is shared with the platform's sends, so those fetches
  * go through ONE chain for the whole process (`crmDb`'s `runCappedFetch`): one at a time, 500 ms apart like the sends, at most 20 in it and 10
- * per account, each given up on after 30 s (the provider reads have no timeout of their own), and a fetch that does not fit is skipped (its event
+ * per account, each given up on after 10 s (the provider reads have no timeout of their own), and a fetch that does not fit is skipped (its event
  * comes back without a body). `get_lead_details` can also check a connected LinkedIn
  * account. A key that
  * holds only `tools:read` cannot call the two lead tools, the same as `manage_leads` and `search_leads`. The monthly token quota refuses an

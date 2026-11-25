@@ -45,13 +45,13 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
  * ENG-2840 (W2-5a): the provider fetches of a CAPPED lead-history read (the MCP lead tools) go through ONE chain for the whole process: one at
  * a time, `gapMs` apart (the gap the platform's own sends keep, 2 a second). At most `backlog` fetches may be in the chain (one running, the rest
  * waiting) and at most `perUser` of them one account's, so one account crawling its leads cannot fill it; a fetch that would not fit is skipped and
- * its event comes back without a body. A fetch that has not answered after `timeoutMs` is given up on (the event comes back without a body and
+ * its event comes back without a body. A fetch that has not answered after `timeoutMs` (10 s: the ten fetches of one call, if the provider hangs, then take about 100 s, inside the 5-minute self-call timeout) is given up on (the event comes back without a body and
  * the chain moves on): the provider reads have no timeout of their own, and one request that never answers must not block every later read in the
  * process. The provider's request limit is shared with the platform's sends, and an API key can repeat a read 60 times a minute (up to 600), so a
  * per-call limit alone would still let several calls fetch at once. An uncapped read (Emma, the portal) does not use the chain.
  * `cappedFetchTuning` is exported so a test can shorten the gap and the deadline.
  */
-export const cappedFetchTuning = { gapMs: 500, backlog: 20, perUser: 10, timeoutMs: 30_000 };
+export const cappedFetchTuning = { gapMs: 500, backlog: 20, perUser: 10, timeoutMs: 10_000 };
 let cappedFetchChain: Promise<unknown> = Promise.resolve();
 let cappedFetchWaiting = 0;
 const cappedFetchByUser = new Map<string, number>();
@@ -9975,7 +9975,7 @@ export const crmDb = {
    * `options.maxContentFetches` (ENG-2840 W2-5a, set only by the MCP lead tools): the most email bodies this call may fetch from the mail
    * provider. Without it (Emma, the portal) every received or delivered event that has no stored body is fetched, all at once. With it, only
    * the NEWEST that many such events are fetched, through one process-wide chain (one at a time, 500 ms apart, at most 20 in it and 10 per
-   * account, each given up on after 30 s; one that does not fit is skipped), and stored (so a later call reaches the next ones, as long as these succeed: a body that cannot be
+   * account, each given up on after 10 s; one that does not fit is skipped), and stored (so a later call reaches the next ones, as long as these succeed: a body that cannot be
    * fetched is not remembered and uses the allowance again on every call); the others are returned without a body.
    * An event whose body is already stored never uses up the allowance. A value that is not a finite number of at least 0 is no cap.
    */
