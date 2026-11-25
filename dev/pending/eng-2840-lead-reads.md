@@ -52,7 +52,7 @@
   anything else, so a bad value is never a silent "no cap"): only the newest 10 such events without a stored body are fetched per call, through
   ONE chain for the whole process (`runCappedFetch` in `services/db.ts`): one at a time, 500 ms apart (the gap the platform's own sends keep),
   at most 20 in the chain (one running, 19 waiting) and at most 10 per account (so one account crawling its leads cannot fill it and starve the
-  others), each fetch given up on after 30 s (the Resend reads set no timeout, so one request that never answered would otherwise block every
+  others), each fetch given up on after 10 s (so a hanging provider holds one call for about 100 s at most, inside the 5-minute self-call timeout; the Resend reads set no timeout, so one request that never answered would otherwise block every
   later read in the process; the abandoned request is not cancelled). A fetch that does not fit is skipped and its event comes back without a
   body; fetches are handed to the chain newest first, so what a busy chain skips is the oldest of the allowed events. An uncapped read (Emma,
   the portal) does not use the chain, is not paced and runs every fetch at once, as before. Resend's limit is shared with the platform's sends
