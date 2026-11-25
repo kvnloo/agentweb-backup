@@ -12,8 +12,10 @@ export function createActivationReportRouter(store?: ProgressStore) {
   router.get('/zoma/activation-progress', authenticateToken, isAdmin, async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     let cursor: { email: string } | undefined;
-    const hours = req.query.stuckAfterHours === undefined ? 24 : Number(req.query.stuckAfterHours);
-    if (!Number.isFinite(hours) || hours < 1 || hours > 8760 || (req.query.stuckAfterHours !== undefined && typeof req.query.stuckAfterHours !== 'string')) return res.status(400).json({ error: 'stuckAfterHours must be 1..8760' });
+    const rawHours = req.query.stuckAfterHours;
+    if (rawHours !== undefined && typeof rawHours !== 'string') return res.status(400).json({ error: 'stuckAfterHours must be 1..8760' });
+    const hours = rawHours === undefined ? 24 : Number(rawHours);
+    if (!Number.isFinite(hours) || hours < 1 || hours > 8760) return res.status(400).json({ error: 'stuckAfterHours must be 1..8760' });
     if (req.query.format !== undefined && !['json', 'csv'].includes(req.query.format as string)) return res.status(400).json({ error: 'format must be json or csv' });
     if (req.query.userId !== undefined && (typeof req.query.userId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(req.query.userId))) return res.status(400).json({ error: 'Invalid userId' });
     try {

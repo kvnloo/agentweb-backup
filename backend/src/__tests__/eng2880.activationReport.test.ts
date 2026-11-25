@@ -50,7 +50,7 @@ it('cursor is passed to exactly the next page', async () => {
   await call({ query: { cursor: Buffer.from(JSON.stringify({ email: 'last@b.co' })).toString('base64url') } }, res);
   expect(db.listZomaActivationUsers).toHaveBeenCalledWith({ email: 'last@b.co' });
 });
-it.each([{ format: 'xml' }, { stuckAfterHours: 'NaN' }, { stuckAfterHours: '0' }, { stuckAfterHours: ['24'] }, { cursor: 'bad' }, { cursor: Buffer.from('{"email":"x","extra":"bad"}').toString('base64url') }, { userId: ['u1'] }])('rejects invalid query %p without storage access', async query => {
+it.each([{ format: 'xml' }, { stuckAfterHours: 'NaN' }, { stuckAfterHours: '0' }, { stuckAfterHours: ['24'] }, { stuckAfterHours: { toString: 'x' } }, { cursor: 'bad' }, { cursor: Buffer.from('{"email":"x","extra":"bad"}').toString('base64url') }, { userId: ['u1'] }])('rejects invalid query %p without storage access', async query => {
   const { db, call } = handler(); const res = response();
   await call({ query }, res);
   expect(res.status).toHaveBeenCalledWith(400);
