@@ -3,6 +3,8 @@
  * the 75%/90% notices fire once per threshold. Counters persist on the session item, so a new
  * tracker (another instance, after a deploy) sees the same state.
  */
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   isSessionLimitConfirmation,
   sessionLimitCapsForTier,
@@ -104,7 +106,8 @@ describe('replayed runaway session (Opiner aea6a0ee: 549 turns, ~$47)', () => {
     expect(paused).toBe(true);
     // $20 at ~$0.0856/turn is reached at turn 234 > 150, so the turn cap trips first.
     expect(total).toBe(150);
-    expect(tracker.pauseMessage(false)).toContain('150 of 150 steps');
+    // Owner decision 2026-11-25: the customer-facing pause text carries no numbers (the usage is logged and stored on the message).
+    expect(tracker.pauseMessage(false)).toBe('This session has reached its usage limit. Reply "continue" to keep going in this session, or start a new session.');
 
     // A new run (another instance / after a deploy) reads the persisted counters: still paused.
     tracker = (await startSessionLimit(attended('what else can you do?'), t.deps))!;
@@ -124,15 +127,54 @@ describe('replayed runaway session (Opiner aea6a0ee: 549 turns, ~$47)', () => {
     const tracker = (await startSessionLimit(attended(), t.deps))!;
     const r = await runLoop(tracker, 100, 0.5);
     expect(r).toEqual({ calls: 40, paused: true });
-    expect(tracker.pauseMessage(false)).toContain('$20.00 of $20.00');
+    // Stopped by the dollar side, and the text still shows no dollar figure or count.
+    expect(tracker.pauseMessage(false)).not.toMatch(/[$\d]/);
   });
 
   it('an unattended scheduled run cannot confirm: it stays paused with a scheduled-run notice', async () => {
     const t = fakeTable({ sessionId: SESSION, sessionLimitTurns: 150, sessionLimitSpendMicroUsd: 1 });
     const tracker = (await startSessionLimit({ ...attended('continue'), isUnattendedRun: true, warningsAllowed: false }, t.deps))!;
     expect(tracker.reached()).toBe(true);
-    expect(tracker.pauseMessage(true)).toMatch(/^This scheduled run paused/);
+    expect(tracker.pauseMessage(true)).toBe('This scheduled run paused because the session reached its usage limit. Open this session and reply "continue" to keep going, or start a new session.');
     expect(t.item()!.sessionLimitWindowStartTurns).toBeUndefined();
+  });
+
+  // ENG-2812 / ENG-3164: a share-link visitor's "continue" is not the owner's word. Found live 2026-11-25: it reopened the owner's window.
+  describe('a share-link visitor', () => {
+    const visitor = (messageContent = 'continue') => ({ ...attended(messageContent), isShareVisitor: true });
+
+    it('cannot reopen the owner\'s window with "continue" (or any confirmation word); the owner on the same session still can', async () => {
+      for (const word of ['continue', 'Keep going', 'yes', 'proceed', 'ok continue']) {
+        const t = fakeTable({ sessionId: SESSION, sessionLimitTurns: 150, sessionLimitSpendMicroUsd: 1 });
+        const tracker = (await startSessionLimit(visitor(word), t.deps))!;
+        expect(tracker.reached()).toBe(true);
+        expect(t.item()!.sessionLimitWindowStartTurns).toBeUndefined(); // no window written
+        expect((await runLoop(tracker, 40, 0.01)).calls).toBe(0);
+      }
+      const t = fakeTable({ sessionId: SESSION, sessionLimitTurns: 150, sessionLimitSpendMicroUsd: 1 });
+      expect((await startSessionLimit(visitor(), t.deps))!.reached()).toBe(true);
+      const owner = (await startSessionLimit(attended('continue'), t.deps))!; // the owner's own turn: no visitor flag
+      expect(owner.reached()).toBe(false);
+      expect(t.item()!.sessionLimitWindowStartTurns).toBe(150);
+    });
+
+    it('is told to ask the person who shared the chat, in plain words with no numbers', async () => {
+      const t = fakeTable({ sessionId: SESSION, sessionLimitTurns: 150, sessionLimitSpendMicroUsd: 1 });
+      const tracker = (await startSessionLimit(visitor('what is next?'), t.deps))!;
+      expect(tracker.pauseMessage(false)).toBe('This shared chat has reached its usage limit. Ask the person who shared it to continue it.');
+    });
+
+    it('still counts its turns against the shared session, but never sees the 75% / 90% notices (nor claims them for the owner)', async () => {
+      const t = fakeTable({ sessionId: SESSION, sessionLimitTurns: 112, sessionLimitSpendMicroUsd: 0 });
+      const tracker = (await startSessionLimit(visitor('hello'), t.deps))!;
+      await tracker.recordTurn(0.01); // 113 of 150: past 75%
+      expect(t.item()!.sessionLimitTurns).toBe(113);
+      expect(tracker.dueWarning()).toBeUndefined();
+      expect(t.item()!.sessionLimitWarned75).toBeUndefined(); // not claimed: the owner's next turn still gets the notice
+      const ownerTurn = (await startSessionLimit(attended('hello'), t.deps))!;
+      await ownerTurn.recordTurn(0.01);
+      expect(ownerTurn.dueWarning()).toBe(75);
+    });
   });
 
   it('two simultaneous confirmations open exactly one window', async () => {
@@ -253,5 +295,35 @@ describe('media reopen backstop', () => {
     const base = { role: 'assistant', content: 'x', metadata: { toolCalls: [deferred] } } as any;
     expect(hasUnresolvedMediaDeferral([{ ...base, metadata: { ...base.metadata, mediaBudgetDeferred: true } }])).toBe(true);
     expect(hasUnresolvedMediaDeferral([{ ...base, metadata: { mediaBudgetDeferred: true, sessionLimitPaused: { turns: 150 } } }])).toBe(false);
+  });
+});
+
+// ENG-2812 / ENG-3164: the visitor rule above only holds if the turn's visitor flag actually reaches the limit. Replies are generated in a
+// forked worker, so the in-process visitor marker is NOT visible there; the flag that does cross is `isInteractiveShare` (false for the
+// owner on their own link). A behavioural test would need the whole model stack, so the wiring is pinned the way ENG-827 pins its own.
+describe('the visitor flag reaches the session limit (wiring)', () => {
+  const read = (rel: string) => fs.readFileSync(path.join(__dirname, rel), 'utf8');
+
+  it('startSessionLimitForRun is called with isShareVisitor taken from the turn\'s isInteractiveShare', () => {
+    const src = read('../agentModeService.ts');
+    const call = src.slice(src.indexOf('await startSessionLimitForRun({'));
+    const args = call.slice(0, call.indexOf('});'));
+    expect(args).toMatch(/isShareVisitor:\s*isInteractiveShare\s*===\s*true/);
+  });
+
+  it('isInteractiveShare crosses the worker boundary: declared, sent by the controller, unpacked and forwarded by the worker', () => {
+    expect(read('../generateMarketingResponseWorkerService.ts')).toMatch(/isInteractiveShare\?:\s*boolean/);
+    const controller = read('../../controllers/agentModeController.ts');
+    const payload = controller.slice(controller.indexOf('runInWorker('), controller.indexOf('runInWorker(') + 900);
+    expect(payload).toContain('isInteractiveShare: isInteractiveShare || false');
+    const worker = read('../../workers/generateMarketingResponseWorker.ts');
+    expect(worker).toMatch(/const\s*\{[^}]*\bisInteractiveShare\b[^}]*\}\s*=\s*message\.params/);
+    const call = worker.slice(worker.indexOf('generateMarketingResponse('));
+    expect(call.slice(0, call.indexOf(');'))).toContain('isInteractiveShare');
+  });
+
+  it('the share route passes isInteractiveShare = "not the owner", so the owner on their own link is not treated as a visitor', () => {
+    const controller = read('../../controllers/agentModeController.ts');
+    expect(controller).toMatch(/!viewerIsOwner,\s*\/\/ isInteractiveShare/);
   });
 });
