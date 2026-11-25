@@ -1,6 +1,5 @@
 const mockPut = jest.fn();
-jest.mock('aws-sdk', () => ({ DynamoDB: { DocumentClient: jest.fn(() => ({ put: mockPut })) } }));
-jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn(async () => ({ orgId: 'org-test' })) } }));
+jest.mock('aws-sdk', () => ({ DynamoDB: { DocumentClient: jest.fn(() => ({ put: mockPut, query: () => ({ promise: async () => ({ Items: [{ orgId: 'org-test' }] }) }) })) } }));
 import { recordSuccessfulSend } from '../services/sentMessageShadow';
 const input = { channel: 'email' as const, userId: 'user', recipients: ['test@example.com'], providerId: 'provider-test', adapter: 'test' };
 const flush = () => new Promise(setImmediate);
