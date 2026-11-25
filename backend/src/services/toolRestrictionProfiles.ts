@@ -325,8 +325,8 @@ export function isServerSideBrowserCodeTool(toolName: string): boolean {
 
 /**
  * ENG-3170: the Playwright tools that take a `filename` (evaluate, snapshot, screenshot, console, network, pdf, video...) write the result to that path, and
- * `browser_file_upload` takes `paths` and sends those files to the page. The browser server runs in the backend's own working directory (no `cwd` is set) and
- * Playwright allows anything under it, so a call that sets one is reading or overwriting the deployed backend's files (a restart then runs what was written).
+ * `browser_file_upload` takes `paths` and sends those files to the page. The browser server used to run in the backend's own working directory and Playwright allows anything under it, so a call that set one read or overwrote the
+ * deployed backend's files (a restart then ran what was written). Since ENG-3187 it has a working folder of its own, so this rule is a second layer for visitors.
  * A visitor who may not run the sensitive tools may not set either; the same call without them (the result comes back in the chat) is unaffected. Pure.
  */
 export function browserCallTouchesServerFiles(args?: unknown): boolean {
