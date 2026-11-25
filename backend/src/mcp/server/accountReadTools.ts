@@ -104,6 +104,8 @@ export const SOCIAL_UNITS_PER_ACCOUNT = 30;
 export const SOCIAL_COST_POSTS = 1;
 export const SOCIAL_COST_METRICS = 4;
 export const SOCIAL_COST_PER_ANALYTICS_POST = 5;
+/** Per post when a posts call asks for metrics (the same per-post path as analytics). */
+export const SOCIAL_COST_PER_POST_WITH_METRICS = 5;
 const SOCIAL_WINDOW_MS = 60_000;
 const SOCIAL_CACHE_MAX = 500;
 const SOCIAL_ACCOUNTS_MAX = 2_000;
@@ -180,7 +182,7 @@ async function guardedSocialRead(
   if (hit) return jsonResult(hit);
   const wait = socialReadGuard.take(`${caller}|${accountId}`, cost);
   if (wait > 0) {
-    refuse(tool, `this account has used its provider allowance for this minute (${SOCIAL_UNITS_PER_ACCOUNT} units; the platform's quota is shared by every customer, and this call costs ${cost}). Try again in ${Math.ceil(wait / 1000)} seconds, or repeat the same call: an answer is kept for ${SOCIAL_CACHE_TTL_MS / 1000} seconds.`);
+    refuse(tool, `you have used your provider allowance for this account this minute (${SOCIAL_UNITS_PER_ACCOUNT} units; the platform's quota is shared by every customer, and this call costs ${cost}). Try again in ${Math.ceil(wait / 1000)} seconds, or repeat the same call: an answer is kept for ${SOCIAL_CACHE_TTL_MS / 1000} seconds.`);
   }
   const answer = requireOk(tool, await callRoute(tool, request, context));
   socialReadGuard.remember(cacheKey, answer);
@@ -192,16 +194,16 @@ async function guardedSocialRead(
 const POSTS_INPUTS = ['account_id', 'limit', 'include_metrics'] as const;
 const METRICS_INPUTS = ['account_id', 'start_date', 'end_date'] as const;
 const ANALYTICS_INPUTS = ['account_id', 'post_ids'] as const;
-const COST_NOTE = 'posts 1, plus 1 per post with include_metrics; account metrics 4; post analytics 5 per post';
+const COST_NOTE = 'posts 1, plus 5 per post with include_metrics; account metrics 4; post analytics 5 per post';
 export const POSTS_DEFAULT_LIMIT = 10;
 export const POSTS_MAX_LIMIT = 50;
-/** Instagram costs one provider call per post when metrics are on. */
-export const POSTS_MAX_LIMIT_WITH_METRICS = 10;
+/** With metrics a personal LinkedIn post can cost five provider calls: five posts cost 26 of the 30 units. */
+export const POSTS_MAX_LIMIT_WITH_METRICS = 5;
 export const METRICS_MAX_RANGE_DAYS = 366;
 /** A LinkedIn post is up to five sequential provider calls: five posts cost 25 of the 30 units. */
 export const POST_IDS_MAX = 5;
-/** The ids the posts tool hands out: LinkedIn urns (urn:li:share:123), Instagram numbers, YouTube ids. No slash, query character, dot or percent: Instagram puts the id into a Graph path. */
-const POST_ID_RE = /^[A-Za-z0-9:_-]{1,100}$/;
+/** The ids the posts tool hands out: LinkedIn urns (urn:li:share:123), Instagram media numbers, YouTube video ids (11 characters). Nothing else: Instagram puts the id into a Graph path. */
+const POST_ID_RE = /^(urn:li:(share|ugcPost|activity):\d{1,30}|\d{5,25}(_\d{5,25})?|[A-Za-z0-9_-]{11})$/;
 
 export interface RouteRequest {
   method: 'GET' | 'POST';
@@ -223,7 +225,7 @@ export function postsRequest(args: unknown): RouteRequest & { accountId: string;
   }
   if (a.include_metrics !== undefined && a.include_metrics !== null && typeof a.include_metrics !== 'boolean') refuse(tool, 'include_metrics must be true or false.');
   const metrics = a.include_metrics === true;
-  if (metrics && limit > POSTS_MAX_LIMIT_WITH_METRICS) refuse(tool, `with include_metrics the most posts is ${POSTS_MAX_LIMIT_WITH_METRICS} (Instagram costs one provider call per post).`);
+  if (metrics && limit > POSTS_MAX_LIMIT_WITH_METRICS) refuse(tool, `with include_metrics the most posts is ${POSTS_MAX_LIMIT_WITH_METRICS} (a personal LinkedIn post with metrics can cost five provider calls).`);
   return {
     method: 'GET',
     path: '/api/emma/connected-account-posts',
@@ -273,7 +275,7 @@ export function analyticsRequest(args: unknown): RouteRequest & { accountId: str
   if (!Array.isArray(a.post_ids) || a.post_ids.length < 1 || a.post_ids.length > POST_IDS_MAX) refuse(tool, `post_ids must be a list of 1 to ${POST_IDS_MAX} post ids.`);
   const ids = (a.post_ids as unknown[]).map((id) => {
     const text = cleanText(tool, 'post_ids', id, 100, 'Use ids returned by list_connected_account_posts.');
-    if (!POST_ID_RE.test(text)) refuse(tool, 'post_ids holds an id that is not a post id (letters, digits, colon, underscore and hyphen only). Use ids returned by list_connected_account_posts.');
+    if (!POST_ID_RE.test(text)) refuse(tool, 'post_ids holds an id that is not a post id (a LinkedIn urn, an Instagram media number or a YouTube video id). Use ids returned by list_connected_account_posts.');
     return text;
   });
   if (new Set(ids).size !== ids.length) refuse(tool, 'post_ids has the same id twice.');
@@ -316,7 +318,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const r = postsRequest(args);
     const withMetrics = r.normalized.include_metrics === true;
-    return guardedSocialRead('list_connected_account_posts', context, r.accountId, r.normalized, r, SOCIAL_COST_POSTS + (withMetrics ? (r.normalized.limit as number) : 0));
+    return guardedSocialRead('list_connected_account_posts', context, r.accountId, r.normalized, r, SOCIAL_COST_POSTS + (withMetrics ? SOCIAL_COST_PER_POST_WITH_METRICS * (r.normalized.limit as number) : 0));
   },
 });
 
@@ -328,7 +330,7 @@ mcpToolRegistry.register({
     description: 'Account-level numbers of one connected social account: followers, page or profile views, reach, subscribers or shares, depending on the platform (YouTube numbers are lifetime totals; X returns none). account_id comes from list_connected_accounts. '
       + `start_date and end_date (YYYY-MM-DD, both or neither, at most ${METRICS_MAX_RANGE_DAYS} days; the range ends at 00:00 UTC of end_date) choose the range. Numbers can read 0 or empty when the provider call failed. `
       + 'These go live to the provider with the account owner\'s sign-in token. '
-      + 'The platform\'s quota is shared by every customer, so an answer is kept for 60 seconds and each caller has an allowance of ' + SOCIAL_UNITS_PER_ACCOUNT + ' provider-call units a minute per account across the three social tools (' + COST_NOTE + '); a read can refresh and store the account owner\'s sign-in token and cache what it fetched. '
+      + 'The platform\'s quota is shared by every customer, so an answer is kept for 60 seconds and each caller has an allowance of ' + SOCIAL_UNITS_PER_ACCOUNT + ' provider-call units a minute per account across the three social tools (' + COST_NOTE + '); a read can refresh and store the account owner\'s sign-in token. '
       + 'Any other argument is refused by name (userId, sessionId and llmModel are ignored by the server).',
     inputSchema: {
       type: 'object',
@@ -351,7 +353,7 @@ mcpToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'get_post_analytics',
-    description: `Engagement numbers (likes, comments, shares, impressions, clicks) for specific posts of one connected social account. account_id comes from list_connected_accounts; post_ids (1 to ${POST_IDS_MAX}, no repeats; letters, digits, colon, underscore, hyphen) come from list_connected_account_posts. `
+    description: `Engagement numbers (likes, comments, shares, impressions, clicks) for specific posts of one connected social account. account_id comes from list_connected_accounts; post_ids (1 to ${POST_IDS_MAX}, no repeats; a LinkedIn urn, an Instagram media number or a YouTube video id) come from list_connected_account_posts. `
       + 'A post that could not be read comes back with an error text instead of numbers, or is left out (LinkedIn company-page posts the provider does not return are omitted). A personal LinkedIn post can cost five provider calls. '
       + 'The platform\'s quota is shared by every customer, so an answer is kept for 60 seconds and each caller has an allowance of ' + SOCIAL_UNITS_PER_ACCOUNT + ' provider-call units a minute per account across the three social tools (' + COST_NOTE + '); a read can refresh and store the account owner\'s sign-in token and cache what it fetched. '
       + 'Any other argument is refused by name (userId, sessionId and llmModel are ignored by the server).',
