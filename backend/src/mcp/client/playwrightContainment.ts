@@ -3,21 +3,23 @@
  *
  * The browser server is a child process of the backend. Before this change it started with a full copy of the backend's
  * environment (login-token signing secret, cloud keys, payment and Slack keys) and with the backend's own working folder,
- * and the browser could be pointed at local files and internal addresses. Everything here is a layer that makes that harder:
+ * and the `browser_navigate` tool could be pointed at local files and internal addresses. What is here:
  *
  *  - playwrightChildEnv: the child gets only the variables a headless browser needs, never the backend's secrets.
- *  - the child runs in its own empty working and output folder (its file tools are confined to the working folder).
- *  - browserNavigationRefusal: `browser_navigate` opens public http(s) pages only.
- *  - PLAYWRIGHT_BLOCKED_ORIGINS: the cloud metadata addresses are blocked at the browser too.
+ *  - the child runs in its own empty working and output folder; Playwright confines its file tools to that folder.
+ *  - withoutBrowserClientMeta: a tool call cannot move that confinement (Playwright reads `arguments._meta.cwd` as the base for the paths it checks).
+ *  - browserNavigationRefusal: the `browser_navigate` tool opens public http(s) pages only.
  *
- * What this does NOT do: `browser_run_code` runs the caller's code in a Node `vm`, which is not a security boundary, and the
- * child runs as the same OS user as the backend, so code that escapes it can still read the backend's process and files.
- * Closing that needs the browser server under a separate OS user or container (infrastructure, tracked in ENG-3187).
+ * What this does NOT do (tracked in ENG-3187, phase B): `browser_run_code` hands the caller Playwright's raw `page`. Through it a
+ * caller can still `page.goto('file:///proc/<backend pid>/environ')`, call `page.request` (Node-side HTTP, not routed or checked) to
+ * loopback or the cloud metadata address, or escape the Node `vm` it runs in. The child also runs as the same OS user as the backend. The
+ * navigate check does not see redirects, links, meta refresh or DNS rebinding (Chrome resolves the name again). Closing all of that needs
+ * the browser server under its own OS user or container with the metadata address blocked for it, or `browser_run_code` withdrawn from callers.
  */
-import { assertPublicHostname } from '../../utils/ssrfGuard';
+import { SsrfBlockedError, assertPublicHostname } from '../../utils/ssrfGuard';
 
 /** Variables a headless browser (and npx, if it is used to start the server) needs. Anything not listed stays behind. */
-const ENV_ALLOWED_NAMES = new Set([
+export const PLAYWRIGHT_ENV_ALLOWED_NAMES: ReadonlySet<string> = new Set([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE', 'TZ', 'TERM', 'TMPDIR', 'TEMP', 'TMP',
   // Where Playwright's own browsers were installed, and the font setup.
   'PLAYWRIGHT_BROWSERS_PATH', 'FONTCONFIG_PATH', 'FONTCONFIG_FILE',
@@ -42,36 +44,76 @@ export function playwrightChildEnv(
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(parentEnv)) {
     if (typeof value !== 'string') continue;
-    if (options.inheritFullEnv || ENV_ALLOWED_NAMES.has(name) || ENV_ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+    if (options.inheritFullEnv || PLAYWRIGHT_ENV_ALLOWED_NAMES.has(name) || ENV_ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
       env[name] = value;
     }
   }
   return { ...env, ...configuredEnv };
 }
 
-/** Where each browser server's own working and output folder lives (one folder per pool, mode 0700, removed with the pool). */
+/** Where each browser server's own working and output folder lives (one fresh folder per browser server, mode 0700, removed with it). */
 export const PLAYWRIGHT_WORK_ROOT = '/tmp/playwright-mcp-work';
 
-/** A folder-safe name for a pool key (or, for a shared server, its name). */
-export function playwrightWorkDirName(poolKeyOrName: string): string {
-  return poolKeyOrName.replace(/[^a-zA-Z0-9-_]/g, '_');
+/** The start of a working folder's name: the owning process id (so a sweep can tell a live owner from a dead one) and a folder-safe pool key. */
+export function playwrightWorkDirPrefix(poolKeyOrName: string, pid: number = process.pid): string {
+  return `${pid}-${poolKeyOrName.replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 80)}-`;
 }
 
+/** A working folder with no readable owner (not made by this code) is judged by age alone. */
+const FOREIGN_WORK_DIR_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
 /**
- * Origins the browser may never request: the cloud metadata services. Playwright says this list is not a security boundary and does not
- * follow redirects, so it is one extra layer; the address check in browserNavigationRefusal and the instance setting (IMDSv2 required) are the others.
+ * Whether a folder under PLAYWRIGHT_WORK_ROOT was left behind: its owning process is gone. A live process's folders are never touched, however old
+ * (a folder's own modification time only changes when entries are added directly to it). A name without an owner is removed only when very old.
  */
-export const PLAYWRIGHT_BLOCKED_ORIGINS = [
-  'http://169.254.169.254', 'https://169.254.169.254',
-  'http://169.254.170.2', 'https://169.254.170.2',
-  'http://[fd00:ec2::254]', 'https://[fd00:ec2::254]',
-  'http://metadata.google.internal', 'https://metadata.google.internal',
-].join(';');
+export function isAbandonedPlaywrightWorkDir(
+  entryName: string,
+  mtimeMs: number,
+  nowMs: number,
+  ownPid: number,
+  pidAlive: (pid: number) => boolean,
+): boolean {
+  const owner = /^(\d+)-/.exec(entryName);
+  if (!owner) return nowMs - mtimeMs > FOREIGN_WORK_DIR_MAX_AGE_MS;
+  const pid = Number(owner[1]);
+  if (pid === ownPid) return false;
+  return !pidAlive(pid);
+}
+
+/** True when a process with this id exists (a process we may not signal still exists). */
+export function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+const isBrowserToolName = (toolName: string): boolean => typeof toolName === 'string' && (toolName.startsWith('browser_') || toolName.startsWith('playwright_'));
+
+/**
+ * The arguments to send to a browser tool: a copy without `_meta`. Playwright's `callTool` reads `arguments._meta.cwd` as the folder it resolves the
+ * paths of `browser_file_upload` against when it checks them, but `setFiles` then resolves the same raw paths against its own working folder, so a
+ * model-supplied `_meta.cwd` makes the check pass for a path that reads somewhere else (any file the backend's user can read). No tool needs it.
+ */
+export function withoutBrowserClientMeta(toolName: string, args: unknown): Record<string, unknown> {
+  const copy: Record<string, unknown> = args && typeof args === 'object' ? { ...(args as Record<string, unknown>) } : {};
+  if (isBrowserToolName(toolName)) delete copy._meta;
+  return copy;
+}
 
 export const BROWSER_NAVIGATE_TOOL = 'browser_navigate';
 
 const REFUSAL_SCHEME = 'The browser can only open public web pages (http or https). It cannot open local files or other kinds of address.';
-const REFUSAL_ADDRESS = 'The browser can only open public web pages. It cannot open internal, local-network or unresolvable addresses.';
+const REFUSAL_ADDRESS = 'The browser can only open public web pages. It cannot open internal, local-network or IPv6 literal addresses.';
+const REFUSAL_UNRESOLVED = 'The browser could not check that address just now (it did not resolve). Check the spelling, or try again in a moment.';
+
+/** How long the host check may take before the address is treated as not checkable. */
+const HOST_CHECK_TIMEOUT_MS = 5000;
+
+/** Names Chrome or the network treat as local without asking the public DNS (`*.localhost` is loopback in Chrome; `.local` is mDNS; `.internal` is private by convention). */
+const LOCAL_NAME_SUFFIXES = ['.localhost', '.local', '.internal', '.localdomain', '.lan', '.home.arpa'];
 
 /** The address as Playwright's own `browser_navigate` reads it: a string that is not a URL gets http:// (localhost) or https://. */
 function readNavigationTarget(rawUrl: string): URL | null {
@@ -88,34 +130,68 @@ function readNavigationTarget(rawUrl: string): URL | null {
   }
 }
 
+class HostCheckTimeout extends Error {}
+
 /**
- * For `browser_navigate`: a reason (worded for the model) when the address is not a public http(s) page, otherwise null. Every other tool returns null.
- * It looks at the scheme first (file:, view-source:, chrome:, data:, javascript: and the like are refused), then asks whether the host is a public address
- * (literal private, loopback and link-local addresses, local names and names that resolve to them are refused; an address that cannot be checked is refused).
- * A page that redirects to an internal address after this check is not covered (see the header).
+ * For `browser_navigate`: a reason (worded for the model) when the address is not a public http(s) page (or `data:`, which has no host), otherwise null.
+ * Every other tool returns null. It looks at the scheme first (file:, view-source:, chrome:, javascript:, blob: and the like are refused), then at the
+ * host: IPv6 literals, local names and names that resolve to private, loopback or link-local addresses are refused, and an address that cannot be checked
+ * within a few seconds is refused with a different reason. It is a check on this tool only, made before the call (see the header for what it does not see).
  */
 export async function browserNavigationRefusal(
   toolName: string,
   args: unknown,
-  assertPublic: (url: string) => Promise<void> = assertPublicHostname,
-  log: (line: string) => void = (line) => console.warn(line),
+  options: {
+    assertPublic?: (url: string) => Promise<void>;
+    log?: (line: string) => void;
+    who?: { userId?: string; sessionId?: string };
+    timeoutMs?: number;
+  } = {},
 ): Promise<string | null> {
   if (toolName !== BROWSER_NAVIGATE_TOOL) return null;
   const rawUrl = (args as { url?: unknown } | null | undefined)?.url;
   // Not a string: leave it to the tool's own schema check to reject.
   if (typeof rawUrl !== 'string') return null;
+  const assertPublic = options.assertPublic ?? assertPublicHostname;
+  const log = options.log ?? ((line: string) => console.warn(line));
+  const refused = (reason: 'scheme' | 'address' | 'unresolved', scheme?: string): void =>
+    log(JSON.stringify({ event: 'browser_navigation_refused', reason, ...(scheme ? { scheme: scheme.slice(0, 32) } : {}), userId: options.who?.userId, sessionId: options.who?.sessionId }));
+
   const target = readNavigationTarget(rawUrl);
-  if (!target) return REFUSAL_ADDRESS;
-  if (target.protocol === 'about:' && target.href === 'about:blank') return null;
-  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
-    log(JSON.stringify({ event: 'browser_navigation_refused', reason: 'scheme', scheme: target.protocol }));
+  if (!target) {
+    refused('address');
+    return REFUSAL_ADDRESS;
+  }
+  if (target.protocol === 'about:') {
+    if (target.href === 'about:blank') return null;
+    refused('scheme', target.protocol);
     return REFUSAL_SCHEME;
   }
-  try {
-    await assertPublic(target.href);
-  } catch {
-    log(JSON.stringify({ event: 'browser_navigation_refused', reason: 'address' }));
+  // A data: page has no host to check; it is an opaque origin that can reach no more than any other page can.
+  if (target.protocol === 'data:') return null;
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    refused('scheme', target.protocol);
+    return REFUSAL_SCHEME;
+  }
+  const host = target.hostname.toLowerCase().replace(/\.$/, '');
+  if (!host || host === 'localhost' || host.startsWith('[') || LOCAL_NAME_SUFFIXES.some((suffix) => host.endsWith(suffix))) {
+    refused('address');
     return REFUSAL_ADDRESS;
+  }
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      assertPublic(target.href),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HostCheckTimeout()), options.timeoutMs ?? HOST_CHECK_TIMEOUT_MS); }),
+    ]);
+  } catch (error) {
+    const couldNotCheck = error instanceof HostCheckTimeout
+      || (error instanceof SsrfBlockedError && /^(DNS lookup failed|Hostname did not resolve)/.test(error.message))
+      || (!(error instanceof SsrfBlockedError) && /^(DNS lookup failed|Hostname did not resolve)/.test(String((error as Error)?.message)));
+    refused(couldNotCheck ? 'unresolved' : 'address');
+    return couldNotCheck ? REFUSAL_UNRESOLVED : REFUSAL_ADDRESS;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   return null;
 }
