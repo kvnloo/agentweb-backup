@@ -115,6 +115,8 @@ describe('POST /api/emma/lead-details (get_lead_details projection)', () => {
     expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', { maxContentFetches: 10 });
     await post({});
     expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
+    await post({ max_content_fetches: null });
+    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1');
     mockService.getLeadDetails.mockClear();
     const res = await request(app).post('/api/emma/lead-details').send({ list_id: 'list-1', lead_id: 'l1', max_content_fetches: 999 });
     expect(res.status).toBe(400);

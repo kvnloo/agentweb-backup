@@ -50,7 +50,7 @@ jest.mock('../services/contactEventsDb', () => ({
   normalizeContactId: (raw: string) => raw.trim().toLowerCase(),
 }));
 
-import { crmDb, userDb } from '../services/db';
+import { crmDb, userDb, cappedFetchTuning } from '../services/db';
 import AWS from 'aws-sdk';
 import { LEAD_LIFECYCLES } from '../utils/leadSchema';
 
@@ -2179,6 +2179,10 @@ describe('CRM Database Service', () => {
     // ENG-2840 (W2-5a): options.maxContentFetches bounds how many email bodies one read fetches from the mail provider. Without it (Emma, the
     // portal) every received or delivered event with no stored body is fetched, as before.
     describe('options.maxContentFetches', () => {
+      // the pacing between capped fetches is 500 ms in production; most tests here do not wait for it
+      const productionTuning = { ...cappedFetchTuning };
+      beforeEach(() => { cappedFetchTuning.gapMs = 0; cappedFetchTuning.backlog = productionTuning.backlog; });
+      afterEach(() => { cappedFetchTuning.gapMs = productionTuning.gapMs; cappedFetchTuning.backlog = productionTuning.backlog; });
       const listId = 'list_cap';
       const leadId = 'lead_cap';
       const userId = 'user_cap';
@@ -2241,6 +2245,53 @@ describe('CRM Database Service', () => {
         await crmDb.getLeadEngagements(listId, leadId, userId);
         expect(fetchedIds()).toHaveLength(5);
         expect(uncapped.max).toBeGreaterThan(1);
+      });
+
+      it('the chain is process-wide: two capped reads at the same time never have two fetches in flight between them', async () => {
+        arrange(fiveEvents());
+        const state = trackConcurrency();
+        await Promise.all([
+          crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 3 }),
+          crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 3 }),
+        ]);
+        expect(state.max).toBe(1);
+        expect(fetchedIds().length).toBeGreaterThanOrEqual(6);
+      });
+
+      it('capped fetches are paced: each one starts at least the gap after the one before it finished', async () => {
+        cappedFetchTuning.gapMs = 40;
+        arrange(fiveEvents());
+        const starts: number[] = [];
+        const record = async (emailId: string) => { starts.push(Date.now()); return { html: `<p>${emailId}</p>`, text: emailId }; };
+        resend.getReceivedEmailContent.mockImplementation(record);
+        resend.getDeliveredEmailContent.mockImplementation(record);
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 4 });
+        expect(starts).toHaveLength(4);
+        for (let i = 1; i < starts.length; i++) expect(starts[i] - starts[i - 1]).toBeGreaterThanOrEqual(35);
+      });
+
+      it('at most `backlog` fetches wait: one that would wait behind more is skipped, and its event still comes back', async () => {
+        cappedFetchTuning.backlog = 3;
+        arrange(fiveEvents());
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 5 });
+        expect(fetchedIds()).toHaveLength(3);
+        expect(result.engagements).toHaveLength(5);
+        expect(result.engagements.filter((e: any) => e.emailContent)).toHaveLength(3);
+        // the waiting count came back down: a later read fetches again
+        arrange(fiveEvents());
+        await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 2 });
+        expect(fetchedIds()).toHaveLength(2);
+      });
+
+      it('a provider that answers nothing (the real service returns null after its retries) leaves the event without a body, stores nothing, and uses the allowance', async () => {
+        arrange(fiveEvents());
+        resend.getReceivedEmailContent.mockResolvedValue(null);
+        resend.getDeliveredEmailContent.mockResolvedValue(null);
+        const result = await crmDb.getLeadEngagements(listId, leadId, userId, { maxContentFetches: 2 });
+        expect(fetchedIds()).toEqual(['email-e4', 'email-e5']);
+        expect(updateContent).not.toHaveBeenCalled();
+        expect(result.engagements.filter((e: any) => e.emailContent)).toHaveLength(0);
+        expect(result.engagements).toHaveLength(5);
       });
 
       it('a capped read goes on to the next fetch after one fails, and still returns every event', async () => {
