@@ -68,6 +68,8 @@ export interface GenerateMarketingResponseResult {
   cancelled?: boolean;
   // Loop termination signal carried unchanged across IPC; suppress automatic replay.
   truncatedByStepBudget?: boolean;
+  // ENG-2812: the run stopped at the session's turn/spend limit and waits for the person; never auto-continue it.
+  pausedBySessionLimit?: boolean;
   // ENG-473: count of responseMessages already persisted incrementally during the
   // run, so the caller's final batch persists only the remaining tail.
   persistedResponseCount?: number;

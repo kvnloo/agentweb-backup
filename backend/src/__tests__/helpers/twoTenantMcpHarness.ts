@@ -12,8 +12,8 @@
  * `makeTwoTenantFake()`, (2) mock the socket.io export and the secrets reader (neither is under test), and (3) call
  * `installSelfCallFetch(app)` so the tool's self-call (a `fetch` to http://localhost:PORT) lands in the app instead of a socket.
  *
- * Limits, stated so nobody reads it as more than it is: the fake database ignores FilterExpression / Limit / ExclusiveStartKey and has no
- * batch operations or S3, so isolation that lives in a database filter cannot be proven here; the caller's identity is the session context
+ * Limits, stated so nobody reads it as more than it is: the fake database ignores FilterExpression / Limit / ExclusiveStartKey, serves BatchGetItem
+ * with nothing ever unprocessed, and has no S3, so isolation that lives in a database filter cannot be proven here; the caller's identity is the session context
  * the HTTP layer would have built from a valid aw_ key (the key lookup itself is not exercised); and scope checks that live in the HTTP
  * layer (mcpServer.ts) are not exercised.
  */

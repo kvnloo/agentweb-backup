@@ -41,6 +41,58 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+/**
+ * ENG-2840 (W2-5a): the provider fetches of a CAPPED lead-history read (the MCP lead tools) go through ONE chain for the whole process: one at
+ * a time, `gapMs` apart (the gap the platform's own sends keep, 2 a second). At most `backlog` fetches may be in the chain (one running, the rest
+ * waiting) and at most `perUser` of them one account's, so one account crawling its leads cannot fill it; a fetch that would not fit is skipped and
+ * its event comes back without a body. A fetch that has not answered after `timeoutMs` (10 s: the ten fetches of one call, if the provider hangs, then take about 100 s, inside the 5-minute self-call timeout) is given up on (the event comes back without a body and
+ * the chain moves on): the provider reads have no timeout of their own, and one request that never answers must not block every later read in the
+ * process. The provider's request limit is shared with the platform's sends, and an API key can repeat a read 60 times a minute (up to 600), so a
+ * per-call limit alone would still let several calls fetch at once. An uncapped read (Emma, the portal) does not use the chain.
+ * `cappedFetchTuning` is exported so a test can shorten the gap and the deadline.
+ */
+export const cappedFetchTuning = { gapMs: 500, backlog: 20, perUser: 10, timeoutMs: 10_000 };
+let cappedFetchChain: Promise<unknown> = Promise.resolve();
+let cappedFetchWaiting = 0;
+const cappedFetchByUser = new Map<string, number>();
+/** `fetch` with a deadline: an answer in time, or null (an error is passed on). The abandoned request, if any, is not cancelled. */
+function withDeadline<T>(fetch: () => Promise<T>): Promise<T | null> {
+  return new Promise<T | null>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(null), cappedFetchTuning.timeoutMs);
+    (timer as any).unref?.();
+    let started: Promise<T>;
+    try {
+      started = fetch();
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+      return;
+    }
+    started.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
+  });
+}
+function runCappedFetch<T>(userId: string, fetch: () => Promise<T>): Promise<T | null> {
+  const mine = cappedFetchByUser.get(userId) ?? 0;
+  if (cappedFetchWaiting >= cappedFetchTuning.backlog || mine >= cappedFetchTuning.perUser) return Promise.resolve(null);
+  cappedFetchWaiting++;
+  cappedFetchByUser.set(userId, mine + 1);
+  const run = cappedFetchChain.then(() => withDeadline(fetch));
+  const done = () => {
+    cappedFetchWaiting--;
+    const left = (cappedFetchByUser.get(userId) ?? 1) - 1;
+    if (left > 0) cappedFetchByUser.set(userId, left); else cappedFetchByUser.delete(userId);
+  };
+  run.then(done, done);
+  cappedFetchChain = run.then(() => undefined, () => undefined).then(() => {
+    if (!(cappedFetchTuning.gapMs > 0)) return undefined;
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, cappedFetchTuning.gapMs);
+      (timer as any).unref?.();
+    });
+  });
+  return run;
+}
+
 /** ENG-2123: until when getLeadIdsByPhoneKey should not try PhoneKeyIndex again (missing index / denied). */
 let phoneIndexUnavailableUntil = 0;
 
@@ -9919,7 +9971,15 @@ export const crmDb = {
     }
   },
 
-  async getLeadEngagements(listId: string, leadId: string, userId: string) {
+  /**
+   * `options.maxContentFetches` (ENG-2840 W2-5a, set only by the MCP lead tools): the most email bodies this call may fetch from the mail
+   * provider. Without it (Emma, the portal) every received or delivered event that has no stored body is fetched, all at once. With it, only
+   * the NEWEST that many such events are fetched, through one process-wide chain (one at a time, 500 ms apart, at most 20 in it and 10 per
+   * account, each given up on after 10 s; one that does not fit is skipped), and stored (so a later call reaches the next ones, as long as these succeed: a body that cannot be
+   * fetched is not remembered and uses the allowance again on every call); the others are returned without a body.
+   * An event whose body is already stored never uses up the allowance. A value that is not a finite number of at least 0 is no cap.
+   */
+  async getLeadEngagements(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number }) {
     try {
       // Get the lead
       const lead = await this.getLeadById(listId, leadId);
@@ -9952,10 +10012,28 @@ export const crmDb = {
 
       const filteredEvents = [...emailEvents, ...linkedInEvents];
 
+      const maxContentFetches = options?.maxContentFetches;
+      const capFetches = typeof maxContentFetches === 'number' && Number.isFinite(maxContentFetches) && maxContentFetches >= 0;
+      const fetchAllowed = new Set<any>();
+      if (capFetches) {
+        const needContent = filteredEvents
+          .filter((e: any) => (e.eventType === 'email.received' || e.eventType === 'email.delivered') && !e.emailContent && e.data?.email_id)
+          .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        for (const e of needContent.slice(0, Math.floor(maxContentFetches as number))) fetchAllowed.add(e);
+      }
+
+      // A capped read (the MCP lead tools) fetches its bodies through the process-wide chain (see runCappedFetch): one at a time, paced, with a
+      // backlog limit. An uncapped read (Emma, the portal) runs every fetch at once, as before.
+      const runFetch = <T>(fetch: () => Promise<T>): Promise<T | null> => (capFetches ? runCappedFetch(userId, fetch) : fetch());
+      // A capped read hands its fetches to the chain newest first, so what a busy chain skips is the oldest, not the newest.
+      const eventsToLoad = capFetches
+        ? [...filteredEvents].sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        : filteredEvents;
+
       // Transform email events to engagement format
       // For email.received events, fetch the email content
       const emailEngagements = await Promise.all(
-        filteredEvents.map(async (event: any) => {
+        eventsToLoad.map(async (event: any) => {
           const baseEngagement = {
             eventType: event.eventType,
             eventData: event.data,
@@ -9985,13 +10063,16 @@ export const crmDb = {
                 };
               }
 
+              // Over the caller's allowance (see options.maxContentFetches): no fetch, the event is returned without a body
+              if (capFetches && !fetchAllowed.has(event)) return baseEngagement;
+
               // Fetch from Resend if not cached
               const resendService = require('./resendService').resendService;
 
               if (event.eventType === 'email.received') {
-                emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+                emailContent = await runFetch(() => resendService.getReceivedEmailContent(event.data.email_id));
               } else if (event.eventType === 'email.delivered') {
-                emailContent = await resendService.getDeliveredEmailContent(event.data.email_id);
+                emailContent = await runFetch(() => resendService.getDeliveredEmailContent(event.data.email_id));
               }
 
               if (emailContent) {
@@ -11475,6 +11556,101 @@ export const crmDb = {
     } catch (err) {
       if (isConditionalFailure(err)) return false;
       handleDynamoDbError(err, 'createLeadSystemRecordOnce');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: atomically claims a lead's stored email draft for sending. The draft itself is NOT
+   * removed (a crash/deploy mid-send must not lose it); instead a send-claim timestamp is set ONLY
+   * while the draft still equals `expectedDraft` and no fresh claim exists. Of two concurrent
+   * senders exactly one wins; the loser gets false and must not send. A claim older than
+   * `leaseMs` is treated as abandoned (crashed sender) so the user can retry. Touches only
+   * `emailDraftSendClaimedAt` (no updatedAt, so no GSI re-projection).
+   */
+  async claimLeadEmailDraft(
+    listId: string,
+    leadId: string,
+    expectedDraft: Record<string, unknown>,
+    leaseMs: number = 5 * 60 * 1000,
+  ): Promise<string | null> {
+    const now = Date.now();
+    // Ownership token: ISO timestamp prefix keeps the lexicographic stale-lease comparison
+    // valid; the random suffix lets release() remove only this caller's claim.
+    const token = `${new Date(now).toISOString()}#${randomUUID()}`;
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'SET emailDraftSendClaimedAt = :now',
+        ConditionExpression:
+          'emailDraft = :expected AND (attribute_not_exists(emailDraftSendClaimedAt) OR emailDraftSendClaimedAt < :staleBefore)',
+        ExpressionAttributeValues: {
+          ':expected': expectedDraft,
+          ':now': token,
+          ':staleBefore': new Date(now - leaseMs).toISOString(),
+        },
+      }).promise();
+      return token;
+    } catch (err) {
+      if (isConditionalFailure(err)) return null;
+      handleDynamoDbError(err, 'claimLeadEmailDraft');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: after a successful send, clears the draft and the send-claim in ONE conditional
+   * write — only while the claim still holds the caller's token AND the stored draft still equals
+   * the draft that was sent. Returns false (nothing written) otherwise, so a draft replaced
+   * mid-send or a replacement sender's claim is never removed.
+   */
+  async completeLeadEmailDraftSend(
+    listId: string,
+    leadId: string,
+    token: string,
+    sentDraft: Record<string, unknown>,
+  ): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        // No updatedAt: changing the GSI range key re-projects the sparse lookup indexes, which
+        // fails on legacy rows carrying "" index keys (see updateLead's self-heal). Bookkeeping
+        // only, like claimLeadEmailDraft.
+        UpdateExpression: 'SET emailDraft = :null REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token AND emailDraft = :sent',
+        ExpressionAttributeValues: {
+          ':null': null,
+          ':token': token,
+          ':sent': sentDraft,
+        },
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'completeLeadEmailDraftSend');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: releases a send-claim (after a failed send, or after a successful send has cleared
+   * the draft). Removes the claim only while it still holds the caller's token, so a sender whose
+   * lease expired cannot drop a replacement sender's claim. Idempotent; a mismatch is a no-op.
+   */
+  async releaseLeadEmailDraftClaim(listId: string, leadId: string, token: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token',
+        ExpressionAttributeValues: { ':token': token },
+      }).promise();
+    } catch (err) {
+      if (isConditionalFailure(err)) return;
+      handleDynamoDbError(err, 'releaseLeadEmailDraftClaim');
       throw err;
     }
   },
