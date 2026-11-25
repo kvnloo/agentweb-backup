@@ -4926,6 +4926,7 @@ type RunVerifiedChatResult = {
   workPlanCompleted: boolean;
   // ENG-2854: why a failed run stopped when it was not a requirements miss.
   terminationReason?: 'iteration_limit' | 'session_limit';
+  workPlanBlockReason?: string;
   // ENG-396: set when a headless turn left an unanswered blocking question. The
   // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
@@ -4973,6 +4974,11 @@ type RunVerifiedChatResult = {
   sendPressExhausted?: boolean;
 };
 
+// Read-only normalization shared by completion and blocked-plan retry decisions.
+function workPlanStepStatus(step: any): string {
+  return typeof step?.status === 'string' ? step.status.trim().toLowerCase() : '';
+}
+
 // ENG-1811: is this work plan ACTUALLY finished -- every step terminal AND no
 // outstanding debt from a removed step's required function call that never
 // genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against
@@ -4984,7 +4990,7 @@ type RunVerifiedChatResult = {
 // breaks any of them that happen to exercise this retry loop.
 function workPlanCompletedWithoutDebt(workPlan: any, calledFunctions?: Record<string, number>): boolean {
   if (!workPlan || !Array.isArray(workPlan.steps)) return true;
-  const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+  const allStepsTerminal = workPlan.steps.every((s: any) => ['completed', 'skipped'].includes(workPlanStepStatus(s)));
   if (!allStepsTerminal) return false;
   const called = calledFunctions || {};
   const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
@@ -5515,6 +5521,36 @@ async function runVerifiedChatInner(
     return null;
   };
 
+  // ENG-2998: no runnable steps remain. Stop unattended pressing without
+  // crediting blocked prerequisites as completion; pending/transient work retries.
+  const stopForBlockedPlan = (workPlan: any): RunVerifiedChatResult | null => {
+    const steps = Array.isArray(workPlan?.steps) ? workPlan.steps : [];
+    const notesOf = (step: any): string => typeof step?.notes === 'string' ? step.notes
+      : Array.isArray(step?.notes) ? step.notes.filter((note: unknown) => typeof note === 'string').join('; ') : '';
+    const blockedSteps = steps.filter((s: any) => ['blocked', 'pending'].includes(workPlanStepStatus(s)));
+    // The tool contract represents unfinished steps as pending; legacy callers
+    // also store blocked. Derive terminality from the existing prerequisite note
+    // for either representation, without changing the persisted status contract.
+    // Unknown/transient causes still use the bounded retry path.
+    if (!isUnattendedRun || blockedSteps.length === 0 ||
+        !steps.every((s: any) => ['blocked', 'pending', 'completed', 'skipped'].includes(workPlanStepStatus(s))) ||
+        !blockedSteps.every((s: any) => /\breason\s*[:=]\s*no_key\b/i.test(notesOf(s)))) return null;
+    const functionStatus = requiredFunctions.map(f => {
+      const actualCount = countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting);
+      return { functionName: f.functionName, requiredCount: f.minCount, actualCount, met: actualCount >= f.minCount };
+    });
+    return {
+      success: false, content: allContent, toolCalls: allToolCalls,
+      keywordMatches: keywords.filter(k => allContent.toLowerCase().includes(k.toLowerCase())),
+      keywordMisses: keywords.filter(k => !allContent.toLowerCase().includes(k.toLowerCase())),
+      functionCallMatches: functionStatus.filter(f => f.met).map(f => f.functionName),
+      functionCallMisses: functionStatus.filter(f => !f.met).map(f => f.functionName),
+      functionStatus, attempts: attempt, workPlanCompleted: false,
+      workPlanBlockReason: blockedSteps
+        .map((s: any) => `${s.stepCount}${s.title ? ` ${s.title}` : ''}: reason=no_key`).join('; '),
+    };
+  };
+
   while (attempt < maxAttempts) {
     attempt++;
 
@@ -5679,6 +5715,8 @@ async function runVerifiedChatInner(
         if (continuationQuestion?.action === 'park') {
           return continuationQuestion.result;
         }
+        const blockedContinuation = stopForBlockedPlan(continuationResponse.workPlan);
+        if (blockedContinuation) return blockedContinuation;
         // Re-evaluate the gate against the continuation's own output. Pass the
         // whole run's accumulated tool-call objects (name + arguments + result) so a
         // still-uncommitted per-list preview→execute gap (ENG-518) keeps the gate
@@ -5714,6 +5752,14 @@ async function runVerifiedChatInner(
             `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
             `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
           );
+        }
+        // A transient/unknown blocked continuation is not completion. Re-enter
+        // the existing bounded work-plan retry path, never credit unfinished work.
+        if (continuationResponse.workPlan && !workPlanCompletedWithoutDebt(
+          continuationResponse.workPlan, continuationResponse.calledFunctions
+        )) {
+          await waitForVerifiedChatRetry(attempt);
+          continue;
         }
         // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
@@ -5837,6 +5883,9 @@ async function runVerifiedChatInner(
       // Check work plan status
       const workPlan = response.workPlan;
       const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, response.calledFunctions);
+
+      const blockedPlanResult = stopForBlockedPlan(workPlan);
+      if (blockedPlanResult) return blockedPlanResult;
 
       // Only evaluate keywords and function calls if work plan is completed or doesn't exist
       let keywordMatches: string[] = [];

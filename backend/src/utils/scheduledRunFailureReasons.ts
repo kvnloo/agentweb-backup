@@ -11,6 +11,7 @@ export interface ScheduledRunFailureSignals {
   functionCallMisses?: string[];
   keywordMisses?: string[];
   workPlanCompleted?: boolean;
+  workPlanBlockReason?: string;
   deferredUnresolved?: boolean;
   parkedUnnotifiable?: boolean;
   publishHeldForApproval?: boolean;
@@ -57,6 +58,8 @@ export function describeScheduledRunFailureReasons(
   } else if (run.terminationReason === 'session_limit') {
     // ENG-2812: paused at the session's turn/spend limit; a person must reply "continue" in the session.
     reasons.push('paused at the session turn/spend limit; waiting for someone to reply "continue" in the session');
+  } else if (run.workPlanBlockReason) {
+    reasons.push(`work plan blocked: ${run.workPlanBlockReason}`);
   } else if (run.workPlanCompleted === false) reasons.push('work plan not completed');
 
   const hasMisses = (run.functionCallMisses?.length ?? 0) > 0 || (run.keywordMisses?.length ?? 0) > 0;
