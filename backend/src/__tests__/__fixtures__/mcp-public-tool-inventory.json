@@ -1761,6 +1761,88 @@
     }
   },
   {
+    "name": "get_lead_details",
+    "listed": false,
+    "description": "Everything about one lead: contact and company fields, status, deal value, ICP match, attribution, a count of its engagements, its 10 most recent engagements and its LinkedIn connection status. Use it instead of manage_leads get when you need the engagement picture; manage_leads get returns the stored fields only. list_id and lead_id come from manage_leads list or search_leads. If the lead is not in list_id but is in another list you can access, it is returned with a note naming the right list. Reading never changes the lead; the first read of an email can fetch its content from the mail provider and store it, and a LinkedIn lead can trigger a check of the connected account. Any other argument is refused by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "The lead list the lead is in"
+        },
+        "lead_id": {
+          "type": "string",
+          "description": "The lead id"
+        }
+      },
+      "required": [
+        "list_id",
+        "lead_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "get_lead_engagements",
+    "listed": false,
+    "description": "The engagement history of one lead, newest first: emails sent and received, LinkedIn messages, and the calls, meetings and notes recorded by hand. limit is a whole number from 1 to 100 (default 20). Each event has eventType, createdAt, eventData and, for an email, a preview of its first 200 characters. engagementSummary holds the counts (total, last 7 days), so a page that is shorter than the total is not read as the whole history. list_id and lead_id come from manage_leads list or search_leads. Reading never changes the lead; the first read of an email can fetch its content from the mail provider and store it. Any other argument is refused by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "The lead list the lead is in"
+        },
+        "lead_id": {
+          "type": "string",
+          "description": "The lead id"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Most events to return (default 20)"
+        }
+      },
+      "required": [
+        "list_id",
+        "lead_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "get_lead_list_statuses",
+    "listed": false,
+    "description": "The pipeline stages a lead list uses (the values a lead's status takes), with the list name. A list that never stored its own stages answers with the default for its type, which create_lead_list get does not show. list_id comes from list_lead_lists. Any other argument is refused by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "The lead list id"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "get_pr_digest",
     "listed": false,
     "description": "Fetch merged pull requests from GitHub repositories (agentweb and agentweb-customer-portal) within a time range and return a formatted summary. Defaults to the past 24 hours. Admin-only. Use this to generate change digests to send to the team. When the user asks for \"last N days\" or a specific date range, always pass the appropriate days_ago or since/until — do not rely on the default.",

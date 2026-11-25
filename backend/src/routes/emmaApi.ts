@@ -992,7 +992,7 @@ router.post('/search-leads', async (req: Request, res: Response) => {
 });
 
 // ─── CRM (lead readback, ENG-3021) ──────────────────────────────────────────
-// Read-only. The same handlers Emma's get_leads / get_lead_details tools call, reachable
+// Read-only. The same handlers Emma's get_leads / get_lead_details / get_lead_engagements / get_lead_list_statuses tools call, reachable
 // without a model run so a verifier can read stored fields (contactStatus and the
 // unsubscribe evidence) back. The caller is always the authenticated user; the
 // handlers enforce list access, so nothing here trusts an identity from the body.
@@ -1023,6 +1023,30 @@ router.post('/lead-details', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     res.json(await svc.getLeadDetails(body.list_id, body.lead_id, userId(req)));
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ENG-2840 (W2-5a): the engagement history of one lead and the pipeline stages of one list, for the MCP tools of the same names.
+// Same handlers as Emma's tools (list access is checked inside them); a refusal is HTTP 200 `{ success: false, message }`, as above.
+router.post('/lead-engagements', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  if (!isId(body.list_id) || !isId(body.lead_id)) return res.status(400).json({ message: 'list_id and lead_id are required' });
+  try {
+    const svc = await getAgentModeService();
+    res.json(await svc.getLeadEngagements(body.list_id, body.lead_id, userId(req), typeof body.limit === 'number' ? body.limit : undefined));
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/lead-list-statuses', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  if (!isId(body.list_id)) return res.status(400).json({ message: 'list_id is required' });
+  try {
+    const svc = await getAgentModeService();
+    res.json(await svc.getLeadListStatuses(body.list_id, userId(req)));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
