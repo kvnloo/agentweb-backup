@@ -328,7 +328,22 @@ describe('Memory API Routes', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.memories).toHaveLength(1);
-    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', undefined);
+    // ENG-2840 (W2-1): the list screen reads the newest rows up to the list bound, without the embedding vectors.
+    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', undefined, undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true });
+  });
+
+  it('GET /api/memory returns the list OLDEST FIRST, the order the screen always had (the read is newest first so the bound drops the oldest)', async () => {
+    const { accountMemoryDb: mockDb } = require('../services/db');
+    mockDb.getUserMemories.mockResolvedValue([{ memoryId: 'm3' }, { memoryId: 'm2' }, { memoryId: 'm1' }]);
+    const res = await request.get('/api/memory');
+    expect(res.body.memories.map((m: any) => m.memoryId)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('GET /api/memory?category= returns the rows as read: a category index cannot be ordered by time', async () => {
+    const { accountMemoryDb: mockDb } = require('../services/db');
+    mockDb.getUserMemories.mockResolvedValue([{ memoryId: 'a' }, { memoryId: 'b' }]);
+    const res = await request.get('/api/memory?category=preference');
+    expect(res.body.memories.map((m: any) => m.memoryId)).toEqual(['a', 'b']);
   });
 
   it('GET /api/memory?category=preference should filter by category', async () => {
@@ -337,7 +352,7 @@ describe('Memory API Routes', () => {
 
     await request.get('/api/memory?category=preference');
 
-    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', 'preference');
+    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', 'preference', undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true });
   });
 
   it('POST /api/memory should create a memory', async () => {
@@ -360,6 +375,49 @@ describe('Memory API Routes', () => {
     expect(res.body.memory.memoryId).toBe('mem1');
     // Now also persists an embedding (5th arg) computed at write time for relevance retrieval
     expect(mockDb.addMemory).toHaveBeenCalledWith('user1', 'preference', 'test fact', undefined, [0.1, 0.2, 0.3]);
+  });
+
+  describe('POST /api/memory refuses what addMemory would refuse BEFORE the embedding is requested (Opslane P2: it was billed anyway)', () => {
+    // Fetched inside each test: this file installs its embeddings mock in beforeAll, after the describe bodies run.
+    const embeddings = () => require('../utils/embeddings').embedText;
+    const bodies: Array<[string, any, string]> = [
+      ['an invalid category', { content: 'a fact', category: 'other' }, 'Invalid category: other. Must be one of: preference, history, insight, workflow'],
+      ['a whitespace-only content', { content: '   ', category: 'insight' }, 'Content is required'],
+    ];
+    it.each(bodies)('%s: 400, no embedding, nothing saved', async (_name, body, message) => {
+      const { accountMemoryDb: mockDb } = require('../services/db');
+      const embedText = embeddings();
+      embedText.mockClear();
+      mockDb.addMemory.mockClear();
+      const res = await request.post('/api/memory').send(body);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe(message);
+      expect(embedText).not.toHaveBeenCalled();
+      expect(mockDb.addMemory).not.toHaveBeenCalled();
+    });
+
+    it('a content over the limit: 400, no embedding, nothing saved', async () => {
+      const { accountMemoryDb: mockDb } = require('../services/db');
+      const embedText = embeddings();
+      embedText.mockClear();
+      mockDb.addMemory.mockClear();
+      const res = await request.post('/api/memory').send({ content: 'x'.repeat(2001), category: 'insight' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/^Content must be 2000 characters or less/);
+      expect(embedText).not.toHaveBeenCalled();
+      expect(mockDb.addMemory).not.toHaveBeenCalled();
+    });
+
+    it('a valid save still embeds once, then saves', async () => {
+      const { accountMemoryDb: mockDb } = require('../services/db');
+      const embedText = embeddings();
+      embedText.mockClear();
+      mockDb.addMemory.mockResolvedValue({ memoryId: 'm1' });
+      const res = await request.post('/api/memory').send({ content: 'a fact', category: 'workflow' });
+      expect(res.status).toBe(201);
+      expect(embedText).toHaveBeenCalledTimes(1);
+      expect(mockDb.addMemory).toHaveBeenCalledWith('user1', 'workflow', 'a fact', undefined, [0.1, 0.2, 0.3]);
+    });
   });
 
   it('POST /api/memory should reject missing content', async () => {

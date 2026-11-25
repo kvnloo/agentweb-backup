@@ -320,6 +320,18 @@ export async function listCampaignGroups(
   );
 }
 
+/**
+ * One campaign group by id (the same single-group path updateCampaignGroup reads back). Read-only.
+ * Used by the Zoma toolkit to describe a group in a preview and to read a change back.
+ */
+export async function getCampaignGroup(
+  accessToken: string,
+  adAccountId: string,
+  campaignGroupId: string
+): Promise<LinkedInAdsApiResult> {
+  return makeRequest('GET', `/rest/adAccounts/${adAccountId}/adCampaignGroups/${campaignGroupId}`, accessToken);
+}
+
 export async function createCampaignGroup(
   accessToken: string,
   adAccountId: string,
@@ -397,6 +409,18 @@ export async function listCampaigns(
     path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(status:(values:List(${statuses})))`;
   }
   return fetchAllPages(path, accessToken, 1000);
+}
+
+/**
+ * One campaign by id (the same single-campaign path updateCampaign reads back). Read-only.
+ * Used by the Zoma toolkit to describe a campaign in a preview and to read a change back.
+ */
+export async function getCampaign(
+  accessToken: string,
+  adAccountId: string,
+  campaignId: string
+): Promise<LinkedInAdsApiResult> {
+  return makeRequest('GET', `/rest/adAccounts/${adAccountId}/adCampaigns/${campaignId}`, accessToken);
 }
 
 /**
@@ -777,6 +801,19 @@ export async function listCreatives(
     100,
     { 'X-RestLi-Method': 'FINDER' }
   );
+}
+
+/**
+ * One creative by id or URN (the same single-creative path updateCreativeStatus reads back). Read-only.
+ * Used by the Zoma toolkit to describe a creative in a preview and to read a change back.
+ */
+export async function getCreative(
+  accessToken: string,
+  adAccountId: string,
+  creativeId: string
+): Promise<LinkedInAdsApiResult> {
+  const creativeUrn = creativeId.startsWith('urn:') ? creativeId : `urn:li:sponsoredCreative:${creativeId}`;
+  return makeRequest('GET', `/rest/adAccounts/${adAccountId}/creatives/${encodeURIComponent(creativeUrn)}`, accessToken);
 }
 
 // ─── UTM audit (ENG-239 AC3, read side) ───────────────────────────────────────

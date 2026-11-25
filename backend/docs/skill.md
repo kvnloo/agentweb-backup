@@ -1492,21 +1492,33 @@ update_gtm_work_item({
 
 #### `send_gtm_status_report`
 
-**What it does:** Generates and sends a GTM plan status report via email.
+**What it does:** Emails a status report for one phase or for a whole GTM plan, from AgentWeb to the people you choose. Nobody is emailed unless you choose them.
 
 **Parameters:**
-- `planId` — Plan ID
-- `recipients` — Array of email addresses
+- `plan_id` — Plan ID (required)
+- `phase_id` — Send it for a phase report; leave it out for a whole-plan report
+- `notify_user` — Email the account owner
+- `notify_plan_poc` — Email the plan contact
+- `notify_phase_poc` — Phase report only: email that phase's contact
+- `notify_phase_pocs` — Plan report only: email every phase contact
+- `message` — Optional note shown in the report (at most 2,000 characters over MCP)
+
+At least one `notify_*` must be `true`.
 
 **Returns:**
 - `success` — Boolean
-- `reportUrl` — URL to HTML report (also sent via email)
+- `message` — What happened, e.g. "The phase status report was sent successfully to 1 recipient."
+- Over MCP also `sent`, `failed` and `suppressed` (how many emails were accepted, refused, and held back by a non-production email guard)
+
+**Over MCP (outside agents):** the tool needs an API key that holds the `gtm:email` scope (an account owner grants it when minting the key; default keys do not have it). A call emails at most 10 people, an account may send about 50 emails an hour, and the same report is not sent twice within 10 minutes.
 
 **Example:**
 ```javascript
 send_gtm_status_report({
-  planId: "plan-123",
-  recipients: ["team@example.com", "stakeholders@example.com"]
+  plan_id: "plan-123",
+  phase_id: "phase-456",
+  notify_phase_poc: true,
+  message: "Weekly update"
 })
 ```
 

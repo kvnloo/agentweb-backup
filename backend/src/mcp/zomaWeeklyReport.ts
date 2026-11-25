@@ -99,10 +99,15 @@ export function isReportRecipient(user: Pick<ZomaUserRecord, 'email' | 'isAdmin'
   return zomaLeadClassification(user.zomaAdsExperience) !== ZOMA_PAL;
 }
 
-export type AdPlatform = 'meta' | 'google_ads';
-const PLATFORM_LABEL: Record<AdPlatform, string> = { meta: 'Meta ads', google_ads: 'Google Ads' };
-const PLATFORM_COLOR: Record<AdPlatform, string> = { meta: '#1877f2', google_ads: '#34a853' };
-const WRITE_PLATFORM_LABEL: Record<string, string> = { meta: 'Meta', google_ads: 'Google Ads' };
+export type AdPlatform = 'meta' | 'google_ads' | 'linkedin_ads' | 'x_ads';
+const PLATFORM_LABEL: Record<AdPlatform, string> = { meta: 'Meta ads', google_ads: 'Google Ads', linkedin_ads: 'LinkedIn Ads', x_ads: 'X Ads' };
+const PLATFORM_COLOR: Record<AdPlatform, string> = { meta: '#1877f2', google_ads: '#34a853', linkedin_ads: '#0a66c2', x_ads: '#000000' };
+const WRITE_PLATFORM_LABEL: Record<string, string> = { meta: 'Meta', google_ads: 'Google Ads', linkedin_ads: 'LinkedIn Ads', x_ads: 'X Ads' };
+/** Where a connection that could not be read gets fixed. LinkedIn may be connected outside Zoma (in AgentWeb). */
+const reconnectAdvice = (platform: AdPlatform) =>
+  platform === 'linkedin_ads' ? 'It may need to be reconnected in AgentWeb.' : 'It may need to be reconnected: ask your agent to run zoma_status.';
+/** A connected ad platform whose numbers this email does not report yet: say so, never "nothing is connected". */
+const notReportedLine = (platform: AdPlatform) => `Your ${PLATFORM_LABEL[platform]} account is connected. Its numbers are not in this weekly email yet.`;
 const WEEKDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTH = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -148,7 +153,9 @@ export type PlatformWeek =
   | { platform: AdPlatform; status: 'delivered'; ads: ZomaAdsWeek }
   /** `notIncluded`: usable accounts that were not checked (beyond the per-platform limit). */
   | { platform: AdPlatform; status: 'no_delivery'; notIncluded?: number }
-  | { platform: AdPlatform; status: 'unreadable' };
+  | { platform: AdPlatform; status: 'unreadable' }
+  /** Connected, but this email cannot report the platform's numbers yet (X Ads). */
+  | { platform: AdPlatform; status: 'not_reported' };
 
 // ---- dates -----------------------------------------------------------------------------------
 
@@ -367,7 +374,7 @@ export function watchFlags(ads: ZomaAdsWeek, platform: AdPlatform): string[] {
   if (trailing >= 2 && trailing < ads.daily.length) {
     flags.push(`Spend stopped after ${weekdayOf(ads.daily[ads.daily.length - 1 - trailing].date)}. If that is not planned, check your budgets and campaign status.`);
   }
-  if (ads.conversions > 0 && (platform === 'google_ads' || event !== null)) {
+  if (ads.conversions > 0 && (platform !== 'meta' || event !== null)) {
     for (const c of ads.topCampaigns) if (c.spend > 0 && c.conversions === 0) flags.push(`${cleanName(c.name)} spent ${money(c.spend, ads.currency)} with no ${what}.`);
   }
   return flags.slice(0, 3);
@@ -464,7 +471,8 @@ function platformHtml(week: PlatformWeek): string {
   const color = PLATFORM_COLOR[week.platform];
   const head = `<h3 style="margin:22px 0 2px;color:#111;border-left:4px solid ${color};padding-left:8px">${label}</h3>`;
   if (week.status === 'no_delivery') return `${head}<p style="margin:6px 0;color:#202124">No ad delivery was recorded on your ${label} account this week.${week.notIncluded ? ` ${escapeHtml(notCheckedLine(week.platform, week.notIncluded))}` : ''}</p>`;
-  if (week.status === 'unreadable') return `${head}<p style="margin:6px 0;color:#202124">We could not read your ${label} account this week. It may need to be reconnected: ask your agent to run zoma_status.</p>`;
+  if (week.status === 'unreadable') return `${head}<p style="margin:6px 0;color:#202124">We could not read your ${label} account this week. ${escapeHtml(reconnectAdvice(week.platform))}</p>`;
+  if (week.status === 'not_reported') return `${head}<p style="margin:6px 0;color:#202124">${escapeHtml(notReportedLine(week.platform))}</p>`;
   const { ads } = week;
   const insight = weekInsight(ads);
   const flags = watchFlags(ads, week.platform);
@@ -489,7 +497,8 @@ function platformHtml(week: PlatformWeek): string {
 function platformText(week: PlatformWeek): string[] {
   const label = PLATFORM_LABEL[week.platform];
   if (week.status === 'no_delivery') return [label, `No ad delivery was recorded on your ${label} account this week.${week.notIncluded ? ` ${notCheckedLine(week.platform, week.notIncluded)}` : ''}`];
-  if (week.status === 'unreadable') return [label, `We could not read your ${label} account this week. It may need to be reconnected: ask your agent to run zoma_status.`];
+  if (week.status === 'unreadable') return [label, `We could not read your ${label} account this week. ${reconnectAdvice(week.platform)}`];
+  if (week.status === 'not_reported') return [label, notReportedLine(week.platform)];
   const { ads } = week;
   const insight = weekInsight(ads);
   const flags = watchFlags(ads, week.platform);
@@ -891,6 +900,53 @@ async function googleWeek(userId: string, customerId: string, win: AdsWindows): 
   return { platform: 'google_ads', status: 'delivered', ads: week };
 }
 
+const liDate = (iso: string) => {
+  const [year, month, day] = iso.split('-').map(Number);
+  return { year, month, day };
+};
+const liRowDate = (e: any): string | undefined => {
+  const d = e?.dateRange?.start;
+  if (!d || !Number.isFinite(d.year) || !Number.isFinite(d.month) || !Number.isFinite(d.day)) return undefined;
+  return `${d.year}-${String(d.month).padStart(2, '0')}-${String(d.day).padStart(2, '0')}`;
+};
+
+/** LinkedIn adAnalytics DAILY rows (ACCOUNT pivot) as the report's daily series. Conversions = website conversions + lead form leads. */
+export function linkedInDailyRows(elements: any[]): DailyInputRow[] {
+  const rows: DailyInputRow[] = [];
+  for (const e of elements ?? []) {
+    const date = liRowDate(e);
+    if (!date) continue;
+    rows.push({
+      date,
+      spend: num(e.costInLocalCurrency),
+      impressions: num(e.impressions),
+      clicks: num(e.clicks),
+      conversions: num(e.externalWebsiteConversions) + num(e.oneClickLeads),
+    });
+  }
+  return rows;
+}
+
+const LINKEDIN_WEEK_FIELDS = ['impressions', 'clicks', 'costInLocalCurrency', 'externalWebsiteConversions', 'oneClickLeads', 'dateRange', 'pivotValues'];
+
+async function linkedInWeek(ownerUserId: string, account: any, accountId: string, win: AdsWindows): Promise<PlatformWeek> {
+  const [{ getFreshLinkedInAdsToken }, { getAdAnalytics }] = await Promise.all([
+    import('../services/linkedInAdsCredentials'), import('../services/linkedInAdsService'),
+  ]);
+  const { accessToken } = await getFreshLinkedInAdsToken(ownerUserId, account);
+  const r = await getAdAnalytics(accessToken, accountId, 'ACCOUNT', 'DAILY', { start: liDate(win.prevSince), end: liDate(win.until) }, LINKEDIN_WEEK_FIELDS);
+  if (!r.success) {
+    // The service's own text can carry LinkedIn's; only the status decides permanence (401/403: reconnect or not enabled).
+    throw new Error(`LinkedIn Ads analytics failed: HTTP ${r.status ?? 0}`);
+  }
+  const elements: any[] = r.data?.elements ?? (Array.isArray(r.data) ? r.data : []);
+  const cfg: any = account?.config;
+  const currency = typeof cfg?.currency === 'string' && cfg.currency.trim() ? cfg.currency.trim().toUpperCase() : undefined;
+  const week = weekFromDaily(linkedInDailyRows(elements), win, { currency, conversionEvent: null, topCampaigns: [] });
+  if (!week) return { platform: 'linkedin_ads', status: 'no_delivery' };
+  return { platform: 'linkedin_ads', status: 'delivered', ads: week };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Production wiring
 // ---------------------------------------------------------------------------------------------
@@ -919,7 +975,7 @@ export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
   // Only the Zoma toolkit's rows: Emma's own MCP writes the same event type with product 'emma_mcp'.
   getUsageByUser: (range) => getMcpUsageByUser(range, { product: 'zoma' }),
   async getAdsWeeks(userId, win, opts) {
-    const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER, GOOGLE_ADS_PROVIDER, googleToolkitEnabled }] = await Promise.all([
+    const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER, GOOGLE_ADS_PROVIDER, LINKEDIN_ADS_PROVIDER, X_ADS_PROVIDER, googleToolkitEnabled }] = await Promise.all([
       import('../services/connectedAccountsDb'), import('./zomaProviders'),
     ]);
     const now = Date.now();
@@ -959,6 +1015,11 @@ export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
     await read('meta', META_PROVIDER, (a, id) => metaWeek(a, id, win));
     // The Google toolkit is dark until its flag is on: no Google section (and no "run zoma_status" advice) before then.
     if (googleToolkitEnabled()) await read('google_ads', GOOGLE_ADS_PROVIDER as typeof META_PROVIDER, (_a, id) => googleWeek(userId, id, win));
+    // LinkedIn is read whatever the Zoma LinkedIn toolkit flag says: the account may have been connected in AgentWeb,
+    // and reporting only needs the stored r_ads_reporting connection. An org-shared account refreshes on its owner.
+    await read('linkedin_ads', LINKEDIN_ADS_PROVIDER as typeof META_PROVIDER, (a, id) => linkedInWeek(String(a?.userId ?? userId), a, id, win));
+    // X Ads has no weekly reader yet: name it, so a connected X account never reads as "no ad account is connected".
+    if (accounts.some((a) => X_ADS_PROVIDER.isAdAccount(a))) weeks.push({ platform: 'x_ads', status: 'not_reported' });
     return weeks;
   },
   async sendEmail(to, subject, text, html, headers) {
