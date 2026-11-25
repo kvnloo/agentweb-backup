@@ -8571,6 +8571,8 @@ export async function runScheduledChat(
       // was left unwritten — marked so the waived minimum is still observable in
       // runResults rather than looking like every requirement was met.
       ...(result.readOnlyRequirementWaived ? { readOnlyRequirementWaived: true } : {}),
+      // ENG-2812: keep why the run stopped (session_limit pause / iteration_limit) on the stored run record.
+      ...(result.terminationReason ? { terminationReason: result.terminationReason } : {}),
       // ENG-2816 (step 3): see skippedRequiredCalls on this function's return type.
       ...(runRequired.skipped.length > 0 ? { skippedRequiredCalls: runRequired.skipped } : {}),
       // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
