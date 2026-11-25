@@ -166,6 +166,66 @@ describe('signups that are not a new free seat', () => {
   });
 });
 
+describe('Databricks-origin signup is not a free seat (ENG-2781)', () => {
+  const noInvite = { hasPendingOrgInvite: async () => false };
+  beforeEach(() => rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 60 }));
+
+  it('is admitted when the free seats are full, takes no seat and leaves no waitlist row', async () => {
+    expect(await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true })).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+    expect(rows.has('buyer@customer.co')).toBe(false);
+    expect(posts).toEqual([]);
+  });
+
+  it('is admitted the same way before the seats are full, without consuming one', async () => {
+    rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 3 });
+    expect(await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true })).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(3);
+    expect(rows.has('buyer@customer.co')).toBe(false);
+  });
+
+  it('exempts the signup without touching the org-invite lookup', async () => {
+    const lookup = jest.fn(async () => false);
+    expect(await admitZomaSignup('buyer@customer.co', { hasPendingOrgInvite: lookup }, { databricks: true })).toBe('approved');
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('is decided per signup: the same email through a non-Databricks path is still waitlisted', async () => {
+    expect(await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true })).toBe('approved');
+    expect(await admitZomaSignup('buyer@customer.co', noInvite)).toBe('waitlisted');
+    expect(rows.get('buyer@customer.co')).toEqual(expect.objectContaining({ zomaStatus: 'waitlisted' }));
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+  });
+
+  it.each([[undefined], [{}], [{ databricks: false }], [{ databricks: undefined }]])('an origin of %p is still capped like any other signup', async (origin) => {
+    expect(await admitZomaSignup('late@company.co', noInvite, origin)).toBe('waitlisted');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+  });
+
+  it('a signup that is not Databricks-origin still consumes a seat while seats are free', async () => {
+    rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 3 });
+    expect(await admitZomaSignup('early@company.co', noInvite, {})).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(4);
+  });
+
+  it('logs the bypass without the email address', async () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true });
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(String(log.mock.calls[0][0])).toContain('Databricks');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('buyer@customer.co');
+      log.mockClear();
+      await admitZomaSignup('late@company.co', noInvite);
+      await admitZomaSignup('someone@agentweb.pro', noInvite);
+      await admitZomaSignup('mate@customer.co', { hasPendingOrgInvite: async () => true });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
 describe('capacity counter and decision fields stay out of waitlist CRUD', () => {
   it('the admin waitlist list never shows the counter row', async () => {
     rows.set('w@company.co', { email: 'w@company.co', zomaStatus: 'waitlisted' });
