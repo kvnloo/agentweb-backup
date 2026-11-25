@@ -1,5 +1,6 @@
 import { UnipileClient } from 'unipile-node-sdk';
 import { getUnipileCredentials } from '../utils/secretsManager';
+import { recordSuccessfulSend } from './sentMessageShadow';
 import { userDb } from './db';
 
 // NOTE: Unipile actively maintains: Emails, WhatsApp, LinkedIn, Telegram, Instagram (as of March 2026).
@@ -1726,6 +1727,7 @@ export class LinkedInOutreachService {
           },
         },
       });
+      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id ?? undefined, adapter: 'linkedin:inmail' });
       this.log(`InMail sent successfully`, { accountId, providerId });
       return res;
     } catch (error: any) {
@@ -1752,6 +1754,7 @@ export class LinkedInOutreachService {
         attendees_ids: [providerId],
         text: messageText
       });
+      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id ?? undefined, adapter: 'linkedin:message' });
       this.log(`Message sent successfully`, { accountId, providerId });
       return res;
     } catch (error: any) {
