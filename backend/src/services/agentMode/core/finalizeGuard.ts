@@ -63,7 +63,8 @@ const SETTINGS_PERSISTENCE_TOOLS = new Set<string>([
  * `draft`, `duplicate_suppressed` or a silent no-send in the result. Those tools are in CLAIM_TOOL_LOOSE_MATCHERS
  * instead, where a hit means "ambiguous, never corrected". (A tool whose draft state shows in its call arguments,
  * such as post_on_connected_account, can stay strict: savedAsDraft skips it through `entry.args`.)
- *  - send_gtm_status_report returns success after silent no-ops (no recipients, swallowed send errors);
+ *  - send_gtm_status_report used to return success after silent no-ops (no recipients, swallowed send errors); since ENG-2840 W2-4 it
+ *    answers failure then. It stays out of this list until a shadow window shows the claim guard can rely on it;
  *  - create_social_media_posts / create_html_* / update_html_file produce an HTML document, not an image or
  *    video, and update_html_file can succeed with zero operations applied;
  *  - knowledge-base writes persist content, not user settings (loose for settings_saved and task claims, so
@@ -175,7 +176,7 @@ const LOOSE_DOCUMENT_TOOLS: ReadonlySet<string> = new Set([
  * review (see FinalizeGuardOutcome.ambiguousClaimClasses).
  */
 const CLAIM_TOOL_LOOSE_MATCHERS: Record<ClaimClass, (toolName: string) => boolean> = {
-  // send_gtm_status_report emails a GTM report but returns success even when nothing was sent.
+  // send_gtm_status_report emails a GTM report. It used to return success even when nothing was sent (ENG-2840 W2-4 fixed that); it stays loose here on purpose.
   email_sent: (n) => /email/.test(n) || n === 'send_gtm_status_report',
   // Knowledge bases and work plans are keyed by "task" ids in replies ("Task ID: ...") and carry no `task` in the tool name.
   task_created_or_updated: (n) => /task/.test(n) || /^(attach|create|update|add)_knowledge_base/.test(n) || /^(create|update|modify|set|save)_work_plan/.test(n),

@@ -12,8 +12,9 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isServerSideBrowserCodeTool, browserCallTouchesServerFiles, sensitiveActionScheduleRefusal, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
+import { normalizeEmailList } from '../utils/validation';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -30,6 +31,12 @@ import OpenAI from 'openai';
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
+import { interactiveShareControl } from '../utils/interactiveShare';
+import { AsyncLocalStorage } from 'async_hooks';
+import { isShareVisitorTurn } from './shareVisitorTurnMarker';
+
+/** The restriction profile of the tool call being run, for the calls that tool makes itself (see `executeTool`). */
+const toolCallRestrictionStore = new AsyncLocalStorage<{ restrictionProfile: string; withinVisitorCall: boolean }>();
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -45,6 +52,7 @@ import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
 import { requiredToolsBudgetNote, uncalledRequiredTools } from './agentMode/core/stepBudgetRequiredTools';
 import { recordSessionBreakerShadowTurn, shadowTurnCostUsd } from './sessionBreakerShadow';
+import { startSessionLimitForRun, sessionLimitWarningMessage } from './sessionLimit';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -3587,7 +3595,7 @@ export class AgentModeService {
     // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
     // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
     modelRouting?: MessageModelRouting,
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; pausedBySessionLimit?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3677,6 +3685,19 @@ export class AgentModeService {
       // truncates the tool list to the model's maxTools. Read once per turn; a failed
       // read only loses the prioritisation, never the turn.
       const requiredToolNamesForTurn = await this.resolveScheduledRequiredToolNames(currentSession);
+
+      // ENG-2812: persisted per-session turn/spend limit. Null when off, mocked, or unreadable (fail open).
+      // Notices are in-app chat only: shown on runs from the chat controller (persistIncrementally), never on
+      // unattended runs or Slack sessions, whose replies leave the app.
+      const sessionLimit = mockMode ? null : await startSessionLimitForRun({
+        sessionId,
+        userId,
+        messageContent,
+        isUnattendedRun,
+        warningsAllowed: persistIncrementally && !(currentSession?.pageIdentifier || '').toLowerCase().includes('slack'),
+      });
+      const sessionLimitUnattended = isUnattendedRun === true;
+      let pausedBySessionLimit = false;
 
       let content = '';
       const toolCalls: any[] = [];
@@ -3955,6 +3976,16 @@ export class AgentModeService {
           if (!content) {
             content = 'Generation was stopped.';
           }
+          break;
+        }
+
+        // ENG-2812: the session's limit window is used up — stop before another model call and wait for
+        // the person to reply "continue" (an unattended run stays paused until someone does).
+        // `content` is emptied so the post-loop reply rewriters leave it alone; the pause text is set
+        // just before the reply is persisted.
+        if (sessionLimit?.reached()) {
+          content = '';
+          pausedBySessionLimit = true;
           break;
         }
 
@@ -4385,6 +4416,19 @@ export class AgentModeService {
         // This prevents blocking the main thread during long-running generateResponse operations
         await new Promise(resolve => setImmediate(resolve));
 
+        // ENG-2812: what this completed call cost, by the ledger's rule with the metering path's usage
+        // normalization (cache reads reported only in prompt_tokens_details are not priced as fresh input).
+        const turnCostUsd = () => {
+          const usage: any = (response as any)?.usage;
+          if (!usage) return 0;
+          const n = normalizeCallUsageTokens(usage, 'openrouter');
+          return shadowTurnCostUsd(usage, this.estimateCost(
+            llmModel, n.inputTokens, n.outputTokens, n.cacheReadTokens, n.cacheWriteTokens, usage.cache_creation_by_ttl,
+          ));
+        };
+        // ENG-2812: count the call against the session's persisted limit before any post-call exit (Stop included).
+        if (sessionLimit) await sessionLimit.recordTurn(turnCostUsd());
+
         // Check cancellation after the LLM returns — for single-shot responses the pre-iteration
         // check fires before the LLM call starts, so a Stop that arrives mid-call is only visible here.
         if (isCancelled?.()) {
@@ -4417,18 +4461,7 @@ export class AgentModeService {
           userId,
           billingUserId,
           isScheduled: isScheduledSession,
-          costUsd: () => {
-            const usage: any = (response as any)?.usage;
-            if (!usage) return 0;
-            return shadowTurnCostUsd(usage, this.estimateCost(
-              llmModel,
-              Number(usage.prompt_tokens) || 0,
-              Number(usage.completion_tokens) || 0,
-              Number(usage.cache_read_input_tokens) || 0,
-              Number(usage.cache_creation_input_tokens) || 0,
-              usage.cache_creation_by_ttl,
-            ));
-          },
+          costUsd: turnCostUsd,
         });
 
         // Extract content - handle both string and array formats (Claude returns array)
@@ -5676,6 +5709,15 @@ export class AgentModeService {
         content = buildIterationLimitReport(content, toolCalls);
       }
 
+      if (pausedBySessionLimit && sessionLimit) {
+        content = sessionLimit.pauseMessage(sessionLimitUnattended);
+      }
+      // ENG-2812: a one-time 75%/90% notice claimed during this run, appended to the reply (in-app chat only).
+      const sessionLimitWarning = !wasCancelled && !pausedBySessionLimit ? sessionLimit?.dueWarning() : undefined;
+      if (sessionLimitWarning) {
+        content = `${content}\n\n${sessionLimitWarningMessage(sessionLimitWarning)}`;
+      }
+
       // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
       // content-filter and time-budget texts are assigned to `content` after the
       // model's own (often empty) message was already appended, so the transcript
@@ -5692,7 +5734,8 @@ export class AgentModeService {
           && lastResponse.role === 'assistant'
           && !(Array.isArray(lastResponse.tool_calls) && lastResponse.tool_calls.length > 0)
           && persistedTail.length > persistedResponseCount;
-        if (lastIsUnflushedTextAnswer) {
+        // ENG-2812: a session-limit pause is always its own message, never written over the model's text.
+        if (lastIsUnflushedTextAnswer && !pausedBySessionLimit) {
           if (lastResponse.content !== content) lastResponse.content = content;
         } else {
           (messages as any[]).push({
@@ -5735,6 +5778,9 @@ export class AgentModeService {
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
             ...(truncatedByStepBudget && !wasCancelled ? { iterationLimitReached: true } : {}),
+            // ENG-2812: machine-readable marks for the session-limit pause and notices.
+            ...(pausedBySessionLimit && sessionLimit ? { sessionLimitPaused: { ...sessionLimit.usage(), ...sessionLimit.caps } } : {}),
+            ...(sessionLimitWarning ? { sessionLimitWarning } : {}),
             ...(citations.length > 0 ? { citations } : {}),
             // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
             // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
@@ -5780,6 +5826,8 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
+        // ENG-2812: the run stopped at the session limit; callers must not auto-continue it.
+        ...(pausedBySessionLimit ? { pausedBySessionLimit: true } : {}),
         ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
         ...(pendingApprovalDeck ? { pendingApprovalDeck } : {})
       };
@@ -7717,6 +7765,16 @@ export class AgentModeService {
     socketEmit?: ToolDispatchPorts['socketEmit'];
   }): ToolDispatchPorts {
     return {
+      // ENG-3170: the early refusal of a share-link visitor asks whether the link has FULL CONTROL (an explicit choice, on a link that is still
+      // live); any failure to read means no.
+      shareLinkFullControl: async (sessionId: string) => {
+        try {
+          const record = await chatbotDb.getChatSessionRecord(sessionId, true);
+          return interactiveShareControl(record?.interactiveShareMetadata).full;
+        } catch {
+          return false;
+        }
+      },
       evaluateAgentToolPolicy,
       validateAndRepairToolArgs,
       getToolInputSchema: (toolName: string) => {
@@ -10115,19 +10173,55 @@ export class AgentModeService {
   private async scheduledRunRestriction(
     toolName: string,
     sessionId: string,
-    extraContext?: Record<string, any>
+    extraContext?: Record<string, any>,
+    args?: unknown,
+    nameOnly: boolean = false,
   ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
+    // ENG-3170: a browser step of an unattended run asks whether its schedule is marked; a run makes many such steps, so a settled answer is kept for a
+    // minute (an unreadable schedule is never kept). Only the browser question is kept: the schedule-write and sensitive-call questions are asked every time.
+    const browserQuestion = extraContext?.isUnattendedRun === true && isBrowserAutomationTool(toolName) && !SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    if (browserQuestion && sessionId) {
+      const kept = this.browserProvenanceAnswers.get(sessionId);
+      if (kept && kept.until > Date.now()) return kept.answer;
+    }
+    const answer = await this.scheduledRunRestrictionRead(toolName, sessionId, extraContext, args, nameOnly);
+    if (browserQuestion && sessionId && !answer.unsettled && answer.refusal === null) {
+      this.browserProvenanceAnswers.set(sessionId, { until: Date.now() + 60_000, answer });
+      while (this.browserProvenanceAnswers.size > 500) {
+        const oldest = this.browserProvenanceAnswers.keys().next().value;
+        if (oldest === undefined) break;
+        this.browserProvenanceAnswers.delete(oldest);
+      }
+    }
+    return answer;
+  }
+
+  private browserProvenanceAnswers = new Map<string, { until: number; answer: { refusal: string | null; profile?: RestrictionProfileId } }>();
+
+  private async scheduledRunRestrictionRead(
+    toolName: string,
+    sessionId: string,
+    extraContext?: Record<string, any>,
+    args?: unknown,
+    nameOnly: boolean = false,
+  ): Promise<{ refusal: string | null; profile?: RestrictionProfileId; unsettled?: boolean }> {
     const unrestricted = { refusal: null };
     if (!sessionId) return unrestricted;
     // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
     if (extraContext?.restrictionProfile) return unrestricted;
-    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) !== null;
-    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) !== null;
+    // ENG-3170: a browser tool of an UNATTENDED run is asked too, because the browser starts from the owner's saved logins: a schedule a visitor wrote
+    // must not borrow them. Only the cookie rule listens (browser tools are not refused by this profile), so a schedule that cannot be read still gets its
+    // browser step, just without the owner's logins.
+    const browserOfUnattendedRun = extraContext?.isUnattendedRun === true && isBrowserAutomationTool(toolName);
+    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName) || browserOfUnattendedRun;
     if (!refusedByProfile && !carriesClaim) return unrestricted;
 
     const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
     // What "could not be verified" means for THIS caller: refused if it is an unattended run, otherwise left alone.
-    const whenUnverifiable = extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
+    const browserOnly = browserOfUnattendedRun && !refusedByProfile && !SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    const withoutOwnerLogins = { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE as RestrictionProfileId, unsettled: true };
+    const whenUnverifiable = extraContext?.isUnattendedRun === true ? (browserOnly ? withoutOwnerLogins : unverifiable) : unrestricted;
 
     let session: any;
     try {
@@ -10163,7 +10257,7 @@ export class AgentModeService {
       } catch (scheduleError) {
         // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
         console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
-        return unverifiable;
+        return browserOnly ? withoutOwnerLogins : unverifiable;
       }
     }
     // A deleted schedule: an unattended run cannot be shown to be the owner's; an owner reopening the old session is not a run.
@@ -10172,24 +10266,128 @@ export class AgentModeService {
     if (readScheduleProvenance(schedule.provenance).length === 0) return unrestricted;
 
     if (refusedByProfile) {
+      // ENG-3170: publishing from a visitor-made schedule is already withheld, with its own wording (and the instruction not to send the
+      // owner to a setting that cannot lift it), by blockedByScheduledPublishApproval further down executeTool. A tool that is refused
+      // ONLY by the sensitive rule and is a publish call is left to that answer, so its guidance is not replaced by the general one.
+      if (isExternalContentPublish(toolName, args) && !isRefusedByScheduleBlockList(toolName, ADMIN_SKILL_TOOL_NAMES)) return unrestricted;
       console.warn(`AgentMode ENG-2816: refused ${toolName} in session ${sessionId}: schedule ${scheduleId} carries visitor provenance [${readScheduleProvenance(schedule.provenance).join(', ')}].`);
-      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) };
+      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) };
     }
     return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
   }
 
+  /** ENG-3170: does this schedule email results to anyone (the recipients stored on it)? Consistent read, one retry; a schedule that cannot be read counts as yes. A schedule that is not there counts as no (the tool answers not found). */
+  private async scheduleEmailsOthers(scheduleId: string, ownerUserId?: string): Promise<boolean> {
+    let schedule: any;
+    try {
+      schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+    } catch (firstError) {
+      try {
+        schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      } catch (retryError) {
+        console.error(`AgentMode ENG-3170: could not read schedule ${scheduleId} to see who it emails; refusing the edit:`, retryError);
+        return true;
+      }
+    }
+    // Every stored format (a list, a bare address, a JSON list in text), and not the owner's own address: new schedules default to it, and results that go
+    // to the owner reach nobody else.
+    const recipients = normalizeEmailList(schedule?.emailNotifications).map((address) => address.toLowerCase());
+    if (recipients.length === 0) return false;
+    let ownerEmail = '';
+    try {
+      ownerEmail = String((ownerUserId ? await userDb.getUserById(ownerUserId) : undefined)?.email ?? '').trim().toLowerCase();
+    } catch (userError) {
+      console.warn(`AgentMode ENG-3170: could not read the owner's address to tell their own results from others':`, userError);
+    }
+    return recipients.some((address) => address !== ownerEmail);
+  }
+
+  /**
+   * ENG-3170: did the owner turn on FULL CONTROL for the share link this session belongs to? (A visitor-made schedule has no link and
+   * is judged in `restrictionRefusal`.) Only a call under the `share_visitor` profile to a tool that depends on it pays for the read;
+   * the owner, an ordinary session and every other tool are untouched. The read is consistent, so an owner switching a link off
+   * takes effect on the next call, and it fails closed: a session that cannot be read (after one retry) or is gone refuses, because
+   * running one of these as the owner on an unverified link is the hole this closes.
+   */
+  private async readShareLinkControl(toolName: string, sessionId: string): Promise<{ sensitive: boolean; full: boolean }> {
+    let session: any;
+    if (sessionId) {
+      try {
+        session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      } catch (firstError) {
+        try {
+          session = await chatbotDb.getChatSessionRecord(sessionId, true);
+        } catch (retryError) {
+          console.error(`AgentMode ENG-3170: could not read session ${sessionId} to check the share link setting for ${toolName}; refusing:`, retryError);
+          throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
+        }
+      }
+    }
+    if (!session) throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
+    return interactiveShareControl(session.interactiveShareMetadata);
+  }
+
+  /**
+   * ENG-3170: the restriction a tool call runs under reaches the calls that tool makes ITSELF. A tool that drives the browser for the model
+   * (open_site_signin, solve_captcha, coding_agent) calls `executeTool` again for each browser step, with no extra context, so the nested
+   * call used to look like the owner's. Chat turns run in a forked worker, so a per-process marker of "a visitor's turn" cannot see this;
+   * a call-scoped store can, in any process and for voice. A nested call with no restriction of its own inherits the one it was made
+   * from; one that carries its own keeps it.
+   */
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    const own = normalizeRestrictionClaim(extraContext?.restrictionProfile);
+    const outer = toolCallRestrictionStore.getStore();
+    const inherited = own ? undefined : outer?.restrictionProfile;
+    const profile = own ?? inherited;
+    // A call made while another restricted call is running is NESTED (a tool acting for the visitor with code of its own, such as solve_captcha); a call the
+    // model or the visitor makes directly is not. Set here and never taken from the caller's context.
+    const nested = outer !== undefined;
+    // The flag is never taken from the caller: with no profile it is dropped, with one it is set from the call stack.
+    const { nestedInRestrictedCall: _callerClaim, ...callerContext } = (extraContext ?? {}) as Record<string, any>;
+    const context = profile ? { ...callerContext, ...(inherited ? { restrictionProfile: inherited } : {}), nestedInRestrictedCall: nested } : (extraContext ? callerContext : extraContext);
+    if (!profile) return this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context);
+    // `withinVisitorCall` stays true for everything nested under a visitor's call, even when a nested call carries a profile of its own.
+    const withinVisitorCall = profile === 'share_visitor' || outer?.withinVisitorCall === true;
+    return toolCallRestrictionStore.run({ restrictionProfile: profile, withinVisitorCall }, () =>
+      this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context));
+  }
+
+  private async executeToolUnderProfile(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
     // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
     // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
-    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
+    // ENG-3170: before argument repair only what depends on the tool NAME is judged (the block list, and a tool that is sensitive whatever
+    // its arguments). A tool judged by an argument (an email's action, a HubSpot action) is judged below, on the arguments it will run
+    // with, so a read that the model spelled in a shape repair understands is not refused for looking like something else.
+    const isShareVisitor = normalizeRestrictionClaim(extraContext?.restrictionProfile) === 'share_visitor';
+    // A visitor's call to a tool that depends on the link (the sensitive tools, the block list, connect_account) reads the link once.
+    const linkControl = isShareVisitor && isFullControlGatedWholeTool(toolName) ? await this.readShareLinkControl(toolName, sessionId) : { sensitive: false, full: false };
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, undefined, { nameOnly: true, linkAllowsFullControl: linkControl.full });
     if (restricted) throw new ToolRestrictionDenied(restricted);
+    // ENG-3170: a visitor may run a SENSITIVE tool (delete data, send or post outside the account, change ad spend, disconnect an
+    // account, use saved logins) only on a link whose owner turned on full control. Never taken from the request.
+    if (isShareVisitor && isSensitiveWholeTool(toolName) && !linkControl.sensitive) {
+      console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
+      throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+    }
     // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
     // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
-    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext);
+    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext, undefined, true);
     if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
     if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
+    // ENG-3170: a visitor who may not run the sensitive tools may not call the tool that runs their code on the server (see isServerSideBrowserCodeTool). A
+    // nested call by a tool with fixed code is allowed; a link that allows the sensitive tools (ON, legacy dialog link) keeps it, as the owner has it.
+    if (isServerSideBrowserCodeTool(toolName) && extraContext?.nestedInRestrictedCall !== true) {
+      const inVisitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+      if (isShareVisitor || inVisitorSchedule) {
+        const linkAllows = isShareVisitor && await this.readShareLinkControl(toolName, sessionId).then((control) => control.sensitive, () => false);
+        if (!linkAllows) {
+          console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: it runs the caller's code on the server, and the owner has not turned on full control.`);
+          throw new ToolRestrictionDenied(inVisitorSchedule ? sensitiveActionScheduleRefusal(toolName) : sensitiveActionRefusal(toolName));
+        }
+      }
+    }
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -10218,6 +10416,49 @@ export class AgentModeService {
     }
 
     const preparedArgs = contractResult.args;
+    // ENG-3170: a direct browser call by a visitor who may not run the sensitive tools may not name a file to write or to upload (see browserCallTouchesServerFiles).
+    if (isBrowserAutomationTool(toolName) && extraContext?.nestedInRestrictedCall !== true && (browserCallTouchesServerFiles(preparedArgs) || browserCallTouchesServerFiles(args))) {
+      const inVisitorScheduleNow = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+      if (isShareVisitor || inVisitorScheduleNow) {
+        const linkAllows = isShareVisitor && await this.readShareLinkControl(toolName, sessionId).then((control) => control.sensitive, () => false);
+        if (!linkAllows) {
+          console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: it names a file on the server, and the owner has not turned on full control.`);
+          throw new ToolRestrictionDenied(inVisitorScheduleNow ? sensitiveActionScheduleRefusal(toolName) : sensitiveActionRefusal(toolName));
+        }
+      }
+    }
+    // ENG-3170: a tool judged by an argument is judged here, on the arguments the tool will actually run with (repair hoists a nested
+    // wrapper, renames an alias, turns a GET shape into an action), as the publish-approval check below does. The checks above ran by
+    // name; for a sensitive call they run again with the arguments. A tool that is sensitive whatever its arguments was settled above.
+    if (!isFullControlGatedWholeTool(toolName)) {
+      const sensitiveCall = isSensitiveToolCall(toolName, preparedArgs);
+      // A Meta write is sensitive only in a run of a schedule a visitor wrote (an unattended run stages it for an approver who is not the owner):
+      // in a visitor's own chat it halts into a deck only the owner can answer, so the link is not asked about it.
+      if (sensitiveCall || isSensitiveInVisitorScheduleCall(toolName, preparedArgs)) {
+        if (sensitiveCall) {
+          const refusedByArgument = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
+          if (refusedByArgument) throw new ToolRestrictionDenied(refusedByArgument);
+          if (isShareVisitor && !(await this.readShareLinkControl(toolName, sessionId)).sensitive) {
+            console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
+            throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+          }
+        }
+        const scheduledByArgument = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
+        if (scheduledByArgument.refusal) throw new ToolRestrictionDenied(scheduledByArgument.refusal);
+      }
+    }
+    // ENG-3170: a visitor rewriting the prompt, keywords or variables of one of the owner's schedules that already emails OTHER people would have AgentWeb
+    // send their text to those people (the visitor mark limits the tools a run may use, not who receives its output). Only on a link that may not run the
+    // sensitive tools; a schedule that emails nobody else stays editable. An unreadable schedule refuses.
+    // This also holds for a run of a schedule a visitor wrote (it carries the schedule profile, and has no link that could allow it).
+    const inVisitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+    if (isShareVisitor || inVisitorSchedule) {
+      const editedScheduleId = scheduleContentEditTarget(toolName, preparedArgs);
+      if (editedScheduleId && !(isShareVisitor && (await this.readShareLinkControl(toolName, sessionId)).sensitive) && await this.scheduleEmailsOthers(editedScheduleId, userId)) {
+        console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: schedule ${editedScheduleId} emails other people and the link has not been given full control.`);
+        throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+      }
+    }
     const policyDecision = evaluateAgentToolPolicy({
       toolName,
       args: preparedArgs,
@@ -10259,10 +10500,25 @@ export class AgentModeService {
         const autoDeps = {
           runTool: (name: string, toolArgs: any) => this.toolRegistry.execute(name, toolArgs ?? {}, cookieCtx),
         };
-        await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
-        const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
+        // ENG-3170: the owner's saved browser sessions are saved logins. A share-link visitor's browser starts from them (and writes its own
+        // cookies back over them) only on a link the owner has let run the sensitive tools; otherwise it browses as nobody. A link that
+        // cannot be read counts as not allowed: the browser tool itself still runs, it just does not borrow the owner's logins.
+        // "Visitor" is decided from the TURN as well as from the caller's claim: a tool that drives the browser for the model (open_site_signin,
+        // solve_captcha, coding_agent) calls executeTool without forwarding the claim, and that nested call is still the visitor's turn.
+        // A nested call that carries a profile of its own, inside a visitor's scope, is still inside that visitor's call (`withinVisitorCall`).
+        // A scheduled run of a schedule a visitor wrote (scheduledRunRestriction hands back its profile for a browser tool of an unattended run) has no
+        // link to ask: it never borrows the owner's logins until the owner adopts the schedule.
+        const visitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+        const visitorCall = isShareVisitor || visitorSchedule || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
+        const borrowOwnerLogins = !visitorCall || (!visitorSchedule && await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false));
+        // A visitor who may not use the owner's logins also gets a BROWSER of their own. A chat session's browser is pooled for the whole session (an hour idle)
+        // under the owner's id, so a shared one would be driven by the visitor with the cookies the owner's turn loaded (browser_evaluate can read them), and
+        // any hand-over between the two has a window. Their own pool (`<session>::visitor`) has no owner's logins in it, ever, and nothing to hand over.
+        const browserCtx = borrowOwnerLogins ? cookieCtx : { ...cookieCtx, browserPoolSessionId: `${sessionId}::visitor` };
+        if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
+        const result = await this.toolRegistry.execute(toolName, preparedArgs, browserCtx);
         const toolFailed = result && (result as any).success === false;
-        if (!toolFailed && shouldPersistAfterBrowserTool(toolName)) {
+        if (!toolFailed && borrowOwnerLogins && shouldPersistAfterBrowserTool(toolName)) {
           await autoSaveCookies(this.browserCookieAutoState, sessionId, autoDeps);
         }
         await recordToolReliabilityEvent({

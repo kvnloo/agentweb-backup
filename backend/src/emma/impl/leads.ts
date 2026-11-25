@@ -1788,6 +1788,14 @@ export async function setLeadContactStatus(
 
       for (const leadId of leadIds) {
         try {
+          // `updateLead` is an upsert: for an id that is not in this list (deleted, or mistyped) it would CREATE an empty stub lead that
+          // then shows up in the list. A missing lead is a failure to report, never a lead to create.
+          const existing = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+          if (!existing) {
+            failed++;
+            errors.push(`${leadId}: lead not found in this list`);
+            continue;
+          }
           const updates: any = {
             contactStatus,
             contactStatusUpdatedAt: now,
@@ -2615,6 +2623,22 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         };
       }
 
+      // ENG-2984: claim the draft atomically before the provider call. Two concurrent
+      // invocations both read the same draft above; only the one whose conditional claim
+      // succeeds may send, so the lead gets at most one email. The draft stays stored until
+      // the send succeeds, so a crash/deploy mid-send never loses it (stale claims expire).
+      const claimToken = await crmDb.claimLeadEmailDraft(listId, leadId, draft);
+      if (!claimToken) {
+        return {
+          success: false,
+          message: 'Email draft already sent or changed',
+          // ENG-2984 / Opslane run 2213: a refused claim means either a send is in flight or
+          // the draft changed. Say so truthfully and give the recovery path: an orphaned claim
+          // (crashed send) expires after the 5-minute lease, after which a retry succeeds.
+          error: 'Another request is sending this draft right now (or the draft was just changed), so it was not sent twice. Check the lead in a minute: if the draft is gone, it was sent. If the draft is still there after about 5 minutes, retry the send once.',
+        };
+      }
+
       try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
@@ -2626,14 +2650,37 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         });
         emailId = sendResult.messageId;
       } catch (error) {
+        // The send did not go out: release the claim so the user can retry now (best effort;
+        // an unreleased claim also expires on its own).
+        try {
+          await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
+        } catch (releaseError) {
+          console.error('AgentMode: failed to release email draft claim after send failure (ENG-2984):', releaseError);
+        }
         if (error instanceof SenderDailyLimitExceededError) {
           return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
         throw error;
       }
 
-      // Clear the draft after successful send
-      await crmDb.updateLead(listId, leadId, { emailDraft: null });
+      // Clear the sent draft and our claim in one conditional write: only while we still own
+      // the claim AND the stored draft is the one we sent, so a draft replaced mid-send (or a
+      // replacement sender after our lease expired) is never deleted.
+      try {
+        const cleared = await crmDb.completeLeadEmailDraftSend(listId, leadId, claimToken, draft);
+        if (!cleared) {
+          console.warn('AgentMode: sent email but draft changed or claim lost mid-send; left stored draft intact (ENG-2984)');
+          // Our send finished: drop our claim so a replacement draft is sendable now. Token-
+          // conditional, so a no-op if another sender owns the claim.
+          try {
+            await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
+          } catch (releaseError) {
+            console.error('AgentMode: failed to release email draft claim after replaced draft (ENG-2984):', releaseError);
+          }
+        }
+      } catch (clearError) {
+        console.error('AgentMode: failed to clear sent email draft (ENG-2984):', clearError);
+      }
 
       return {
         success: true,

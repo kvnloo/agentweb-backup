@@ -6,6 +6,12 @@ export interface ToolContext {
   userId: string;
   sessionId: string;
   llmModel: string;
+  /**
+   * ENG-3170: the session id a BROWSER tool call is pooled under, when it must not share the chat session's browser. A browser is pooled per
+   * (owner, chat session), and a share-link visitor runs under the owner's id and session, so they would drive the browser the owner logged in.
+   * `executeTool` gives a visitor who may not use the owner's logins a pool of their own (`<session>::visitor`). Absent: the chat session's own pool.
+   */
+  browserPoolSessionId?: string;
   mockMode?: boolean;
   /**
    * Reference to the AgentModeService to access its helper methods

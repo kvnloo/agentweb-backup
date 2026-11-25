@@ -310,3 +310,35 @@ describe('POST /connect', () => {
     expect(res.body.success).toBe(true);
   });
 });
+
+// ── Error logging never carries the OAuth secret or code ───────────────────────
+
+describe('failed finalize / connect log a short message, not the AxiosError', () => {
+  const axiosError = () => Object.assign(new Error('Request failed with status code 400'), {
+    isAxiosError: true,
+    config: { params: { client_secret: 'SHOULD-NOT-BE-LOGGED', code: 'AUTH-CODE-SHOULD-NOT-BE-LOGGED' }, headers: { Authorization: 'Bearer SHOULD-NOT-BE-LOGGED' } },
+    response: { status: 400, data: { error: 'invalid_request' } },
+  });
+
+  it('finalize', async () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    mockAxiosPost.mockRejectedValue(axiosError());
+    const res = await request(app).post('/finalize').send({ code: 'c', state: makeState('user-123') });
+    expect(res.status).toBe(500);
+    expect(spy.mock.calls.length).toBeGreaterThan(0);
+    expect(require('util').inspect(spy.mock.calls, { depth: 6 })).not.toMatch(/SHOULD-NOT-BE-LOGGED/);
+    expect(JSON.stringify(spy.mock.calls)).toContain('Request failed with status code 400');
+    spy.mockRestore();
+  });
+
+  it('connect', async () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const fin = await request(app).post('/finalize').send({ code: 'c', state: makeState('user-123') });
+    (createAccount as jest.Mock).mockRejectedValueOnce(axiosError());
+    const res = await request(app).post('/connect').send({ tokenSessionId: fin.body.tokenSessionId, adAccountId: '111' });
+    expect(res.status).toBe(500);
+    expect(require('util').inspect(spy.mock.calls, { depth: 6 })).not.toMatch(/SHOULD-NOT-BE-LOGGED/);
+    expect(JSON.stringify(spy.mock.calls)).toContain('Request failed with status code 400');
+    spy.mockRestore();
+  });
+});

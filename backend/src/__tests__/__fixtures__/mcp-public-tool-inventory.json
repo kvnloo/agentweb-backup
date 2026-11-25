@@ -346,6 +346,50 @@
     }
   },
   {
+    "name": "delete_memory",
+    "listed": false,
+    "description": "Delete one of the user's own memories by id. Answers \"not found\" when there is no such memory.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memoryId": {
+          "type": "string",
+          "description": "The memory id (from save_memory or list_memories)."
+        }
+      },
+      "required": [
+        "memoryId"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "delete_org_memory",
+    "listed": false,
+    "description": "Delete one of the organization's memories by id. Only org owners and admins can; answers \"not found\" when there is no such memory.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memoryId": {
+          "type": "string",
+          "description": "The memory id (from save_memory or list_memories)."
+        }
+      },
+      "required": [
+        "memoryId"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "deploy_landing_page",
     "listed": false,
     "description": "Retry deploying a landing page that failed during deployment. Only use this if generate_landing_page returned a failed status. Do NOT call this after a successful generate — deployment is already included in generate_landing_page.",
@@ -2245,6 +2289,48 @@
     }
   },
   {
+    "name": "list_memories",
+    "listed": false,
+    "description": "List the user's own memories (scope \"user\", the default) or the organization's (scope \"org\"), newest first, a page at a time. Returns id, category, content and dates, never embeddings. Pass nextCursor back as cursor for the next page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "user",
+            "org"
+          ],
+          "description": "\"user\" (default) or \"org\"."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "preference",
+            "history",
+            "insight",
+            "workflow"
+          ],
+          "description": "preference, history, insight or workflow."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Memories per page, 1 to 50 (default 20)."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "nextCursor from the previous page."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "list_predefined_work_plans",
     "listed": false,
     "description": "List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template's full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.",
@@ -2650,66 +2736,97 @@
   {
     "name": "manage_gtm_items",
     "listed": false,
-    "description": "Manage GTM plan phases and work items. Use action: \"add_phase\", \"update_phase\", \"delete_phase\", \"add_work_items\", \"update_work_item\", \"delete_work_item\", \"get_common_items\", \"add_common_items\", or \"send_status_report\".",
+    "description": "Manage the phases and work items of a GTM plan. Each action takes only its own inputs; any other argument is refused by name. add_phase: plan_id, title (required), description, dri, due_date. update_phase: plan_id, phase_id and at least one of title, description, dri, due_date. delete_phase: plan_id, phase_id. add_work_items: plan_id, phase_id, work_items (1 to 20 objects, each with title and optionally description, dri, due_date); they are added one after the other. update_work_item: plan_id, phase_id, work_item_id and at least one of title, description, status (pending, in_progress, completed, skipped), notes, dri, due_date. delete_work_item: plan_id, phase_id, work_item_id. get_common_items: nothing (a plan_id is accepted and ignored). add_common_items: plan_id, items (up to 50, from get_common_items: each a title and optionally a description), and exactly one of target_phase_id or new_phase_name. Nothing here emails anyone: to email a status report use send_gtm_status_report (it needs an API key with the gtm:email scope). Dates are YYYY-MM-DD; dri is an email address; an empty string (or null) clears description, notes, dri or due_date. A phase's and a plan's status follow their work items and cannot be set.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "action": {
           "type": "string",
+          "enum": [
+            "add_phase",
+            "update_phase",
+            "delete_phase",
+            "add_work_items",
+            "update_work_item",
+            "delete_work_item",
+            "get_common_items",
+            "add_common_items"
+          ],
           "description": "Action to perform"
         },
         "plan_id": {
           "type": "string",
-          "description": "Plan ID"
+          "description": "Plan id"
         },
         "phase_id": {
           "type": "string",
-          "description": "Phase ID"
+          "description": "Phase id"
         },
         "work_item_id": {
           "type": "string",
-          "description": "Work item ID"
+          "description": "Work item id"
+        },
+        "title": {
+          "type": "string",
+          "description": "Phase or work item title, at most 300 characters (name is accepted as the old spelling)"
         },
         "name": {
           "type": "string",
-          "description": "Phase/item name"
+          "description": "Old spelling of title"
         },
         "description": {
           "type": "string",
-          "description": "Description"
+          "description": "Description, at most 5000 characters; an empty string clears it"
         },
         "status": {
           "type": "string",
-          "description": "Status"
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "skipped"
+          ],
+          "description": "Work item status (update_work_item only)"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Work item notes (update_work_item); an empty string (or null) clears them"
+        },
+        "dri": {
+          "type": "string",
+          "description": "Email address of the contact; an empty string removes it"
+        },
+        "due_date": {
+          "type": "string",
+          "description": "Due date YYYY-MM-DD; an empty string removes it"
         },
         "work_items": {
           "type": "array",
-          "description": "Array of work item objects"
+          "maxItems": 20,
+          "items": {
+            "type": "object"
+          },
+          "description": "Items to add (add_work_items): title, description, dri, due_date"
         },
         "items": {
           "type": "array",
-          "description": "Common items to add"
+          "maxItems": 50,
+          "items": {
+            "type": "object"
+          },
+          "description": "Common items to add (add_common_items), from get_common_items: a title and optionally a description each"
         },
         "target_phase_id": {
           "type": "string",
-          "description": "Target phase for common items"
+          "description": "Existing phase for the common items (add_common_items)"
         },
         "new_phase_name": {
           "type": "string",
-          "description": "New phase name for common items"
-        },
-        "include_summary": {
-          "type": "boolean",
-          "description": "Include summary in status report"
-        },
-        "include_details": {
-          "type": "boolean",
-          "description": "Include details in status report"
+          "description": "Name of a new phase for the common items (add_common_items)"
         }
       },
       "required": [
-        "action",
-        "plan_id"
+        "action"
       ]
     },
     "sideEffect": "write",
@@ -2721,7 +2838,7 @@
   {
     "name": "manage_gtm_plan",
     "listed": false,
-    "description": "Create, read, update, or delete a GTM plan. Use action: \"create\", \"get\", \"update\", or \"delete\".",
+    "description": "Create, read, update or delete a go-to-market (GTM) plan. action \"create\": title (required), description, dri (the plan contact's email). action \"get\" and \"delete\": plan_id. action \"update\": plan_id and at least one of title, description, dri, due_date (YYYY-MM-DD; an empty string removes dri or due_date). A plan has no goals, audience, timeline, budget or status fields to set: write goals and the like into the description; the status follows the phases. An argument that is not an input of the action is refused by name. Phases and work items are managed with manage_gtm_items.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2733,42 +2850,27 @@
             "update",
             "delete"
           ],
-          "description": "CRUD action"
+          "description": "What to do"
         },
         "plan_id": {
           "type": "string",
-          "description": "Plan ID (required for get/update/delete)"
+          "description": "Plan id (get, update, delete); list_gtm_plans returns them"
         },
         "title": {
           "type": "string",
-          "description": "Plan title (create/update)"
+          "description": "Plan title (create, update), at most 300 characters"
         },
         "description": {
           "type": "string",
-          "description": "Plan description (create/update)"
+          "description": "Plan description (create, update), at most 5000 characters; an empty string clears it"
         },
-        "goals": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Plan goals (create/update)"
-        },
-        "target_audience": {
+        "dri": {
           "type": "string",
-          "description": "Target audience (create/update)"
+          "description": "Email address of the plan contact (create, update). On update an empty string removes it; on create it defaults to your own email address"
         },
-        "timeline": {
+        "due_date": {
           "type": "string",
-          "description": "Timeline (create/update)"
-        },
-        "budget": {
-          "type": "string",
-          "description": "Budget (create/update)"
-        },
-        "status": {
-          "type": "string",
-          "description": "Plan status (update)"
+          "description": "Plan due date YYYY-MM-DD (update); an empty string removes it"
         }
       },
       "required": [
@@ -4014,6 +4116,74 @@
     }
   },
   {
+    "name": "save_memory",
+    "listed": false,
+    "description": "Save one fact about the user's own account, for Emma to know in future sessions. Content up to 2,000 characters is one memory; up to 8,000 is split into several. An identical memory is not saved twice, and at most 200 memories can be stored through MCP (delete some to save more).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "The fact. Specific and actionable."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "preference",
+            "history",
+            "insight",
+            "workflow"
+          ],
+          "description": "preference, history, insight or workflow."
+        }
+      },
+      "required": [
+        "content",
+        "category"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "save_org_memory",
+    "listed": false,
+    "description": "Save one fact about the user's organization. Every member's Emma will know it in future sessions, so keep it to what the whole team should know. Same limits as save_memory (at most 200 org memories through MCP).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "The org-wide fact. Specific and actionable."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "preference",
+            "history",
+            "insight",
+            "workflow"
+          ],
+          "description": "preference, history, insight or workflow."
+        }
+      },
+      "required": [
+        "content",
+        "category"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "search_knowledge_base",
     "listed": false,
     "description": "Search the knowledge base for relevant information.",
@@ -4089,6 +4259,53 @@
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "send_gtm_status_report",
+    "listed": false,
+    "description": "Email a status report for one phase or for a whole GTM plan to the people you choose. Needs an API key with the gtm:email scope. plan_id (required). phase_id: send it for a phase report, leave it out for a whole-plan report. Choose who gets it by setting at least one of notify_user (the account owner), notify_plan_poc (the plan contact), notify_phase_poc (a phase report: that phase's contact), notify_phase_pocs (a plan report: every phase contact) to true; nobody is emailed by default. message: an optional note, at most 2000 characters. Limits: at most 10 people per call (a report that would reach more sends nothing), about 50 emails an hour per account (all your keys together), and the same report is not sent twice within 10 minutes. The email goes from AgentWeb to whatever addresses are on the plan, including contacts set with manage_gtm_plan, so check them first with manage_gtm_plan get. The answer says how many emails were accepted and how many failed. Any other argument is refused by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "plan_id": {
+          "type": "string",
+          "description": "Plan id; list_gtm_plans returns them"
+        },
+        "phase_id": {
+          "type": "string",
+          "description": "Send it for a phase report; leave it out for a whole-plan report"
+        },
+        "notify_user": {
+          "type": "boolean",
+          "description": "Email the account owner"
+        },
+        "notify_plan_poc": {
+          "type": "boolean",
+          "description": "Email the plan contact (the plan dri)"
+        },
+        "notify_phase_poc": {
+          "type": "boolean",
+          "description": "Phase report only: email that phase's contact"
+        },
+        "notify_phase_pocs": {
+          "type": "boolean",
+          "description": "Plan report only: email every phase contact"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Optional note shown in the report, at most 2000 characters"
+        }
+      },
+      "required": [
+        "plan_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
     }
   },
   {
