@@ -3695,6 +3695,9 @@ export class AgentModeService {
         messageContent,
         isUnattendedRun,
         warningsAllowed: persistIncrementally && !(currentSession?.pageIdentifier || '').toLowerCase().includes('slack'),
+        // A share-link visitor's "continue" is not the owner's word. This flag reaches the forked worker (an in-process marker
+        // would not) and is false for the owner on their own link.
+        isShareVisitor: isInteractiveShare === true,
       });
       const sessionLimitUnattended = isUnattendedRun === true;
       let pausedBySessionLimit = false;
@@ -6265,7 +6268,7 @@ export class AgentModeService {
         // flow at /onboarding/v2. That flow is a separate brand-build status machine (a
         // "regular" session with NO work plan) and never reaches this code. An earlier
         // hypothesis that this guard could stall onboarding was based on that wrong premise.
-        workPlanContent += `⚠️ AUTOCOMPLETE MODE: This plan runs hands-off — do NOT pause to ask the user to approve or confirm a step. After performing a step's work, immediately call set_work_plan_status to complete it and move on. If information is missing, recover it using your tools (e.g. read_brand_guidelines, read_market_strategy) or earlier session content; if it is still missing, proceed with reasonable defaults rather than blocking. Never leave a step pending waiting on the user.\n\n`;
+        workPlanContent += `⚠️ AUTOCOMPLETE MODE: This plan runs hands-off — do NOT pause to ask the user to approve or confirm a step. After performing a step's work, immediately call set_work_plan_status to complete it and move on. If information is missing, recover it using your tools (e.g. read_brand_guidelines, read_market_strategy) or earlier session content; if it is still missing, proceed with reasonable defaults rather than blocking. Exception: a missing required API key cannot be defaulted; keep the affected step pending, call set_work_plan_status to record reason=no_key in notes, and report the prerequisite without claiming completion. Never leave a step pending waiting on the user except for this explicit prerequisite failure.\n\n`;
       } else {
         // Production-parity path (Emma): the ORIGINAL autocomplete wording, unchanged
         // from origin/main, so Emma's output does not drift.
@@ -11062,8 +11065,8 @@ export class AgentModeService {
     return leadsImpl.searchLeads(listId, filters, userId, limit, options);
   }
 
-  public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
-    return leadsImpl.getLeadDetails(listId, leadId, userId);
+  public async getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number; recoverStaleList?: boolean }): Promise<any> {
+    return options ? leadsImpl.getLeadDetails(listId, leadId, userId, options) : leadsImpl.getLeadDetails(listId, leadId, userId);
   }
 
   public async getLeadsNeedingFollowup(listId: string, userId: string, options: {
@@ -11137,8 +11140,8 @@ export class AgentModeService {
     return leadsImpl.deleteLeadList(listId, userId);
   }
 
-  public async getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number): Promise<any> {
-    return leadsImpl.getLeadEngagements(listId, leadId, userId, limit);
+  public async getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number, options?: { maxContentFetches?: number }): Promise<any> {
+    return options ? leadsImpl.getLeadEngagements(listId, leadId, userId, limit, options) : leadsImpl.getLeadEngagements(listId, leadId, userId, limit);
   }
 
   public async addLeadEngagement(

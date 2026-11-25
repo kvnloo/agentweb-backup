@@ -6580,7 +6580,7 @@ emmaToolRegistry.register({
               },
               notes: {
                 type: 'string',
-                description: 'Optional notes about what was accomplished or why the step was skipped'
+                description: 'Optional notes about what was accomplished or why the step was skipped. If a required API key is missing, keep status pending and record the exact token reason=no_key in notes; never mark unfinished work completed or skipped.'
               }
             },
             required: ['stepCount', 'status']

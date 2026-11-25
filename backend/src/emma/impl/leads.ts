@@ -1091,7 +1091,13 @@ function getEmailContentPreview(emailContent: any, maxLength: number): string | 
       : plainText;
   }
 
-export async function getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
+/**
+ * `options` (ENG-2840 W2-5a, set only by the MCP lead tools): `maxContentFetches` bounds the email bodies one read fetches from the mail provider
+ * (see crmDb.getLeadEngagements); `recoverStaleList: false` skips the search of the caller's other lists for a lead that is not in `listId`.
+ * That search costs one AW-LeadLists query per organization member plus batched lead reads, and AW-LeadLists is provisioned at 5 read units, so
+ * it is not offered to an API key that can repeat it 60 times a minute. Without options (Emma, the portal, the readback verifier) nothing changes.
+ */
+export async function getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number; recoverStaleList?: boolean }): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
       const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
@@ -1113,7 +1119,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
       const requestedListId = listId;
       let lead = await crmDb.getLeadById(listId, leadId);
       let correctedListId: string | null = null;
-      if (!lead) {
+      if (!lead && options?.recoverStaleList !== false) {
         // ENG-969 follow-up: the requested list_id may just be stale/wrong
         // rather than the lead not existing at all. See leadRecovery.ts for
         // the full rationale (tiering, retry, and why it always fails safe).
@@ -1182,7 +1188,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
       // Get engagement count and recent engagements
       const [engagementCount, engagementsResult] = await Promise.all([
         crmDb.getLeadEngagementCount(listId, leadId, userId),
-        crmDb.getLeadEngagements(listId, leadId, userId)
+        options ? crmDb.getLeadEngagements(listId, leadId, userId, options) : crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagements = engagementsResult.engagements || [];
       const customFields = lead.customFields || {};
@@ -2355,7 +2361,7 @@ export async function deleteLeadList(listId: string, userId: string): Promise<an
     }
   }
 
-export async function getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number): Promise<any> {
+export async function getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number, options?: { maxContentFetches?: number }): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
@@ -2387,7 +2393,7 @@ export async function getLeadEngagements(listId: string, leadId: string, userId:
           console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
           return null;
         }),
-        crmDb.getLeadEngagements(listId, leadId, userId)
+        options ? crmDb.getLeadEngagements(listId, leadId, userId, options) : crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagementCountAvailable = engagementCountResult !== null;
       const engagementCount: any = engagementCountResult || {};
