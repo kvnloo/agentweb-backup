@@ -6,7 +6,8 @@
  * kept it in process memory). A session works inside a *window*: the tier's turn and dollar caps,
  * measured from where the window opened. When either side is used up the loop stops before its
  * next model call and the session waits. A person in the chat reopens a fresh window by replying
- * "continue"; an unattended scheduled run cannot confirm, so it stays paused until someone does.
+ * "continue"; an unattended scheduled run cannot confirm, so it stays paused until someone does,
+ * and neither can a share-link visitor (their text is not the owner's word; ENG-3164).
  * At 75% and 90% of a window the attended chat gets a one-time notice (each claimed with a
  * conditional write, so concurrent turns never show it twice).
  *
@@ -143,13 +144,16 @@ export function sessionLimitWarningMessage(pct: SessionLimitWarningPercent): str
   return `You have used ${pct}% of this session’s limit. Start a new session to keep going without interruption.`;
 }
 
-const usd = (n: number) => `$${n.toFixed(2)}`;
-
-export function sessionLimitPauseMessage(usage: SessionLimitUsage, caps: SessionLimitCaps, unattended: boolean): string {
-  const used = `${usage.turns} of ${caps.maxTurns} steps and ${usd(usage.spendUsd)} of ${usd(caps.maxSpendUsd)}`;
+/**
+ * The pause text. No numbers on purpose (owner, 2026-11-25): customers should not see steps or our model cost; the exact usage is
+ * logged and stored on the message (`sessionLimitPaused`). A share-link visitor cannot continue the owner's session, so they are
+ * told to ask the person who shared it.
+ */
+export function sessionLimitPauseMessage(unattended: boolean, shareVisitor = false): string {
+  if (shareVisitor) return 'This shared chat has reached its usage limit. Ask the person who shared it to continue it.';
   return unattended
-    ? `This scheduled run paused because the session reached its limit (${used} used). Open this session and reply "continue" to keep going, or start a new session.`
-    : `This session has reached its limit (${used} used). Reply "continue" to keep going in this session, or start a new session.`;
+    ? 'This scheduled run paused because the session reached its usage limit. Open this session and reply "continue" to keep going, or start a new session.'
+    : 'This session has reached its usage limit. Reply "continue" to keep going in this session, or start a new session.';
 }
 
 export interface SessionLimitDeps {
@@ -186,6 +190,11 @@ export interface StartSessionLimitInput {
   isUnattendedRun?: boolean;
   /** Whether 75%/90% notices may be shown on this run (in-app chat only). */
   warningsAllowed: boolean;
+  /**
+   * True when this turn is typed by a share-link visitor (the turn's `isInteractiveShare`: false for the owner on their own link).
+   * A visitor's "continue" is not the owner's word, so it never reopens the owner's window, and a visitor sees no 75%/90% notices.
+   */
+  isShareVisitor?: boolean;
 }
 
 /**
@@ -218,7 +227,7 @@ export async function startSessionLimit(input: StartSessionLimitInput, deps: Ses
     return null;
   }
 
-  if (isSessionLimitReached(state, caps) && input.isUnattendedRun !== true && isSessionLimitConfirmation(input.messageContent)) {
+  if (isSessionLimitReached(state, caps) && input.isUnattendedRun !== true && input.isShareVisitor !== true && isSessionLimitConfirmation(input.messageContent)) {
     try {
       await deps.update({
         TableName: deps.tableName,
@@ -273,11 +282,11 @@ export async function startSessionLimit(input: StartSessionLimitInput, deps: Ses
         loggedPause = true;
         const u = sessionLimitUsage(state, caps);
         deps.log(JSON.stringify({
-          event: 'session_limit_paused', sessionId, userId: input.userId, unattended,
+          event: 'session_limit_paused', sessionId, userId: input.userId, unattended, shareVisitor: input.isShareVisitor === true,
           windowTurns: u.turns, windowSpendUsd: Number(u.spendUsd.toFixed(4)), totalTurns: state.turns, ...caps,
         }));
       }
-      return sessionLimitPauseMessage(sessionLimitUsage(state, caps), caps, unattended);
+      return sessionLimitPauseMessage(unattended, input.isShareVisitor === true);
     },
     recordTurn: async (costUsd: number) => {
       const micro = Number.isFinite(costUsd) && costUsd > 0 ? Math.round(costUsd * MICRO) : 0;
@@ -302,7 +311,7 @@ export async function startSessionLimit(input: StartSessionLimitInput, deps: Ses
         state = { ...state, turns: state.turns + 1, spendMicroUsd: state.spendMicroUsd + micro };
         deps.log(JSON.stringify({ event: 'session_limit_record_failed', sessionId, error: (error as Error)?.name ?? 'Error' }));
       }
-      if (input.warningsAllowed && input.isUnattendedRun !== true) await claimWarnings();
+      if (input.warningsAllowed && input.isUnattendedRun !== true && input.isShareVisitor !== true) await claimWarnings();
     },
   };
 }
