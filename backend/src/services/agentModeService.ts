@@ -3695,6 +3695,9 @@ export class AgentModeService {
         messageContent,
         isUnattendedRun,
         warningsAllowed: persistIncrementally && !(currentSession?.pageIdentifier || '').toLowerCase().includes('slack'),
+        // A share-link visitor's "continue" is not the owner's word. This flag reaches the forked worker (an in-process marker
+        // would not) and is false for the owner on their own link.
+        isShareVisitor: isInteractiveShare === true,
       });
       const sessionLimitUnattended = isUnattendedRun === true;
       let pausedBySessionLimit = false;
