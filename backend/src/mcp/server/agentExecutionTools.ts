@@ -97,6 +97,10 @@ export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
   'get_landing_page_effective_view',
   'get_landing_page_preview_url',
   'get_landing_page_subdomain',
+  // Lead reads (leadReadTools.ts): a lead's details, its engagement history, a list's pipeline stages. Deterministic CRM reads.
+  'get_lead_details',
+  'get_lead_engagements',
+  'get_lead_list_statuses',
   'get_pr_digest',
   'get_registration_status',
   'get_scheduled_chat_storage_diagnostics',

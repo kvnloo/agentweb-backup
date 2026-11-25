@@ -120,6 +120,8 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
   'POST /search-leads': 'metered',
   'POST /leads': 'metered',
   'POST /lead-details': 'metered',
+  'POST /lead-engagements': 'metered',
+  'POST /lead-list-statuses': 'metered',
   'GET /actions': 'exempt',
   'POST /repair-blog': 'metered',
 };

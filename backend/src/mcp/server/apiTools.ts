@@ -22,6 +22,7 @@ import './conversionSummaryTool';
 import './memoryTools';
 import './gtmTools';
 import './gtmEmailTool';
+import './leadReadTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
