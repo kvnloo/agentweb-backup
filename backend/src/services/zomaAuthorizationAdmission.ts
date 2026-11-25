@@ -20,5 +20,5 @@ export async function admitZomaAuthorizationSignup(userId: string, origin?: Zoma
   const createdAt = Date.parse(user.createdAt);
   if (!Number.isFinite(createdAt)) throw new Error('Zoma authorization user creation date is invalid');
   if (createdAt < startedAt) return 'approved';
-  return origin?.databricks ? admitZomaSignup(user.email, undefined, origin) : admitZomaSignup(user.email);
+  return origin?.databricks ? admitZomaSignup(user.email, undefined, { ...origin, userId }) : admitZomaSignup(user.email);
 }

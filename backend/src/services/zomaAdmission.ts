@@ -122,6 +122,9 @@ export interface ZomaSignupDeps {
  */
 export interface ZomaSignupOrigin {
   databricks?: boolean;
+  /** Attribution for the exemption log only, never part of the decision: the OAuth client and account at authorization. */
+  clientId?: string;
+  userId?: string;
 }
 const defaultSignupDeps: ZomaSignupDeps = {
   hasPendingOrgInvite: async (email) => !!(await (await import('./db')).orgDb.getOrgWithPendingInviteForEmail(email)),
@@ -129,10 +132,12 @@ const defaultSignupDeps: ZomaSignupDeps = {
 
 /**
  * Signups that are not a new free Zoma seat: our own team domains, a Databricks-origin client
- * (ENG-2781: those arrive through the Databricks Marketplace listing and only ever get the
- * read-only tool view), a teammate joining an org that invited them, and an applicant a human
- * already invited before the gate was enabled. They are admitted without consuming a seat (and
- * never waitlisted). A failed org lookup is not an exemption: the gate still applies.
+ * (ENG-2781: those arrive through the Databricks Marketplace listing, and tokens issued to such a
+ * client get the read-only tool view), a teammate joining an org that invited them, and an
+ * applicant a human already invited before the gate was enabled. They are admitted without
+ * consuming a seat (and never waitlisted). A failed org lookup is not an exemption: the gate still
+ * applies. A Databricks origin does not override an admin Reject: that is a decision about the
+ * person, not about the cap, and it still stands (a waitlisted row is exempt: the cap is moot).
  */
 export async function zomaSeatExemption(
   emailInput: string,
@@ -141,9 +146,15 @@ export async function zomaSeatExemption(
 ): Promise<ZomaSeatExemption | null> {
   const email = emailInput.toLowerCase();
   if (accountFlag(email) === 'internal') return 'team';
-  if (origin.databricks === true) return 'databricks';
+  let rejectedRow: any;
+  if (origin.databricks === true) {
+    // The one extra read, only on the Databricks path. Unreadable is not an exemption: it throws.
+    const decision = await entry(email);
+    if (decision?.zomaStatus !== 'rejected') return 'databricks';
+    rejectedRow = decision;
+  }
   if (await deps.hasPendingOrgInvite(email).catch(() => false)) return 'org_invite';
-  const row = await entry(email);
+  const row = rejectedRow ?? await entry(email);
   if (row && !row.zomaStatus && row.status === 'invited') return 'legacy_invite';
   return null;
 }
@@ -151,8 +162,15 @@ export async function zomaSeatExemption(
 /** Registration-time admission (password + Google): exemptions first, then the capped seat. */
 export async function admitZomaSignup(email: string, deps: ZomaSignupDeps = defaultSignupDeps, origin: ZomaSignupOrigin = {}): Promise<string> {
   const exemption = await zomaSeatExemption(email, deps, origin);
-  // Counts bypasses without recording who: a spoofed Databricks client would show up here.
-  if (exemption === 'databricks') console.log('[zoma-waitlist] Databricks-origin signup admitted without a free seat');
+  // Makes the bypass traceable without storing anything on the account and without an email address.
+  // At authorization the client and account are known; at registration only the signed marker is.
+  if (exemption === 'databricks') {
+    if (origin.clientId) {
+      console.log('[zoma-waitlist] Databricks-origin signup admitted without a free seat (authorization):', { clientId: origin.clientId, userId: origin.userId });
+    } else {
+      console.log('[zoma-waitlist] Databricks-origin signup admitted without a free seat (signed intent marker, no client at registration)');
+    }
+  }
   return exemption ? 'approved' : admitZoma(email);
 }
 

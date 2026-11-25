@@ -110,15 +110,19 @@ function attributeConsentSignup(
 async function allowZomaSignupAuthorization(
   product: JourneyProduct,
   userId: string,
-  client: { redirectUris: readonly string[] },
+  client: { clientId: string; redirectUris: readonly string[] },
   res: Response,
 ): Promise<boolean> {
   if (product !== 'zoma') return true;
   try {
-    // ENG-2781: the same registered-redirect-URI test the Zoma gateway uses to make this client's
-    // tokens read-only, so a client exempt from the free-seat cap is exactly one that is read-only.
-    const databricks = isDatabricksClient(client.redirectUris);
-    const admission = databricks ? await admitZomaAuthorizationSignup(userId, { databricks }) : await admitZomaAuthorizationSignup(userId);
+    // ENG-2781: the same registered-redirect-URI test the Zoma gateway uses to make tokens issued to
+    // this client read-only. Read-only binds those tokens, not the account, and anyone can register a
+    // client with a Databricks redirect URI, so this is a cost bypass, not proof the caller is
+    // Databricks. Gate off: the call is the unchanged one-argument call.
+    const databricks = zomaAdmissionEnabled() && isDatabricksClient(client.redirectUris);
+    const admission = databricks
+      ? await admitZomaAuthorizationSignup(userId, { databricks, clientId: client.clientId })
+      : await admitZomaAuthorizationSignup(userId);
     if (admission === 'approved') return true;
     res.status(202).json(waitlistedResponse);
   } catch (error) {
