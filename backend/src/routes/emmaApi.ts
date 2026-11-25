@@ -992,12 +992,23 @@ router.post('/search-leads', async (req: Request, res: Response) => {
 });
 
 // ─── CRM (lead readback, ENG-3021) ──────────────────────────────────────────
-// Reads only: nothing in a lead or a list changes (an engagement read can store a fetched email body, a cache, in the event table). The same handlers Emma's get_leads / get_lead_details / get_lead_engagements / get_lead_list_statuses tools call, reachable
+// Reads only: nothing in a lead or a list changes (an engagement read can store a fetched email body, a cache, in the event table).
+// The same handlers Emma's get_leads / get_lead_details / get_lead_engagements / get_lead_list_statuses tools call, reachable
 // without a model run so a verifier can read stored fields (contactStatus and the
 // unsubscribe evidence) back. The caller is always the authenticated user; the
 // handlers enforce list access, so nothing here trusts an identity from the body.
 
 const isId = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+
+/**
+ * ENG-2840 (W2-5a): a caller may bound how many email bodies one history read fetches from the mail provider (`max_content_fetches`, a
+ * whole number 0 to 50). The MCP lead tools always send it; without it (Emma's own tools, the readback verifier) a read fetches every body
+ * that is not stored yet, as before. Anything else in that field is ignored, not clamped.
+ */
+const MAX_CONTENT_FETCHES_CEILING = 50;
+function contentFetchOptions(value: unknown): { maxContentFetches: number } | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= MAX_CONTENT_FETCHES_CEILING ? { maxContentFetches: value } : undefined;
+}
 
 router.post('/leads', async (req: Request, res: Response) => {
   const body = req.body ?? {};
@@ -1022,7 +1033,8 @@ router.post('/lead-details', async (req: Request, res: Response) => {
   if (!isId(body.list_id) || !isId(body.lead_id)) return res.status(400).json({ message: 'list_id and lead_id are required' });
   try {
     const svc = await getAgentModeService();
-    res.json(await svc.getLeadDetails(body.list_id, body.lead_id, userId(req)));
+    const options = contentFetchOptions(body.max_content_fetches);
+    res.json(options ? await svc.getLeadDetails(body.list_id, body.lead_id, userId(req), options) : await svc.getLeadDetails(body.list_id, body.lead_id, userId(req)));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -1035,7 +1047,9 @@ router.post('/lead-engagements', async (req: Request, res: Response) => {
   if (!isId(body.list_id) || !isId(body.lead_id)) return res.status(400).json({ message: 'list_id and lead_id are required' });
   try {
     const svc = await getAgentModeService();
-    res.json(await svc.getLeadEngagements(body.list_id, body.lead_id, userId(req), typeof body.limit === 'number' ? body.limit : undefined));
+    const limit = typeof body.limit === 'number' ? body.limit : undefined;
+    const options = contentFetchOptions(body.max_content_fetches);
+    res.json(options ? await svc.getLeadEngagements(body.list_id, body.lead_id, userId(req), limit, options) : await svc.getLeadEngagements(body.list_id, body.lead_id, userId(req), limit));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }

@@ -11062,8 +11062,8 @@ export class AgentModeService {
     return leadsImpl.searchLeads(listId, filters, userId, limit, options);
   }
 
-  public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
-    return leadsImpl.getLeadDetails(listId, leadId, userId);
+  public async getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number }): Promise<any> {
+    return options ? leadsImpl.getLeadDetails(listId, leadId, userId, options) : leadsImpl.getLeadDetails(listId, leadId, userId);
   }
 
   public async getLeadsNeedingFollowup(listId: string, userId: string, options: {
@@ -11137,8 +11137,8 @@ export class AgentModeService {
     return leadsImpl.deleteLeadList(listId, userId);
   }
 
-  public async getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number): Promise<any> {
-    return leadsImpl.getLeadEngagements(listId, leadId, userId, limit);
+  public async getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number, options?: { maxContentFetches?: number }): Promise<any> {
+    return options ? leadsImpl.getLeadEngagements(listId, leadId, userId, limit, options) : leadsImpl.getLeadEngagements(listId, leadId, userId, limit);
   }
 
   public async addLeadEngagement(

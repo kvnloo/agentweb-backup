@@ -1091,7 +1091,7 @@ function getEmailContentPreview(emailContent: any, maxLength: number): string | 
       : plainText;
   }
 
-export async function getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
+export async function getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number }): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
       const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
@@ -1182,7 +1182,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
       // Get engagement count and recent engagements
       const [engagementCount, engagementsResult] = await Promise.all([
         crmDb.getLeadEngagementCount(listId, leadId, userId),
-        crmDb.getLeadEngagements(listId, leadId, userId)
+        options ? crmDb.getLeadEngagements(listId, leadId, userId, options) : crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagements = engagementsResult.engagements || [];
       const customFields = lead.customFields || {};
@@ -2355,7 +2355,7 @@ export async function deleteLeadList(listId: string, userId: string): Promise<an
     }
   }
 
-export async function getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number): Promise<any> {
+export async function getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number, options?: { maxContentFetches?: number }): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
@@ -2387,7 +2387,7 @@ export async function getLeadEngagements(listId: string, leadId: string, userId:
           console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
           return null;
         }),
-        crmDb.getLeadEngagements(listId, leadId, userId)
+        options ? crmDb.getLeadEngagements(listId, leadId, userId, options) : crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagementCountAvailable = engagementCountResult !== null;
       const engagementCount: any = engagementCountResult || {};
