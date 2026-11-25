@@ -4671,28 +4671,52 @@ Typical prompts this answers:
  * a JSON-encoded array string, or a comma/semicolon/whitespace-separated
  * string — and return trimmed, non-empty strings.
  */
-export function normalizeRegistrationStatusEmails(raw: unknown): string[] {
-  let items: unknown[];
-  if (Array.isArray(raw)) {
-    items = raw;
-  } else if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    let parsed: unknown = undefined;
-    if (trimmed.startsWith('[')) {
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        parsed = undefined;
-      }
+const REGISTRATION_EMAIL_PATTERN = /[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/**
+ * ENG-3189: models pass `emails` as an array, a comma/space-separated string,
+ * a JSON-encoded array, display-name contacts ("Jane <jane@acme.com>"), or
+ * objects with an `email` field. Pull every address out of whatever shape
+ * arrived, and report entries that held no address instead of dropping them.
+ */
+export function extractRegistrationStatusEmails(raw: unknown): { emails: string[]; skipped: unknown[] } {
+  const emails: string[] = [];
+  const skipped: unknown[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (Array.isArray(value) && depth < 3) {
+      value.forEach((v) => visit(v, depth + 1));
+      return;
     }
-    items = Array.isArray(parsed) ? parsed : trimmed.split(/[\s,;]+/);
-  } else {
-    items = [];
-  }
-  return items
-    .filter((e): e is string => typeof e === 'string')
-    .map((e) => e.trim())
-    .filter((e) => e.length > 0);
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed.startsWith('[') && depth < 3) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            visit(parsed, depth + 1);
+            return;
+          }
+        } catch {
+          // fall through to address extraction
+        }
+      }
+      const found = trimmed.match(REGISTRATION_EMAIL_PATTERN);
+      if (found && found.length > 0) emails.push(...found);
+      else if (trimmed.length > 0) skipped.push(value);
+      return;
+    }
+    if (value && typeof value === 'object' && typeof (value as any).email === 'string') {
+      visit((value as any).email, depth + 1);
+      return;
+    }
+    if (value !== undefined && value !== null) skipped.push(value);
+  };
+  visit(raw, 0);
+  return { emails, skipped };
+}
+
+export function normalizeRegistrationStatusEmails(raw: unknown): string[] {
+  return extractRegistrationStatusEmails(raw).emails;
 }
 
 mcpToolRegistry.register({
@@ -4736,23 +4760,29 @@ Example:
     // JSON-encoded array, or an empty list. Coerce the recoverable shapes and
     // answer the unrecoverable one locally with an actionable message instead
     // of a round-trip that throws.
-    const emails = normalizeRegistrationStatusEmails(args?.emails ?? args?.email);
-    if (emails.length === 0) {
-      return {
-        ...jsonResult({
-          error:
-            'get_registration_status needs at least one email. Pass `emails` as an array of email strings, e.g. { "emails": ["lead1@acme.com", "lead2@acme.com"] }. If you have no lead emails yet, fetch them first (e.g. from the CRM leads list) instead of calling this tool.',
-        }),
-        isError: true,
-      };
-    }
+    const { emails, skipped } = extractRegistrationStatusEmails(args?.emails ?? args?.email);
+    const emptyMessage =
+      'get_registration_status needs at least one email. Pass `emails` as an array of email strings, e.g. { "emails": ["lead1@acme.com", "lead2@acme.com"] }. If you have no lead emails yet, fetch them first (e.g. from the CRM leads list) instead of calling this tool.';
 
-    const data = await mcpFetch({
-      method: 'POST',
-      path: '/api/crm/registration-status',
-      context: ctx(context),
-      body: { emails, includeChatSessionCount: args?.include_chat_session_count === true },
-    });
+    let data: any;
+    try {
+      // The empty case still goes to the route so its admin check answers first
+      // (non-admins get the 403, not an add-emails hint).
+      data = await mcpFetch({
+        method: 'POST',
+        path: '/api/crm/registration-status',
+        context: ctx(context),
+        body: { emails, includeChatSessionCount: args?.include_chat_session_count === true },
+      });
+    } catch (err: any) {
+      if (emails.length === 0 && /\(400\)/.test(String(err?.message ?? ''))) {
+        return { ...jsonResult({ error: emptyMessage, ...(skipped.length ? { skipped } : {}) }), isError: true };
+      }
+      throw err;
+    }
+    if (skipped.length > 0 && data && typeof data === 'object' && !Array.isArray(data)) {
+      data = { ...data, skipped, skippedNote: 'These entries held no email address and were not checked.' };
+    }
     return jsonResult(data);
   },
 });

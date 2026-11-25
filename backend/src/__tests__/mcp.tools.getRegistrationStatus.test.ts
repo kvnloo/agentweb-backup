@@ -135,14 +135,35 @@ describe('get_registration_status', () => {
     });
 
     it.each([
+      ['display-name contact', 'Jane Doe <a@x.com>, b@x.com'],
+      ['quoted list typed as text', '"a@x.com", "b@x.com"'],
+      ['object entries', [{ email: 'a@x.com' }, 'b@x.com']],
+    ])('extracts only the addresses from a %s', async (_label, raw) => {
+      await mcpToolRegistry.execute('get_registration_status', { emails: raw }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(
+        expect.objectContaining({ body: { emails: ['a@x.com', 'b@x.com'], includeChatSessionCount: false } }),
+      );
+    });
+
+    it('reports entries that held no address instead of dropping them silently', async () => {
+      const result: any = await mcpToolRegistry.execute('get_registration_status', { emails: ['a@x.com', { id: 1 }] }, context);
+      expect(JSON.parse(result.content[0].text).skipped).toEqual([{ id: 1 }]);
+    });
+
+    it.each([
       ['empty array', []],
       ['blank strings only', ['  ', '']],
       ['missing emails', undefined],
-    ])('returns an actionable error without calling the API for %s', async (_label, raw) => {
+    ])('turns the route 400 into an actionable error for %s', async (_label, raw) => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (400): Invalid body. Required: emails (non-empty array of strings)'));
       const result: any = await mcpToolRegistry.execute('get_registration_status', { emails: raw }, context);
-      expect(mockMcpFetch).not.toHaveBeenCalled();
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('needs at least one email');
+    });
+
+    it('lets the admin 403 through for a non-admin with an empty list', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (403): Admin access required'));
+      await expect(mcpToolRegistry.execute('get_registration_status', { emails: [] }, context)).rejects.toThrow('403');
     });
   });
 });
