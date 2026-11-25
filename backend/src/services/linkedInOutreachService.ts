@@ -1701,7 +1701,7 @@ export class LinkedInOutreachService {
           },
         },
       });
-      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id, adapter: 'linkedin:inmail' });
+      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id ?? undefined, adapter: 'linkedin:inmail' });
       this.log(`InMail sent successfully`, { accountId, providerId });
       return res;
     } catch (error: any) {
@@ -1728,7 +1728,7 @@ export class LinkedInOutreachService {
         attendees_ids: [providerId],
         text: messageText
       });
-      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id, adapter: 'linkedin:message' });
+      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id ?? undefined, adapter: 'linkedin:message' });
       this.log(`Message sent successfully`, { accountId, providerId });
       return res;
     } catch (error: any) {
