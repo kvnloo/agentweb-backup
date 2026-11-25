@@ -14,6 +14,8 @@ const mockListTools = jest.fn();
 const mockGetServerConfig = jest.fn();
 // 'die' = the child process exits while the client is connecting: the SDK forgets the transport and connect rejects.
 let mockConnectMode: 'ok' | 'die' = 'ok';
+// true = the browser server exits by itself during the call, so the client has already forgotten its transport when the caller closes it.
+let mockForgetTransportDuringCall = false;
 
 jest.mock('../services/settingsService', () => ({ settingsService: { getSetting: jest.fn().mockResolvedValue(null) } }));
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
@@ -45,7 +47,10 @@ jest.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
         }
       }),
       listTools: (...args: any[]) => mockListTools(...args),
-      callTool: (...args: any[]) => mockCallTool(...args),
+      callTool: (...args: any[]) => {
+        if (mockForgetTransportDuringCall) client._transport = undefined;
+        return mockCallTool(...args);
+      },
       close: jest.fn().mockImplementation(async () => { client._transport = undefined; }),
     };
     return client;
@@ -82,6 +87,7 @@ describe('Playwright MCP containment (ENG-3187)', () => {
     jest.clearAllMocks();
     mockAssertPublic.mockResolvedValue(undefined);
     mockConnectMode = 'ok';
+    mockForgetTransportDuringCall = false;
     mockGetServerConfig.mockReset();
     mockStdio.mockImplementation(() => ({ onclose: null, onerror: null }));
     Object.assign(process.env, SECRETS);
@@ -275,7 +281,7 @@ describe('Playwright MCP containment (ENG-3187)', () => {
       const client = (service as any).sessionClientPools.get(poolKey).clients.get('playwright');
       const dir = folderOf(poolKey);
       const transport = client._transport;
-      client._transport = undefined; // what the SDK does on this event, before our own handler runs
+      client._transport = undefined; // the worst order: the SDK client has already forgotten its transport when our handler runs
       transport.onclose();
       expect(fs.existsSync(dir)).toBe(false);
       expect((service as any).sessionClientPools.get(poolKey).clients.has('playwright')).toBe(false);
@@ -449,6 +455,7 @@ describe('Playwright MCP containment (ENG-3187)', () => {
     });
 
     it('callToolDirect removes the browser server\'s folder when it is done, although the client forgot its transport', async () => {
+      mockForgetTransportDuringCall = true;
       mockGetServerConfig.mockResolvedValue(PLAYWRIGHT_CONFIG);
       await service.callToolDirect('playwright', 'browser_snapshot', {});
       expect(liveFolders()).toEqual([]);
@@ -464,7 +471,8 @@ describe('Playwright MCP containment (ENG-3187)', () => {
       expect(mockCallTool.mock.calls[0][0]).toEqual({ name: 'browser_file_upload', arguments: { paths: ['x'] } });
     });
 
-    it('withServerSession removes the browser server\'s folder when the session ends', async () => {
+    it('withServerSession removes the browser server\'s folder when the session ends, although the client forgot its transport', async () => {
+      mockForgetTransportDuringCall = true;
       mockGetServerConfig.mockResolvedValue(PLAYWRIGHT_CONFIG);
       await service.withServerSession('playwright', async (callTool) => { await callTool('browser_snapshot', {}); });
       expect(liveFolders()).toEqual([]);

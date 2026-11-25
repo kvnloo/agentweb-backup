@@ -283,6 +283,22 @@ describe('browserNavigationRefusal', () => {
     expect(await navigate('https://fine.example/', { assertPublic: publicOk, maxConcurrentChecks: 1, log: noLog })).toBeNull();
   });
 
+  it('waits for at most 8 host checks at once by default', async () => {
+    const hangs = jest.fn().mockImplementation(() => new Promise<void>(() => undefined));
+    const waiting = Array.from({ length: 8 }, (_, i) => navigate(`https://slow-${i}.example/`, { assertPublic: hangs, timeoutMs: 60, log: noLog }));
+    expect(await navigate('https://ninth.example/', { assertPublic: publicOk, log: noLog })).toMatch(/could not check that address just now/);
+    expect(publicOk).not.toHaveBeenCalled();
+    await Promise.all(waiting);
+    expect(await navigate('https://after.example/', { assertPublic: publicOk, log: noLog })).toBeNull();
+  });
+
+  it('gives the slot back when the host check throws before it returns anything', async () => {
+    const throwsAtOnce = jest.fn().mockImplementation(() => { throw new Error('boom'); });
+    expect(await navigate('https://one.example/', { assertPublic: throwsAtOnce, maxConcurrentChecks: 1, log: noLog })).toMatch(/cannot open internal/);
+    expect(await navigate('https://two.example/', { assertPublic: throwsAtOnce, maxConcurrentChecks: 1, log: noLog })).toMatch(/cannot open internal/);
+    expect(await navigate('https://three.example/', { assertPublic: publicOk, maxConcurrentChecks: 1, log: noLog })).toBeNull();
+  });
+
   it('refuses an unexpected failure of the host check (it fails closed)', async () => {
     const broken = jest.fn().mockRejectedValue(new Error('boom'));
     expect(await navigate('https://example.com/', { assertPublic: broken, log: noLog })).toMatch(/cannot open internal/);
