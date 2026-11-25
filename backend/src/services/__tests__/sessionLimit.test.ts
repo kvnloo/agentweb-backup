@@ -12,6 +12,7 @@ import {
   type SessionLimitTracker,
 } from '../sessionLimit';
 import { describeScheduledRunFailureReasons } from '../../utils/scheduledRunFailureReasons';
+import { hasUnresolvedMediaDeferral } from '../../utils/timeoutContinuation';
 
 const SESSION = 'sess-runaway';
 
@@ -243,5 +244,14 @@ describe('scheduled run failure reasons', () => {
     expect(describeScheduledRunFailureReasons({ terminationReason: 'session_limit' } as any)).toEqual([
       'paused at the session turn/spend limit; waiting for someone to reply "continue" in the session',
     ]);
+  });
+});
+
+describe('media reopen backstop', () => {
+  it('does not resume a deferral listed on a session-limit pause message', () => {
+    const deferred = { name: 'generate_video', result: { mediaBudgetDeferred: true } };
+    const base = { role: 'assistant', content: 'x', metadata: { toolCalls: [deferred] } } as any;
+    expect(hasUnresolvedMediaDeferral([{ ...base, metadata: { ...base.metadata, mediaBudgetDeferred: true } }])).toBe(true);
+    expect(hasUnresolvedMediaDeferral([{ ...base, metadata: { mediaBudgetDeferred: true, sessionLimitPaused: { turns: 150 } } }])).toBe(false);
   });
 });
