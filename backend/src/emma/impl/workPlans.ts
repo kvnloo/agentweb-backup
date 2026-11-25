@@ -1585,6 +1585,8 @@ async function setWorkPlanStatusAttempt(
   };
 }
 
+import { recordSuccessfulSend } from '../../services/sentMessageShadow';
+
 export async function sendForReview(
   subject: string,
   sessionId: string,
@@ -1639,7 +1641,7 @@ export async function sendForReview(
       const leadEmailHtml = buildResultDeliveryEmailHtml({ resultLabel, replyTo: replyToAddr, assetUrl });
 
       const leadSubject = (metadata.contentSubject || `Your ${resultLabel} is ready`).replace(/[\r\n]+/g, ' ');
-      await resendSvc.sendEmail({
+      const deliveryResult = await resendSvc.sendEmail({
         from: `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`,
         to: metadata.leadEmail,
         subject: leadSubject,
@@ -1647,6 +1649,10 @@ export async function sendForReview(
         cc: reviewerEmail,
         replyTo: replyToAddr,
       });
+
+      if (deliveryResult?.id) {
+        recordSuccessfulSend({ channel: 'email', userId, recipients: [metadata.leadEmail, reviewerEmail].filter((v): v is string => !!v), providerId: deliveryResult.id, adapter: 'workPlan:skipReview' });
+      }
 
       // Record in send history
       const sendHistoryEntry = {
