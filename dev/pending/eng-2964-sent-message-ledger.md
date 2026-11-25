@@ -1,9 +1,8 @@
-## ENG-2964: permanent sent-message ledger foundation, dark draft (2026-11-24)
+## ENG-2964: permanent sent-message records, production shadow
 
-- Adds an explicitly constructed (not activated) DynamoDB ledger with org partition, permanent
-  recipient/campaign/step conditional claims and atomic sent-history finalization.
-- Unknown provider outcomes never auto-retry; permanent claims have no TTL or lease expiry.
-- Standalone review-only CloudFormation template adds an on-demand orgId/sk table with PITR,
-  SSE, deletion protection and Retain. Not applied or linked to deployment; no production tables created.
-- docs/eng-2964-sent-message-ledger.md records schema, safety invariants, rollout and remaining
-  integrations/cooldown/reconciliation work. Existing send paths are unchanged.
+- Created production AW-SentMessages via standalone CloudFormation, us-west-2, PITR/SSE/Retain.
+- Success-only detached recording at sendAsSender and LinkedIn message/InMail; default shadow,
+  SENT_MESSAGE_LEDGER_MODE=off rolls recording back without deleting history. Never blocks sends.
+- Original conditional-claim enforcement service remains dark. Direct provider bypasses and
+  LinkedIn org attribution remain gaps before enforcement. Review readiness after ~3 clean days.
+- Scoped Jest 31/31 pass; docs/eng-2964-sent-message-ledger.md describes remaining work.

@@ -16,22 +16,23 @@ Partition key `orgId`, sort key `sk`. No TTL, indexes, streams, backfill, or aut
   success-finalization write leaves claimed blocking. Reconcile against provider before any release.
 - No content/body stored. Recipient and campaign metadata remain sensitive; restrict IAM to backend.
 
-## Exact IaC proposal (NOT applied)
-`infra/sent-messages.yaml` declares AWS::DynamoDB::Table with orgId/sk string keys, on-demand billing,
-AWS-managed SSE, PITR, deletion protection, Retain for deletion/replacement, and no TTL or GSI.
-Default name is development; production would explicitly set TableName=AW-SentMessages after approval.
-The template is standalone and is not wired into any deployment. No production table has been created.
-Future integration must grant only required GetItem/PutItem/UpdateItem/Query access
-on the exact table ARN, without scan/delete, and configure an explicit table name in backend.
-DynamoDB authorizes transaction members through their underlying PutItem/UpdateItem permissions,
-not a separate TransactWriteItems IAM action ([AWS reference](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html)).
+## Applied production shadow rollout
+`infra/sent-messages.yaml` was deployed as `agentweb-sent-messages-prod` in us-west-2 with
+TableName=AW-SentMessages after engineering approval. Table is ACTIVE with PITR, SSE,
+deletion protection and Retain. Production instance role has PutItem on the exact table ARN
+through its existing inline policy. No new IAM policy was created.
 
-## Delivered in this draft
-An injected DocumentClient service implements durable pre-send conditional claim, provider key,
-fail-closed ambiguity, and atomic permanent record finalization. No existing outbound path is changed.
-This is a storage foundation, **not completion of the entire ENG-2964 universal guard**.
+`recordSuccessfulSend` observes successful sendAsSender (Resend/Gmail/Outlook) and LinkedIn
+sendMessage/sendInMail dispatches. SENT_MESSAGE_LEDGER_MODE defaults to shadow; off disables
+recording. Writes are detached, success-only and fail-open. No blocking claims or provider-key
+changes are activated. Email resolves org from user, falling back to labelled user scope;
+LinkedIn uses labelled account scope pending server org attribution. Direct-provider bypasses
+remain a coverage gap. No message body is stored.
 
-## Remaining before rollout/merge
+The original injected enforcement service remains dark. DynamoDB transaction members require
+underlying PutItem/UpdateItem permissions; no TransactWriteItems IAM action exists.
+
+## Remaining before enforcement
 1. Review/approve persistence design and IaC; provision development and run real Dynamo concurrency tests.
 2. Wire server-resolved org + stable intent across sendAsSender, work-plan delivery, drip, LinkedIn
    message/InMail; preserve keys through provider adapters. Define explicit one-off send intents.
@@ -43,5 +44,6 @@ This is a storage foundation, **not completion of the entire ENG-2964 universal 
    then mistake those claims for delivery. Enforce only after approval and negative/concurrency tests.
 6. Real Dynamo transaction conditions and integration tests; mocked tests are not AWS acceptance.
 
-Rollback before activation: remove module/template (no runtime change). After activation: disable
-routing to ledger only after assessing duplicate risk; retain table/history, never delete as rollback.
+Rollback shadow recording: set SENT_MESSAGE_LEDGER_MODE=off and retain the table/history.
+Review enforcement readiness after approximately three clean days; an enforce flag is deliberately
+not implemented in the observational adapter and must not be enabled without the remaining guards.
