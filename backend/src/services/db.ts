@@ -11480,6 +11480,101 @@ export const crmDb = {
   },
 
   /**
+   * ENG-2984: atomically claims a lead's stored email draft for sending. The draft itself is NOT
+   * removed (a crash/deploy mid-send must not lose it); instead a send-claim timestamp is set ONLY
+   * while the draft still equals `expectedDraft` and no fresh claim exists. Of two concurrent
+   * senders exactly one wins; the loser gets false and must not send. A claim older than
+   * `leaseMs` is treated as abandoned (crashed sender) so the user can retry. Touches only
+   * `emailDraftSendClaimedAt` (no updatedAt, so no GSI re-projection).
+   */
+  async claimLeadEmailDraft(
+    listId: string,
+    leadId: string,
+    expectedDraft: Record<string, unknown>,
+    leaseMs: number = 5 * 60 * 1000,
+  ): Promise<string | null> {
+    const now = Date.now();
+    // Ownership token: ISO timestamp prefix keeps the lexicographic stale-lease comparison
+    // valid; the random suffix lets release() remove only this caller's claim.
+    const token = `${new Date(now).toISOString()}#${randomUUID()}`;
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'SET emailDraftSendClaimedAt = :now',
+        ConditionExpression:
+          'emailDraft = :expected AND (attribute_not_exists(emailDraftSendClaimedAt) OR emailDraftSendClaimedAt < :staleBefore)',
+        ExpressionAttributeValues: {
+          ':expected': expectedDraft,
+          ':now': token,
+          ':staleBefore': new Date(now - leaseMs).toISOString(),
+        },
+      }).promise();
+      return token;
+    } catch (err) {
+      if (isConditionalFailure(err)) return null;
+      handleDynamoDbError(err, 'claimLeadEmailDraft');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: after a successful send, clears the draft and the send-claim in ONE conditional
+   * write — only while the claim still holds the caller's token AND the stored draft still equals
+   * the draft that was sent. Returns false (nothing written) otherwise, so a draft replaced
+   * mid-send or a replacement sender's claim is never removed.
+   */
+  async completeLeadEmailDraftSend(
+    listId: string,
+    leadId: string,
+    token: string,
+    sentDraft: Record<string, unknown>,
+  ): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        // No updatedAt: changing the GSI range key re-projects the sparse lookup indexes, which
+        // fails on legacy rows carrying "" index keys (see updateLead's self-heal). Bookkeeping
+        // only, like claimLeadEmailDraft.
+        UpdateExpression: 'SET emailDraft = :null REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token AND emailDraft = :sent',
+        ExpressionAttributeValues: {
+          ':null': null,
+          ':token': token,
+          ':sent': sentDraft,
+        },
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'completeLeadEmailDraftSend');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: releases a send-claim (after a failed send, or after a successful send has cleared
+   * the draft). Removes the claim only while it still holds the caller's token, so a sender whose
+   * lease expired cannot drop a replacement sender's claim. Idempotent; a mismatch is a no-op.
+   */
+  async releaseLeadEmailDraftClaim(listId: string, leadId: string, token: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token',
+        ExpressionAttributeValues: { ':token': token },
+      }).promise();
+    } catch (err) {
+      if (isConditionalFailure(err)) return;
+      handleDynamoDbError(err, 'releaseLeadEmailDraftClaim');
+      throw err;
+    }
+  },
+
+  /**
    * Conditional patch of the object record at `lead.system[key]`, applied in ONE UpdateItem. Returns
    * false (nothing written) when ANY condition fails, so a replayed or out-of-order caller is a clean
    * no-op rather than a partial write:
