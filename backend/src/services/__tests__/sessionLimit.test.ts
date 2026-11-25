@@ -308,22 +308,26 @@ describe('the visitor flag reaches the session limit (wiring)', () => {
     const src = read('../agentModeService.ts');
     const call = src.slice(src.indexOf('await startSessionLimitForRun({'));
     const args = call.slice(0, call.indexOf('});'));
-    expect(args).toMatch(/isShareVisitor:\s*isInteractiveShare\s*===\s*true/);
+    // Anchored at the start of a line: a commented-out `// isShareVisitor: ...` must not satisfy it.
+    expect(args).toMatch(/^[ \t]+isShareVisitor:\s*isInteractiveShare\s*===\s*true,/m);
   });
 
-  it('isInteractiveShare crosses the worker boundary: declared, sent by the controller, unpacked and forwarded by the worker', () => {
+  it('isInteractiveShare crosses the worker boundary: declared, sent by the controller, unpacked, and passed in its POSITION', () => {
     expect(read('../generateMarketingResponseWorkerService.ts')).toMatch(/isInteractiveShare\?:\s*boolean/);
     const controller = read('../../controllers/agentModeController.ts');
     const payload = controller.slice(controller.indexOf('runInWorker('), controller.indexOf('runInWorker(') + 900);
-    expect(payload).toContain('isInteractiveShare: isInteractiveShare || false');
+    expect(payload).toMatch(/^[ \t]+isInteractiveShare: isInteractiveShare \|\| false,/m);
     const worker = read('../../workers/generateMarketingResponseWorker.ts');
     expect(worker).toMatch(/const\s*\{[^}]*\bisInteractiveShare\b[^}]*\}\s*=\s*message\.params/);
-    const call = worker.slice(worker.indexOf('generateMarketingResponse('));
-    expect(call.slice(0, call.indexOf(');'))).toContain('isInteractiveShare');
+    // The worker's argument list comes off `any`, so its ORDER is not type-checked: pin it, on both sides of the call.
+    const call = worker.slice(worker.indexOf('agentModeService.generateMarketingResponse('));
+    expect(call.slice(0, call.indexOf(');'))).toMatch(/^[ \t]+mockMode,\s*onProgress,\s*socketEmit,\s*isInteractiveShare,\s*isCancelled,/m);
+    const service = read('../agentModeService.ts');
+    expect(service).toMatch(/mockMode: boolean = false,\s*onProgress\?:[^\n]*\n\s*socketEmit\?:[^\n]*\n\s*isInteractiveShare: boolean = false,\s*isCancelled\?:/);
   });
 
-  it('the share route passes isInteractiveShare = "not the owner", so the owner on their own link is not treated as a visitor', () => {
+  it('the share route passes isInteractiveShare = "not the owner" in its slot, so the owner on their own link is not treated as a visitor', () => {
     const controller = read('../../controllers/agentModeController.ts');
-    expect(controller).toMatch(/!viewerIsOwner,\s*\/\/ isInteractiveShare/);
+    expect(controller).toMatch(/^[ \t]+modelToUse,\s*attachments,\s*!viewerIsOwner,\s*\/\/ isInteractiveShare/m);
   });
 });
