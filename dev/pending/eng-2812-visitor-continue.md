@@ -7,10 +7,10 @@ Follow-up to the per-session turn/spend limit (PR #4242).
 **What changed**
 - A visitor's turn never opens a new window, whatever the word ("continue", "yes", "keep going"...). The owner on the same session still can, also from their own share link.
 - A visitor on a paused session gets: "This shared chat has reached its usage limit. Ask the person who shared it to continue it."
-- A visitor never sees the 75% / 90% notices (their advice, "start a new session", means nothing to them), and their turns do not claim a notice, so the owner's next turn still gets it.
+- A visitor's own turns never show the 75% / 90% notices (their advice, "start a new session", means nothing to them), and those turns do not claim a notice, so the owner's next turn still gets it. A visitor can still read a notice or pause text the OWNER's turn stored earlier in the shared transcript. The cost: an owner who is away gets no warning before the window fills (the pause text is the warning).
 - Owner decision (2026-11-25): the pause text carries no numbers (no step count, no dollar figure): "This session has reached its usage limit. Reply "continue" to keep going in this session, or start a new session." The exact usage is still logged (`session_limit_paused`) and stored on the message (`sessionLimitPaused`).
 
-**Which signal.** `isInteractiveShare`, the flag the share route already passes (`!viewerIsOwner`, so false for the owner on their own link). It crosses the worker boundary (controller payload, worker entry, `generateSessionResponse`). The in-process `isShareVisitorTurn` marker was NOT used on purpose: replies are generated in a forked worker, where that set is empty.
+**Which signal.** `isInteractiveShare`, the flag the share route already passes (`!viewerIsOwner`, so false for the owner on their own link). It crosses the worker boundary (controller payload, worker entry, then positional argument 9 of `generateMarketingResponse`, which is the function that runs in the worker). The in-process `isShareVisitorTurn` marker was NOT used on purpose: replies are generated in a forked worker, where that set is empty.
 
 **Limits (not changed here)**
 - Slack sessions and MCP agents: a "continue" typed there is judged by its text only (as before).
