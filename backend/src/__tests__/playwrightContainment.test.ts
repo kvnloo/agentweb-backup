@@ -115,8 +115,16 @@ describe('working folder names and abandoned folders', () => {
     expect(playwrightWorkDirPrefix('playwright')).toBe(`${process.pid}-playwright-`);
   });
 
-  it('never calls this process\'s own folder abandoned, however old', () => {
-    expect(isAbandonedPlaywrightWorkDir('100-a-xyz', now - 30 * DAY, now, 100, () => false)).toBe(false);
+  it('never calls a folder this process knows abandoned, however old', () => {
+    expect(isAbandonedPlaywrightWorkDir('100-a-xyz', now - 30 * DAY, now, 100, () => false, new Set(['100-a-xyz']), now - DAY)).toBe(false);
+  });
+
+  it('never calls a folder this process made since it started abandoned, even if it does not know it', () => {
+    expect(isAbandonedPlaywrightWorkDir('100-a-xyz', now - 1000, now, 100, () => false, new Set(), now - DAY)).toBe(false);
+  });
+
+  it('calls a folder named for this process id abandoned when it is older than this process and unknown to it (a restart in a container reuses the id)', () => {
+    expect(isAbandonedPlaywrightWorkDir('100-a-xyz', now - 2 * DAY, now, 100, () => true, new Set(), now - DAY)).toBe(true);
   });
 
   it('never calls a live process\'s folder abandoned, however old (the folder\'s own modification time does not move while the browser works)', () => {
@@ -261,6 +269,18 @@ describe('browserNavigationRefusal', () => {
     const started = Date.now();
     expect(await navigate('https://slow.example/', { assertPublic: hangs, timeoutMs: 25, log: noLog })).toMatch(/could not check that address just now/);
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('does not let a burst of checks that never answer hold every lookup thread: past the limit the address is refused as not checkable, and the room comes back', async () => {
+    const hangs = jest.fn().mockImplementation(() => new Promise<void>(() => undefined));
+    const lines: string[] = [];
+    const first = navigate('https://slow-1.example/', { assertPublic: hangs, timeoutMs: 40, maxConcurrentChecks: 1, log: noLog });
+    const second = await navigate('https://slow-2.example/', { assertPublic: publicOk, maxConcurrentChecks: 1, log: (line) => lines.push(line) });
+    expect(second).toMatch(/could not check that address just now/);
+    expect(JSON.parse(lines[0])).toMatchObject({ reason: 'unresolved' });
+    expect(publicOk).not.toHaveBeenCalled();
+    expect(await first).toMatch(/could not check that address just now/);
+    expect(await navigate('https://fine.example/', { assertPublic: publicOk, maxConcurrentChecks: 1, log: noLog })).toBeNull();
   });
 
   it('refuses an unexpected failure of the host check (it fails closed)', async () => {
