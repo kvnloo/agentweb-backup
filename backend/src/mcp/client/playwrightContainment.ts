@@ -117,8 +117,9 @@ const REFUSAL_UNRESOLVED = 'The browser could not check that address just now (i
 const HOST_CHECK_TIMEOUT_MS = 5000;
 
 /**
- * How many host checks may be waiting at once. A name lookup holds one of the process's few lookup threads until it answers, so a burst of navigates
- * to names that never answer must not starve the rest of the backend; past this many, the address is refused as "could not check just now".
+ * How many host checks may be waiting at once. It bounds the work a burst of navigates to names that never answer can queue; past this many, the address
+ * is refused as "could not check just now". It is not a guarantee for the process's few lookup threads: a lookup holds one until the resolver returns,
+ * which can be longer than the 5 s the check waits, so such a burst can still delay other lookups for a few seconds. Global, not per user.
  */
 const MAX_CONCURRENT_HOST_CHECKS = 8;
 let activeHostChecks = 0;
