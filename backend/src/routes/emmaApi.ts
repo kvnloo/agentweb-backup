@@ -992,7 +992,7 @@ router.post('/search-leads', async (req: Request, res: Response) => {
 });
 
 // ─── CRM (lead readback, ENG-3021) ──────────────────────────────────────────
-// Read-only. The same handlers Emma's get_leads / get_lead_details / get_lead_engagements / get_lead_list_statuses tools call, reachable
+// Reads only: nothing in a lead or a list changes (an engagement read can store a fetched email body, a cache, in the event table). The same handlers Emma's get_leads / get_lead_details / get_lead_engagements / get_lead_list_statuses tools call, reachable
 // without a model run so a verifier can read stored fields (contactStatus and the
 // unsubscribe evidence) back. The caller is always the authenticated user; the
 // handlers enforce list access, so nothing here trusts an identity from the body.

@@ -2,9 +2,11 @@
  * ENG-2840 (W2-5a): three lead reads that Emma has and the MCP server did not: `get_lead_details`, `get_lead_engagements` and
  * `get_lead_list_statuses`.
  *
- * `manage_leads get` returns the stored lead. Emma's `get_lead_details` returns more: an engagement summary, the recent engagements, the
- * LinkedIn connection status, and it finds the lead when the list id is stale. `get_lead_engagements` (the full history of one lead) and
- * `get_lead_list_statuses` (the pipeline stages, including the default a list that never stored its own uses) have no MCP twin at all.
+ * `manage_leads get` returns the stored lead (including its pipeline status and deal value). Emma's `get_lead_details` returns a different
+ * projection: the profile, drafts, opt-out state, enrichment sources, an engagement summary, the recent engagements and the LinkedIn
+ * connection status (no pipeline status, no deal value), and it finds the lead when the list id is stale but the list itself exists and is
+ * accessible. `get_lead_engagements` (the history of one lead; no stale-list recovery) and `get_lead_list_statuses` (the pipeline stages,
+ * including the default a list that never stored its own uses) have no MCP twin at all.
  *
  * Same pattern as the other wave-2 tools: the handler checks the arguments by NAME (the MCP path validates nothing against the input
  * schema) and then calls the portal's own route through `mcpFetch`, as the key's own user. The route's guard (`canOrgMemberAccessList`: the
@@ -13,16 +15,25 @@
  *
  * One thing differs from the CRM routes: `/api/emma/*` answers a refusal as HTTP 200 with `{ success: false, message }` (Emma's own tools
  * read it that way). `mcpFetch` would pass that on as data, and an agent must never read "Access denied" as an answer, so `requireSuccess`
- * turns it into an error. The route's `error` field is not repeated: on an internal failure it holds the raw exception text.
+ * turns it into an error. The route's `error` field is not repeated: on an internal failure it holds the raw exception text. A 5xx from the
+ * route itself (its catch-all answers with the exception's message) is replaced by a fixed text for the same reason; a 4xx (a 429 for an
+ * account over its monthly quota, a 400 for a missing id) carries the route's own short words and passes through.
  *
  * Not offered, on purpose (W2-5a design, brain `eng-2840-w25a-lead-reads-design-2026-11-25.md`): `get_hot_leads`,
  * `get_leads_needing_followup`, `get_lead_conversation_statuses` (each reloads the whole email history of the account's domain per call),
  * `analyze_crm_data` and `ask_crm` (they spend the platform's model key), `log_contact_event` (it writes to a global table keyed by an email
  * taken from the argument, with no ownership check).
  *
- * "Read" is meant as: nothing in the lead changes. The first read of an email's content can fetch it from the mail provider and store it
- * (a cache), and `get_lead_details` can check a connected LinkedIn account. That is why these tools are not flagged `readOnly`: a key that
- * holds only `tools:read` cannot call them, the same as `manage_leads` and `search_leads`.
+ * "Read" is meant as: nothing in the lead or the list changes. The first read of a lead's history fetches, for every email event of that lead
+ * that has no content stored yet, the content from the mail provider (all at once, with the platform's key) and stores it as a cache, and
+ * `get_lead_details` can check a connected LinkedIn account. Those costs are Emma's and the portal's own, now reachable by a key; the key's
+ * rate limit and the monthly token quota are the only bounds. That is why these tools are not flagged `readOnly`: a key that holds only
+ * `tools:read` cannot call them, the same as `manage_leads` and `search_leads`.
+ *
+ * Known limit, inherited from the data layer (`crmDb.getLeadEngagements`, `getLeadEngagementCount`): email events are looked up through the
+ * account's single legacy `emailDomain` setting. An account whose sending domain is stored only in `emailDomains[]`, or that sends from a
+ * connected mailbox, gets no email events here (LinkedIn and hand-recorded events are always included), so an empty history is not proof that a
+ * lead was never emailed. The descriptions say so.
  */
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
@@ -105,7 +116,15 @@ export function requireSuccess(tool: string, answer: unknown): Record<string, un
 }
 
 async function run(tool: string, request: LeadReadRequest, context: any): Promise<unknown> {
-  const answer = await mcpFetch({ method: 'POST', path: request.path, context: ctx(context), body: request.body });
+  let answer: unknown;
+  try {
+    answer = await mcpFetch({ method: 'POST', path: request.path, context: ctx(context), body: request.body });
+  } catch (err: any) {
+    // the route's catch-all answers a 5xx with the exception's own message; the agent gets a fixed text instead
+    const status = /^API error \((5\d\d)\)/.exec(String(err?.message ?? ''))?.[1];
+    if (status) refuse(tool, `the CRM could not answer (HTTP ${status}). Try again later; nothing was changed.`);
+    throw err;
+  }
   return jsonResult(requireSuccess(tool, answer));
 }
 
@@ -114,11 +133,13 @@ mcpToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'get_lead_details',
-    description: 'Everything about one lead: contact and company fields, status, deal value, ICP match, attribution, a count of its engagements, its 10 most recent engagements and its LinkedIn connection status. '
-      + 'Use it instead of manage_leads get when you need the engagement picture; manage_leads get returns the stored fields only. '
-      + 'list_id and lead_id come from manage_leads list or search_leads. If the lead is not in list_id but is in another list you can access, it is returned with a note naming the right list. '
-      + 'Reading never changes the lead; the first read of an email can fetch its content from the mail provider and store it, and a LinkedIn lead can trigger a check of the connected account. '
-      + 'Any other argument is refused by name.',
+    description: 'One lead\'s profile and engagement picture: name, email, phone, company, title, LinkedIn, notes, custom fields, ICP match, attribution, opt-out state, email and message drafts, enrichment sources, its LinkedIn connection status, engagement counts and its 10 most recent engagements. '
+      + 'It does NOT return the pipeline status or the deal value: read those with manage_leads get. '
+      + 'list_id and lead_id come from manage_leads list or search_leads. If the lead is not in list_id but is in another list you can access, it is returned with a note naming the right list (list_id itself must exist and be one you can access). '
+      + 'engagementSummary.total and last7Days count messages SENT; totalAllMessages counts every event. '
+      + "Email events are found through the account's sending-domain setting: an account that sends from a connected mailbox, or has no sending domain set that way, shows no email events here, so an empty history does not prove a lead was never emailed. "
+      + "Reading never changes the lead; a first read of a lead's history fetches the content of every email event that has none stored yet from the mail provider, all at once, and stores it, and a LinkedIn lead can trigger a check of the connected account. "
+      + 'Any other argument is refused by name (userId, sessionId and llmModel are ignored by the server).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -138,9 +159,12 @@ mcpToolRegistry.register({
     name: 'get_lead_engagements',
     description: 'The engagement history of one lead, newest first: emails sent and received, LinkedIn messages, and the calls, meetings and notes recorded by hand. '
       + `limit is a whole number from 1 to ${ENGAGEMENTS_MAX_LIMIT} (default ${ENGAGEMENTS_DEFAULT_LIMIT}). `
-      + 'Each event has eventType, createdAt, eventData and, for an email, a preview of its first 200 characters. engagementSummary holds the counts (total, last 7 days), so a page that is shorter than the total is not read as the whole history. '
-      + 'list_id and lead_id come from manage_leads list or search_leads. Reading never changes the lead; the first read of an email can fetch its content from the mail provider and store it. '
-      + 'Any other argument is refused by name.',
+      + 'Each event has eventType, createdAt, eventData and, for an email, a preview of its first 200 characters. '
+      + 'To tell whether the page is the whole history, read message (it says "Showing the first N of M" when the page was cut) or engagementSummary.totalAllMessages; engagementSummary.total and last7Days count messages SENT only. '
+      + "Email events are found through the account's sending-domain setting: an account that sends from a connected mailbox, or has no sending domain set that way, shows no email events here, so an empty history does not prove a lead was never emailed. "
+      + 'list_id and lead_id come from manage_leads list or search_leads; a list_id that does not contain the lead is refused here (get_lead_details finds a lead in another of your lists). '
+      + "Reading never changes the lead; a first read of a lead's history fetches the content of every email event that has none stored yet from the mail provider, all at once, and stores it, and a LinkedIn lead can trigger a check of the connected account. "
+      + 'Any other argument is refused by name (userId, sessionId and llmModel are ignored by the server).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -159,8 +183,8 @@ mcpToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'get_lead_list_statuses',
-    description: 'The pipeline stages a lead list uses (the values a lead\'s status takes), with the list name. A list that never stored its own stages answers with the default for its type, which create_lead_list get does not show. '
-      + 'list_id comes from list_lead_lists. Any other argument is refused by name.',
+    description: 'The pipeline stages a lead list is set up with, and the list name. A list that never stored its own stages answers with the default for its type, which create_lead_list get does not show. '
+      + 'list_id comes from list_lead_lists. ' + 'Any other argument is refused by name (userId, sessionId and llmModel are ignored by the server).',
     inputSchema: {
       type: 'object',
       properties: { list_id: { type: 'string', description: 'The lead list id' } },
