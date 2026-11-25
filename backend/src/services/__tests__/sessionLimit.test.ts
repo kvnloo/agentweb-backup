@@ -107,7 +107,7 @@ describe('replayed runaway session (Opiner aea6a0ee: 549 turns, ~$47)', () => {
     // $20 at ~$0.0856/turn is reached at turn 234 > 150, so the turn cap trips first.
     expect(total).toBe(150);
     // Owner decision 2026-11-25: the customer-facing pause text carries no numbers (the usage is logged and stored on the message).
-    expect(tracker.pauseMessage(false)).toBe('This session has reached its usage limit. Reply "continue" to keep going in this session, or start a new session.');
+    expect(tracker.pauseMessage(false)).toBe('This session has reached its limit. Reply "continue" to keep going in this session, or start a new session.');
 
     // A new run (another instance / after a deploy) reads the persisted counters: still paused.
     tracker = (await startSessionLimit(attended('what else can you do?'), t.deps))!;
@@ -135,7 +135,7 @@ describe('replayed runaway session (Opiner aea6a0ee: 549 turns, ~$47)', () => {
     const t = fakeTable({ sessionId: SESSION, sessionLimitTurns: 150, sessionLimitSpendMicroUsd: 1 });
     const tracker = (await startSessionLimit({ ...attended('continue'), isUnattendedRun: true, warningsAllowed: false }, t.deps))!;
     expect(tracker.reached()).toBe(true);
-    expect(tracker.pauseMessage(true)).toBe('This scheduled run paused because the session reached its usage limit. Open this session and reply "continue" to keep going, or start a new session.');
+    expect(tracker.pauseMessage(true)).toBe('This scheduled run paused because the session reached its limit. Open this session and reply "continue" to keep going, or start a new session.');
     expect(t.item()!.sessionLimitWindowStartTurns).toBeUndefined();
   });
 
@@ -161,7 +161,7 @@ describe('replayed runaway session (Opiner aea6a0ee: 549 turns, ~$47)', () => {
     it('is told to ask the person who shared the chat, in plain words with no numbers', async () => {
       const t = fakeTable({ sessionId: SESSION, sessionLimitTurns: 150, sessionLimitSpendMicroUsd: 1 });
       const tracker = (await startSessionLimit(visitor('what is next?'), t.deps))!;
-      expect(tracker.pauseMessage(false)).toBe('This shared chat has reached its usage limit. Ask the person who shared it to continue it.');
+      expect(tracker.pauseMessage(false)).toBe('This shared chat has reached its limit. The person who shared it can reply "continue" to keep going.');
     });
 
     it('still counts its turns against the shared session, but never sees the 75% / 90% notices (nor claims them for the owner)', async () => {

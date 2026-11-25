@@ -146,14 +146,15 @@ export function sessionLimitWarningMessage(pct: SessionLimitWarningPercent): str
 
 /**
  * The pause text. No numbers on purpose (owner, 2026-11-25): customers should not see steps or our model cost; the exact usage is
- * logged and stored on the message (`sessionLimitPaused`). A share-link visitor cannot continue the owner's session, so they are
- * told to ask the person who shared it.
+ * logged and stored on the message (`sessionLimitPaused`). A share-link visitor cannot continue the owner's session, so their text
+ * names who can. That text is stored in the shared transcript, so the owner reads it too: it says that replying "continue" works.
+ * Wording approved by the owner 2026-11-25 ("limit", not "usage limit": the latter is our billing wording).
  */
 export function sessionLimitPauseMessage(unattended: boolean, shareVisitor = false): string {
-  if (shareVisitor) return 'This shared chat has reached its usage limit. Ask the person who shared it to continue it.';
+  if (shareVisitor) return 'This shared chat has reached its limit. The person who shared it can reply "continue" to keep going.';
   return unattended
-    ? 'This scheduled run paused because the session reached its usage limit. Open this session and reply "continue" to keep going, or start a new session.'
-    : 'This session has reached its usage limit. Reply "continue" to keep going in this session, or start a new session.';
+    ? 'This scheduled run paused because the session reached its limit. Open this session and reply "continue" to keep going, or start a new session.'
+    : 'This session has reached its limit. Reply "continue" to keep going in this session, or start a new session.';
 }
 
 export interface SessionLimitDeps {
