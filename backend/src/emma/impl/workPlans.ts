@@ -1145,7 +1145,9 @@ async function setWorkPlanStatusAttempt(
     // resolvedAt/completedAt/calledFunctionCounts mutation for it (those
     // already ran once; re-running them would corrupt state).
     if (alreadyAppliedStepCounts.has(update.stepCount)) {
-      workPlan.steps[stepIndex] = { ...workPlan.steps[stepIndex], notes: update.notes };
+      // Status-only retries are not evidence updates. Explicit notes (including
+      // an empty string after recovery) still replace the previous evidence.
+      workPlan.steps[stepIndex] = { ...workPlan.steps[stepIndex], notes: update.notes === undefined ? step.notes : update.notes };
       updatedSteps.push({ stepCount: update.stepCount, title: step.title, status: update.status });
       continue;
     }

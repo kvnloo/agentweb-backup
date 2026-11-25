@@ -6265,7 +6265,7 @@ export class AgentModeService {
         // flow at /onboarding/v2. That flow is a separate brand-build status machine (a
         // "regular" session with NO work plan) and never reaches this code. An earlier
         // hypothesis that this guard could stall onboarding was based on that wrong premise.
-        workPlanContent += `⚠️ AUTOCOMPLETE MODE: This plan runs hands-off — do NOT pause to ask the user to approve or confirm a step. After performing a step's work, immediately call set_work_plan_status to complete it and move on. If information is missing, recover it using your tools (e.g. read_brand_guidelines, read_market_strategy) or earlier session content; if it is still missing, proceed with reasonable defaults rather than blocking. Never leave a step pending waiting on the user.\n\n`;
+        workPlanContent += `⚠️ AUTOCOMPLETE MODE: This plan runs hands-off — do NOT pause to ask the user to approve or confirm a step. After performing a step's work, immediately call set_work_plan_status to complete it and move on. If information is missing, recover it using your tools (e.g. read_brand_guidelines, read_market_strategy) or earlier session content; if it is still missing, proceed with reasonable defaults rather than blocking. Exception: a missing required API key cannot be defaulted; keep the affected step pending, call set_work_plan_status to record reason=no_key in notes, and report the prerequisite without claiming completion. Never leave a step pending waiting on the user except for this explicit prerequisite failure.\n\n`;
       } else {
         // Production-parity path (Emma): the ORIGINAL autocomplete wording, unchanged
         // from origin/main, so Emma's output does not drift.
