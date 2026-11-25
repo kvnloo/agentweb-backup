@@ -4666,6 +4666,35 @@ Typical prompts this answers:
   },
 });
 
+/**
+ * ENG-3189: accept the shapes models actually send for `emails` — an array,
+ * a JSON-encoded array string, or a comma/semicolon/whitespace-separated
+ * string — and return trimmed, non-empty strings.
+ */
+export function normalizeRegistrationStatusEmails(raw: unknown): string[] {
+  let items: unknown[];
+  if (Array.isArray(raw)) {
+    items = raw;
+  } else if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    let parsed: unknown = undefined;
+    if (trimmed.startsWith('[')) {
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        parsed = undefined;
+      }
+    }
+    items = Array.isArray(parsed) ? parsed : trimmed.split(/[\s,;]+/);
+  } else {
+    items = [];
+  }
+  return items
+    .filter((e): e is string => typeof e === 'string')
+    .map((e) => e.trim())
+    .filter((e) => e.length > 0);
+}
+
 mcpToolRegistry.register({
   name: 'get_registration_status',
   definition: {
@@ -4702,12 +4731,21 @@ Example:
     },
   },
   execute: async (args: any, context: any) => {
-    const emails = Array.isArray(args?.emails)
-      ? args.emails
-          .filter((e: unknown) => typeof e === 'string')
-          .map((e: string) => e.trim())
-          .filter((e: string) => e.length > 0)
-      : [];
+    // ENG-3189: 44% of calls failed with the route's 400 "emails (non-empty
+    // array of strings)" because the model passed a comma-separated string, a
+    // JSON-encoded array, or an empty list. Coerce the recoverable shapes and
+    // answer the unrecoverable one locally with an actionable message instead
+    // of a round-trip that throws.
+    const emails = normalizeRegistrationStatusEmails(args?.emails ?? args?.email);
+    if (emails.length === 0) {
+      return {
+        ...jsonResult({
+          error:
+            'get_registration_status needs at least one email. Pass `emails` as an array of email strings, e.g. { "emails": ["lead1@acme.com", "lead2@acme.com"] }. If you have no lead emails yet, fetch them first (e.g. from the CRM leads list) instead of calling this tool.',
+        }),
+        isError: true,
+      };
+    }
 
     const data = await mcpFetch({
       method: 'POST',

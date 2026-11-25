@@ -116,4 +116,33 @@ describe('get_registration_status', () => {
     const body = (mockMcpFetch.mock.calls[0][0] as any).body;
     expect(body.emails).toEqual(['a@x.com', 'b@x.com']);
   });
+
+  // ENG-3189: the model sent strings / empty lists and the route 400'd.
+  describe('input coercion (ENG-3189)', () => {
+    beforeEach(() => {
+      mockMcpFetch.mockResolvedValue({ statuses: [], summary: { total: 0, registered: 0, premium: 0 } });
+    });
+
+    it.each([
+      ['comma-separated string', 'a@x.com, b@x.com'],
+      ['JSON-encoded array string', '["a@x.com","b@x.com"]'],
+      ['newline/semicolon separated string', 'a@x.com;\nb@x.com'],
+    ])('accepts a %s', async (_label, raw) => {
+      await mcpToolRegistry.execute('get_registration_status', { emails: raw }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(
+        expect.objectContaining({ body: { emails: ['a@x.com', 'b@x.com'], includeChatSessionCount: false } }),
+      );
+    });
+
+    it.each([
+      ['empty array', []],
+      ['blank strings only', ['  ', '']],
+      ['missing emails', undefined],
+    ])('returns an actionable error without calling the API for %s', async (_label, raw) => {
+      const result: any = await mcpToolRegistry.execute('get_registration_status', { emails: raw }, context);
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('needs at least one email');
+    });
+  });
 });
