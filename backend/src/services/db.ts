@@ -41,6 +41,32 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+/**
+ * ENG-2840 (W2-5a): the provider fetches of a CAPPED lead-history read (the MCP lead tools) go through ONE chain for the whole process: one at
+ * a time, `gapMs` apart (the gap the platform's own sends keep, 2 a second), and at most `backlog` may be waiting; a fetch that would wait behind
+ * more is skipped and its event comes back without a body. The provider's request limit is shared with the platform's sends, and an API key can
+ * repeat a read 60 times a minute (up to 600), so a per-call limit alone would still let several calls fetch at once. An uncapped read (Emma, the
+ * portal) does not use the chain. `cappedFetchTuning` is exported so a test can set the gap to 0.
+ */
+export const cappedFetchTuning = { gapMs: 500, backlog: 20 };
+let cappedFetchChain: Promise<unknown> = Promise.resolve();
+let cappedFetchWaiting = 0;
+function runCappedFetch<T>(fetch: () => Promise<T>): Promise<T | null> {
+  if (cappedFetchWaiting >= cappedFetchTuning.backlog) return Promise.resolve(null);
+  cappedFetchWaiting++;
+  const run = cappedFetchChain.then(() => fetch());
+  const done = () => { cappedFetchWaiting--; };
+  run.then(done, done);
+  cappedFetchChain = run.then(() => undefined, () => undefined).then(() => {
+    if (!(cappedFetchTuning.gapMs > 0)) return undefined;
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, cappedFetchTuning.gapMs);
+      (timer as any).unref?.();
+    });
+  });
+  return run;
+}
+
 /** ENG-2123: until when getLeadIdsByPhoneKey should not try PhoneKeyIndex again (missing index / denied). */
 let phoneIndexUnavailableUntil = 0;
 
@@ -9922,8 +9948,9 @@ export const crmDb = {
   /**
    * `options.maxContentFetches` (ENG-2840 W2-5a, set only by the MCP lead tools): the most email bodies this call may fetch from the mail
    * provider. Without it (Emma, the portal) every received or delivered event that has no stored body is fetched, all at once. With it, only
-   * the NEWEST that many such events are fetched, one at a time, and stored (so a later call reaches the next ones, as long as these succeed:
-   * a body that cannot be fetched is not remembered and uses the allowance again on every call); the others are returned without a body.
+   * the NEWEST that many such events are fetched, through one process-wide chain (one at a time, 500 ms apart, at most 20 waiting; one that
+   * would wait behind more is skipped), and stored (so a later call reaches the next ones, as long as these succeed: a body that cannot be
+   * fetched is not remembered and uses the allowance again on every call); the others are returned without a body.
    * An event whose body is already stored never uses up the allowance. A value that is not a finite number of at least 0 is no cap.
    */
   async getLeadEngagements(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number }) {
@@ -9969,16 +9996,9 @@ export const crmDb = {
         for (const e of needContent.slice(0, Math.floor(maxContentFetches as number))) fetchAllowed.add(e);
       }
 
-      // A capped read (the MCP lead tools) fetches its bodies ONE AT A TIME: the provider's request limit is shared with the platform's sends
-      // (paced at 2 a second), so a burst of parallel fetches from an agent's read could slow them. An uncapped read (Emma, the portal) runs
-      // every fetch at once, as before.
-      let fetchChain: Promise<unknown> = Promise.resolve();
-      const runFetch = <T>(fetch: () => Promise<T>): Promise<T> => {
-        if (!capFetches) return fetch();
-        const run = fetchChain.then(fetch, fetch);
-        fetchChain = run.catch(() => undefined);
-        return run;
-      };
+      // A capped read (the MCP lead tools) fetches its bodies through the process-wide chain (see runCappedFetch): one at a time, paced, with a
+      // backlog limit. An uncapped read (Emma, the portal) runs every fetch at once, as before.
+      const runFetch = <T>(fetch: () => Promise<T>): Promise<T | null> => (capFetches ? runCappedFetch(fetch) : fetch());
 
       // Transform email events to engagement format
       // For email.received events, fetch the email content
