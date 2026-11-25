@@ -929,13 +929,13 @@ describe('AgentModeService - Social Media Tools', () => {
         postUrl: 'https://www.linkedin.com/feed/update/urn:li:share:new123',
       });
 
-      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:orig999');
+      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:7001999');
 
       expect(result.success).toBe(true);
       expect(result.post_id).toBe('urn:li:share:new123');
       expect(mockAdapter.createRepost).toHaveBeenCalledWith(
         mockLinkedInAccount,
-        'urn:li:share:orig999',
+        'urn:li:share:7001999',
         undefined,
         'user-123',
         // ENG-827: the consent re-check, run inside the adapter after the token
@@ -953,12 +953,12 @@ describe('AgentModeService - Social Media Tools', () => {
         postUrl: 'https://www.linkedin.com/feed/update/urn:li:share:new456',
       });
 
-      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:orig999', 'Great post!');
+      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:7001999', 'Great post!');
 
       expect(result.success).toBe(true);
       expect(mockAdapter.createRepost).toHaveBeenCalledWith(
         mockLinkedInAccount,
-        'urn:li:share:orig999',
+        'urn:li:share:7001999',
         'Great post!',
         'user-123',
         undefined
@@ -979,7 +979,7 @@ describe('AgentModeService - Social Media Tools', () => {
     it('should return error when account not found', async () => {
       mockGetAccountById.mockResolvedValue(null);
 
-      const result = await service.linkedinRepost('user-123', 'nonexistent', 'urn:li:share:orig999');
+      const result = await service.linkedinRepost('user-123', 'nonexistent', 'urn:li:share:7001999');
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('Account not found or access denied');
@@ -988,7 +988,7 @@ describe('AgentModeService - Social Media Tools', () => {
     it('should return error for non-linkedin account', async () => {
       mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
 
-      const result = await service.linkedinRepost('user-123', 'twitter-user-123', 'urn:li:share:orig999');
+      const result = await service.linkedinRepost('user-123', 'twitter-user-123', 'urn:li:share:7001999');
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('only supported for LinkedIn');
@@ -998,7 +998,7 @@ describe('AgentModeService - Social Media Tools', () => {
       mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createRepost.mockRejectedValue(new Error('LinkedIn access token expired'));
 
-      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:orig999');
+      const result = await service.linkedinRepost('user-123', 'urn:li:organization:123456', 'urn:li:share:7001999');
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('token expired');
@@ -1067,11 +1067,11 @@ describe('AgentModeService - Social Media Tools', () => {
       await service.linkedinManagePost('user-123', {
         action: 'repost',
         account_id: 'acc-1',
-        post_urn: 'urn:li:share:orig',
+        post_urn: 'urn:li:share:7001',
         commentary: 'Nice!',
       });
 
-      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!', undefined);
+      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:7001', 'Nice!', undefined);
     });
 
     it('should dispatch comment action', async () => {

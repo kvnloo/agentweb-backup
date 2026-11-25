@@ -134,6 +134,9 @@ describe('AgentModeService — memory injection wiring (ENG-1310 AC1)', () => {
     expect(memoryMsg.content.endsWith(MEMORY_STALENESS_NOTE)).toBe(true);
     // Carries its saved date, so any later reference has a source to attribute (AC1).
     expect(memoryMsg.content).toContain('saved 2026-07-31');
+    // ENG-2840 (W2-1): the loader asks for the readers' defaults (the newest 200 rows, WITH their embeddings). Passing omitEmbeddings here would
+    // quietly turn relevance ranking into recency plus a re-embedding of every row, every turn.
+    expect(require('../services/db').accountMemoryDb.getUserMemories).toHaveBeenCalledWith('test-user');
   });
 
   it('injects org memory bookended by the staleness caution, never headed "shared facts"', async () => {
@@ -162,6 +165,7 @@ describe('AgentModeService — memory injection wiring (ENG-1310 AC1)', () => {
     expect(firstNote).toBe(0);
     expect(orgMemoryMsg.content.endsWith(MEMORY_STALENESS_NOTE)).toBe(true);
     expect(orgMemoryMsg.content).toContain('saved 2026-07-30');
+    expect(require('../services/db').orgMemoryDb.getOrgMemories).toHaveBeenCalledWith('org-1');
   });
 
   it('injects no memory message when the account has none (no empty block)', async () => {

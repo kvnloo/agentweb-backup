@@ -41,10 +41,32 @@ describe('share_visitor_schedule', () => {
   });
 
   it('allows every tool share_visitor allows', () => {
-    for (const name of ['notify_session', 'manage_scheduled_chat', 'you_search_web', 'post_on_connected_account']) {
+    // ENG-3170: notify_session and post_on_connected_account used to be here. They are SENSITIVE now (send or post outside the account),
+    // and a schedule a visitor set up has no share link to ask, so it is refused them until the owner adopts it (see the next test).
+    for (const name of ['you_search_web', 'read_brand_guidelines']) {
       expect(restrictionRefusal('share_visitor', name, ADMIN)).toBeNull();
       expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN)).toBeNull();
     }
+    // creating or editing a schedule stays allowed (its provenance mark is the protection, ENG-2816); deleting one is sensitive
+    expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, 'manage_scheduled_chat', ADMIN, { action: 'create' })).toBeNull();
+    expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, 'manage_scheduled_chat', ADMIN, { action: 'update' })).toBeNull();
+    expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, 'manage_scheduled_chat', ADMIN, { action: 'delete' })).not.toBeNull();
+  });
+
+  it('refuses a SENSITIVE call (send or post outside the account, delete data, change ad spend) for a visitor-made schedule, with the adopt wording', () => {
+    for (const name of ['notify_session', 'post_on_connected_account', 'slack_send_message', 'delete_leads']) {
+      const text = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN, {})!;
+      expect(text).toContain('set up or edited through a share link');
+      expect(text).toContain('The owner can adopt the schedule in the portal to lift this limit.');
+    }
+  });
+
+  it('by NAME alone it refuses only a tool that is sensitive whatever its arguments, never one that is refused for some actions', () => {
+    expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, 'slack_send_message', ADMIN, undefined, { nameOnly: true })).not.toBeNull();
+    expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, 'call_google_ads_api', ADMIN, undefined, { nameOnly: true })).toBeNull();
+    expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, 'manage_scheduled_chat', ADMIN, undefined, { nameOnly: true })).toBeNull();
+    expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, 'save_memory', ADMIN, undefined, { nameOnly: true })).not.toBeNull();
+    expect(restrictionRefusal('share_visitor', 'slack_send_message', ADMIN, undefined, { nameOnly: true })).toBeNull();
   });
 
   it('says the schedule was set up or edited through a share link and that the owner can adopt it, never "shared sessions"', () => {

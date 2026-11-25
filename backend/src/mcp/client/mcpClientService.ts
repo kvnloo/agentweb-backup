@@ -985,6 +985,8 @@ export class McpClientService {
             execute: async (args: any, context: ToolContext) => {
               const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
               let lastError: unknown;
+              // ENG-3170: a browser call of a share-link visitor who may not use the owner's logins is pooled under a session id of its own.
+              const poolSessionId = context.browserPoolSessionId || context.sessionId;
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 let sessionClient: Client | undefined;
                 try {
@@ -996,7 +998,7 @@ export class McpClientService {
                       llmModel: context.llmModel
                     });
                   }
-                  sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId, originalToolName);
+                  sessionClient = await this.getSessionClient(serverName, poolSessionId, context.userId, originalToolName);
                   const clientTransport = (sessionClient as any)._transport;
                   const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
                   console.log(JSON.stringify(buildMcpToolTelemetry({
@@ -1009,7 +1011,7 @@ export class McpClientService {
                     maxAttempts,
                     phase: 'call',
                   })));
-                  const callPoolKey = this.getPoolKey(serverName, context.sessionId, context.userId, originalToolName);
+                  const callPoolKey = this.getPoolKey(serverName, poolSessionId, context.userId, originalToolName);
                   this.markPoolBusy(callPoolKey, 1);
                   let result;
                   try {
@@ -1035,7 +1037,7 @@ export class McpClientService {
                   // Evict dead client from session pool so the next call reconnects
                   if (isConnectionError(error)) {
                     console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
-                    await this.evictSessionClient(this.getPoolKey(serverName, context.sessionId, context.userId, originalToolName), serverName, sessionClient);
+                    await this.evictSessionClient(this.getPoolKey(serverName, poolSessionId, context.userId, originalToolName), serverName, sessionClient);
                   }
                   if (attempt < maxAttempts) {
                     console.warn(JSON.stringify(buildMcpToolTelemetry({
@@ -1097,8 +1099,11 @@ export class McpClientService {
    */
   async releaseSessionClients(chatSessionId: string): Promise<void> {
     const suffix = `::${chatSessionId}`;
+    // ENG-3170: a share-link visitor who may not use the owner's logins has a browser pool of their own (`<session>::visitor`, see ToolContext.browserPoolSessionId);
+    // it goes when the chat session's pools go.
+    const visitorSuffix = `::${chatSessionId}::visitor`;
     const poolKeys = Array.from(this.sessionClientPools.keys()).filter(
-      key => key === chatSessionId || key.endsWith(suffix)
+      key => key === chatSessionId || key.endsWith(suffix) || key.endsWith(visitorSuffix)
     );
 
     for (const poolKey of poolKeys) {
@@ -1630,6 +1635,8 @@ export class McpClientService {
         execute: async (args: any, context: ToolContext) => {
           const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
           let lastError: unknown;
+          // ENG-3170: a browser call of a share-link visitor who may not use the owner's logins is pooled under a session id of its own.
+          const poolSessionId = context.browserPoolSessionId || context.sessionId;
           for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             let sessionClient: Client | undefined;
             try {
@@ -1645,7 +1652,7 @@ export class McpClientService {
 
               // CRITICAL FIX: Get session-specific client instead of using shared client
               // This ensures each chat session has its own isolated MCP connection
-              sessionClient = await this.getSessionClient(name, context.sessionId, context.userId, originalToolName);
+              sessionClient = await this.getSessionClient(name, poolSessionId, context.userId, originalToolName);
 
               // Log MCP tool call with structured reliability telemetry (ENG-107)
               const clientTransport = (sessionClient as any)._transport;
@@ -1661,7 +1668,7 @@ export class McpClientService {
                 phase: 'call',
               })));
 
-              const callPoolKey = this.getPoolKey(name, context.sessionId, context.userId, originalToolName);
+              const callPoolKey = this.getPoolKey(name, poolSessionId, context.userId, originalToolName);
               this.markPoolBusy(callPoolKey, 1);
               let result;
               try {
@@ -1696,7 +1703,7 @@ export class McpClientService {
               // Evict dead client from session pool so the next call reconnects
               if (isConnectionError(error)) {
                 console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
-                await this.evictSessionClient(this.getPoolKey(name, context.sessionId, context.userId, originalToolName), name, sessionClient);
+                await this.evictSessionClient(this.getPoolKey(name, poolSessionId, context.userId, originalToolName), name, sessionClient);
               }
               if (attempt < maxAttempts) {
                 console.warn(JSON.stringify(buildMcpToolTelemetry({

@@ -9,6 +9,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-11-23',
+    changes: [
+      'New: Choose How Much Control a Shared Chat Link Has',
+      '- When you create an interactive share link there is now a "Full control" switch. It is off by default',
+      "- Off: people using your link can still chat with Emma and ask questions, but she won't delete data, send emails or Slack messages, post or publish, change ad campaigns, change your settings or Emma's memory, connect or disconnect accounts, or use your saved logins for them",
+      '- On: anyone with the link has full control and can ask Emma to do everything you can, as you, the way shared links worked before. It applies to everyone who has that link',
+      '- You can change the switch at any time from the share dialog, without making a new link',
+      '- Links you made before this change: links you created in the share dialog keep working as they did. Other links, including links created automatically such as those in emails and plan pages, now have the switch off, and you can turn it on from the share dialog',
+      '- A schedule set up through a share link needs your approval in the portal before it can do these things',
+      '- Your own messages and actions are unchanged, including when you open your own link while signed in',
+    ],
+  },
+  {
     date: '2026-11-20',
     changes: [
       'Improved: Emma Now Knows Who Wrote What on a Shared Chat Link',
