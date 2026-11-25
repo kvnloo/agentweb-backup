@@ -21,8 +21,10 @@ Partition key `orgId`, sort key `sk`. No TTL, indexes, streams, backfill, or aut
 AWS-managed SSE, PITR, deletion protection, Retain for deletion/replacement, and no TTL or GSI.
 Default name is development; production would explicitly set TableName=AW-SentMessages after approval.
 The template is standalone and is not wired into any deployment. No production table has been created.
-Future integration must grant only required GetItem/PutItem/UpdateItem/Query/TransactWriteItems access
+Future integration must grant only required GetItem/PutItem/UpdateItem/Query access
 on the exact table ARN, without scan/delete, and configure an explicit table name in backend.
+DynamoDB authorizes transaction members through their underlying PutItem/UpdateItem permissions,
+not a separate TransactWriteItems IAM action ([AWS reference](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html)).
 
 ## Delivered in this draft
 An injected DocumentClient service implements durable pre-send conditional claim, provider key,
