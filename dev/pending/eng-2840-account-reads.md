@@ -10,12 +10,20 @@
   organization member reading a teammate's shared page uses the teammate's token, as in the portal), may refresh and store that token, and may
   cache posts. The LinkedIn app quota is shared by every tenant; the portal throttles the same call per account (`routes/socialPosts.ts`),
   Emma's tool and the `/api/emma` routes do not. Through MCP a call goes through `socialReadGuard`: an answer is kept 60 s per (caller, tool,
-  arguments) (a refusal or failure is never kept; the memory is per caller, so one tenant's answer never serves another), and one account can go
-  to the provider 6 times a minute across the three tools (an answer from memory does not count), else the tool answers how many seconds to
-  wait. Inputs are bounded in the handler: `limit` 1 to 50 (default 10; with `include_metrics` at most 10, because Instagram is one provider
+  arguments) (a refusal or failure is never kept; an `success: true` answer that is empty because the provider call failed IS kept for the 60 s;
+  two identical calls at the same moment both go upstream; the memory is per caller, so one tenant's answer never serves another), and each
+  caller has an allowance of 30 provider-call units a minute per account across the three tools, each call costing what it can cost the provider:
+  posts 1 (plus 1 per post with metrics), account metrics 4 (a LinkedIn company page is four calls), post analytics 5 per post (a personal
+  LinkedIn post is five sequential calls; at most 5 posts per call). An answer from memory costs nothing; a call that does not fit is refused
+  with the seconds to wait. The budget is per caller, not per account: members of one organization reading the owner's shared page each have
+  their own. Inputs are bounded in the handler: `limit` 1 to 50 (default 10; with `include_metrics` at most 10, because Instagram is one provider
   call per post), `include_metrics` default false (Emma's own tool defaults to true although its schema says false), `force_reload` is not an
-  input, dates `YYYY-MM-DD`, real, both or neither, at most 366 days, `post_ids` 1 to 25 distinct clean ids. They are not `readOnly`
-  (policy 'write', need `tools:execute`). The routes themselves are unchanged and keep their token-budget class (`exempt` for the two GET
+  input, dates `YYYY-MM-DD`, real, both or neither, at most 366 days (the range ends at 00:00 UTC of `end_date`), `post_ids` 1 to 5 distinct ids of
+  the shapes the posts tool hands out (letters, digits, colon, underscore, hyphen: Instagram puts the id into a Graph path), account and post ids
+  refuse zero-width and bidirectional-control characters. A personal LinkedIn profile shows only the posts created through AgentWeb (plus a long
+  instruction-style message addressed to Emma); `get_post_analytics` omits LinkedIn company-page posts the provider does not return. They are not `readOnly`
+  (policy 'write', need `tools:execute`). The other five are read-only, so a `tools:read` key (and an OAuth client) can call them, including the
+  two settings reads (the owner/admin rule is enforced on the route, whatever the key's scope). The routes themselves are unchanged and keep their token-budget class (`exempt` for the two GET
   routes, as before).
 - Org settings: `get_lead_notification_settings` has a new thin route, `GET /api/emma/lead-notification-settings` (class `exempt`: a
   settings read), that requires `org:configure`. Emma's own read has no role check, so any member of an organization can read its Slack channel
