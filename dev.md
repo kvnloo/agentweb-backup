@@ -1,3 +1,295 @@
+## ENG-2840: Lead reads for outside agents over MCP (2026-11-25)
+
+- Three tools that Emma has now exist on the MCP server: `get_lead_details`, `get_lead_engagements`, `get_lead_list_statuses`
+  (`backend/src/mcp/server/leadReadTools.ts`). `get_lead_details` is a different projection from `manage_leads get`, not a superset: it returns
+  the profile, notes, custom fields, ICP match, attribution, opt-out state, a message draft and a 200-character preview of the email draft,
+  enrichment sources, the LinkedIn connection status (`isConnected: false` also means "could not check": errors are swallowed), the
+  engagement counts and the 10 most recent engagements. It does NOT return the lead's own pipeline status or deal value fields, nor website,
+  domain, role, lifecycle, priority, heat score, expected close date and similar stored fields (`manage_leads get` does); status changes and
+  deal values DO appear inside engagement events (`status.changed` events carry from, to, dealValue). The history is not only emails and
+  hand-recorded notes: `lead.engagements` also holds contact-status audit events (with `actorUserId`, and `delegatedByUserId` for staff
+  acting by delegation: both pass the public sanitiser, as they do on the portal's own route), LinkedIn invite events, hot-lead call events and
+  Smartlead events (replies, bounces and opt-outs only: no bodies, and never the emails Smartlead sent). LinkedIn messages are read from the
+  event table under `linkedin-<listId>`, for a lead with a LinkedIn URL; the email events come from the same table under the caller's domain. `get_lead_engagements` is the history of
+  one lead, newest first, `limit` 1 to 100 (default 20).
+- NO stale-list search over MCP (decision after review round 3). Emma's `get_lead_details` looks for a lead that is not in `list_id` in the
+  caller's other accessible lists (ENG-969): the caller's lists, then one query per organization member, then up to 8 batched reads per tier,
+  retried once after 300 ms on an error. `AW-LeadLists` is provisioned at 5 read units and its `userId-index` at 5 (read-only
+  `describe-table`, 2026-11-25; 412 items), so a key that can repeat that for any unknown lead id 60 times a minute (600 for a key created
+  with the maximum) could throttle the lead-list reads of every tenant. The tool sends `recover_stale_list: false` and an unknown lead id is
+  refused as "Lead not found" with no per-member list queries (the list read, the access check and one lead read). Emma, the portal and the readback verifier send nothing and keep the search. The
+  route takes `recover_stale_list` as a boolean (anything else is a 400); only `false` changes behaviour.
+  `get_lead_list_statuses` returns a list's pipeline stages, including the default a list that never stored its own uses (which
+  `create_lead_list get` does not show); it only reads, so it is `readOnly` and a `tools:read` key can call it.
+- Counts to read right: `engagementSummary.total` and `last7Days` count events whose type contains "sent" (sent messages, but also
+  `linkedin.invite_sent` and any type containing "consent"); `totalAllMessages` counts every event (LinkedIn events are de-duplicated first). A cut page says
+  so in `message` ("Showing the first N of M"). When counting fails the data layer returns zeros and the answer still says `success`: three
+  zero counts beside listed events mean the count failed (the `engagementCountUnavailable` flag the handler has for this can never fire,
+  because `getLeadEngagementCount` swallows its own errors; pre-existing).
+- Same pattern as the other wave-2 tools: the handler checks arguments by name (an unknown argument, including any identity such as
+  `user_id`, `client_id`, `orgId`, is refused; `userId`, `sessionId` and `llmModel` are stripped by the MCP server before the tool sees them),
+  then self-calls the `/api/emma` route as the key's own user. The list access check (`canOrgMemberAccessList`: the list owner, the
+  organization's owner and listed CRM editors, and any other member of the owner's organization while the organization shares its CRM) runs
+  in Emma's handler on the far side and is not replaced. It differs slightly from the CRM routes' guard (`canAccessCrmList`): with CRM sharing
+  off an organization admin who is neither owner nor listed editor passes the CRM routes and is refused here; with an organization row
+  missing, this guard allows and the CRM routes deny. Both pre-exist.
+- `/api/emma/*` answers a refusal as HTTP 200 `{ success: false, message }`. The tools turn that into an error carrying only the route's
+  short `message`; the route's `error` field (raw exception text on an internal failure) is dropped. A 5xx from the route (its catch-all
+  answers with the exception's message) and a failure to reach the route (the raw message names the internal route and port) are replaced by
+  a fixed text. A 4xx (a 429 for an account over its monthly quota, a 400) passes through with the route's own words. "Lead list not found"
+  and "Access denied" are different answers, as they are for Emma and `manage_leads get`, so a caller can tell a real list id of another
+  account from an unknown one; list ids look like `list_<time>_<random>` and are not guessable, except the Calendly list, whose id contains
+  the owner's user id.
+- Two thin routes were added for the tools that had none: `POST /api/emma/lead-engagements` and `POST /api/emma/lead-list-statuses`, both
+  `metered` like `/leads` and `/lead-details`. `metered` means an account that is already over its monthly token quota is refused on them;
+  these reads spend no tokens, so the quota does NOT bound how often they run. The bounds are the key's rate limit (60 calls a minute by
+  default; a key can be created with 1 to 600; several keys of one account multiply it) and the fetch bound below.
+- Cost of a history read. `crmDb.getLeadEngagements` fetches the body of every received or delivered email event that has no stored body from
+  the mail provider (Resend, with the platform's key; two provider calls per received event, with retries) and stores it as a cache. Emma and
+  the portal do this for every such event at once, whatever `limit` is. A failed fetch is not stored and is tried again on the next read. The
+  provider fetch path is not paced like sending (sends go out at most 2 a second) for Emma and the portal. For the MCP tools the data layer takes an allowance
+  (`options.maxContentFetches`, sent by the tools as 10; the routes take `max_content_fetches`, a whole number 0 to 50, and answer 400 to
+  anything else, so a bad value is never a silent "no cap"): only the newest 10 such events without a stored body are fetched per call, through
+  ONE chain for the whole process (`runCappedFetch` in `services/db.ts`): one at a time, 500 ms apart (the gap the platform's own sends keep),
+  at most 20 in the chain (one running, 19 waiting) and at most 10 per account (so one account crawling its leads cannot fill it and starve the
+  others), each fetch given up on after 10 s (so a hanging provider holds one call for about 100 s at most, inside the 5-minute self-call timeout; the Resend reads set no timeout, so one request that never answered would otherwise block every
+  later read in the process; the abandoned request is not cancelled). A fetch that does not fit is skipped and its event comes back without a
+  body; fetches are handed to the chain newest first, so what a busy chain skips is the oldest of the allowed events. An uncapped read (Emma,
+  the portal) does not use the chain, is not paced and runs every fetch at once, as before. Resend's limit is shared with the platform's sends
+  and the chain paces only these fetches: it cannot guarantee that fetches plus sends stay under that limit, it stops a key's reads from adding
+  a burst. The other events come back without a body. A body already stored never uses the
+  allowance, and a body that cannot be fetched is not remembered: it uses the allowance again on every call, so a lead whose 10 newest bodies
+  fail never reaches older ones. Emma and the portal send nothing and are unchanged. `limit` does not bound reading: the email events of the
+  lead's address are read in full (twice, count and list) before the page is cut. `get_lead_details` can also check a connected LinkedIn
+  account (Unipile), one probe per connected account when the list names none and the user has more than one; the connection lookup is by the
+  list's LinkedIn account when the list names one, else by the CALLER's account.
+- Known limit, inherited from `crmDb.getLeadEngagements` / `getLeadEngagementCount` and unchanged here: email events are looked up through the
+  CALLING account's single legacy `emailDomain` setting, not the list owner's (an organization member reading a shared list sees only emails
+  under their own domain). An account whose sending domains are stored only in the multi-domain setting (`emailDomains[]`), or that sends from
+  a connected mailbox, gets none of its own emails from these tools (what lives on the lead is included: Smartlead replies, bounces and
+  opt-outs, which have no bodies and are not the emails Smartlead sent, LinkedIn invites, hand-recorded events; LinkedIn messages come from the
+  event table, for a lead with a LinkedIn URL), so an empty history is not proof that a lead was never emailed. The lookup is keyed by that domain string, not by account;
+  a new-style domain is claimed by one account only, the legacy field is set by an admin without a uniqueness check. Another pre-existing
+  flaw seen on the way: the LinkedIn connection lookup applies `Limit: 5` before filtering by account, so a profile that is a connection of
+  more than five accounts can read as not connected. The Resend content fetch sets no timeout.
+- Not `readOnly` (the two lead tools): a read can write the content cache. A `tools:read` key cannot call them (same as `manage_leads` and
+  `search_leads`). Nothing in the lead or list changes. They are found with `emma_search_tools`, not in the default tool list.
+- Not exposed here, and why: `get_hot_leads`, `get_leads_needing_followup`, `get_lead_conversation_statuses` (each reloads the whole email
+  history of the account's domain on every call), `analyze_crm_data` and `ask_crm` (spend the platform's model key), `log_contact_event`
+  (writes to a global table keyed by an email taken from the argument, with no ownership check).
+- Still true: external answers pass through the public response sanitiser (drops any key named `ipAddress`, `userAgent`, `debug`, `telemetry`,
+  `sessionId` and similar at any depth, including inside a lead's custom fields or event data, and returns `null` past 10,000 nodes), as for
+  `manage_leads`; the descriptions say so. Email text and notes are third-party content: the descriptions tell agents to treat them as data.
+- Proof: unit tests of the request builders, refusals, error texts and descriptions (`mcp/server/__tests__/leadReadTools.test.ts`), the two
+  routes against Emma's real handlers and the allowance's path to the data layer (`emmaApi.leadReadback.test.ts`), the allowance itself
+  (`crm.db.test.ts`, `getLeadEngagements`: also the chain across concurrent reads, its pacing and its backlog limit), and two tenants through the real MCP server, tool, route, handler and in-memory database
+  (`mcp.leadReads.twoTenant.test.ts`): foreign lists and lead ids, identity arguments, organization members with sharing on and off, the
+  organization owner and a listed editor with sharing off, what a page holds, and that no other list is ever looked in for a lead asked for
+  through the wrong list (the lists asked for are read off the database). The in-memory database now serves BatchGetItem
+  (`inMemoryDynamo.batchGet.test.ts`): without it any such search's failure was swallowed as "not found" and a test could pass without the
+  search running or not running. Not covered there: the email-event half of an engagement
+  read (AW-EmailEvents is not in the fake), Limit / ExclusiveStartKey, BatchGetItem's 100-key cap and unprocessed keys.
+
+## ENG-2840: Emailing a GTM status report over MCP, behind an opt-in `gtm:email` key scope (2026-11-25)
+
+Emma has always been able to email a phase or plan status report (`send_gtm_status_report`). Over MCP it was held back: the report templates put caller text into HTML unescaped (fixed in W2-4), one call mails every distinct phase contact, and all platform email shares one queue (the GTM emails have their own bounded lane since PR #4236). With those closed, outside agents (Yugo, Hue, Remy) get the capability, behind a scope the account owner grants and with limits.
+
+**What changed**
+- New tool **`send_gtm_status_report`** on the MCP server, registered with `requiredScope: 'gtm:email'` and `apiKeyOnly`, the same gate as the org memory writes. Only an `aw_` key that holds the scope can call it: a default key, a legacy key, a read-only key, an OAuth client and a delegated session are refused (HTTP layer, `mcpServer.ts`, per request; the registry refuses a non-key caller underneath). `tools:execute` does not imply it.
+- The scope is on the grantable list for key creation, is refused from a delegated (admin-as-customer) session, is not a default scope, and `tools/list` offers the tool only to a key that holds it. The customer portal's key form does not offer opt-in scopes, so a customer cannot tick it there; Yugo's key broker has to ask for `gtm:email` for the agents that should email.
+- Inputs mirror Emma's: `plan_id`, `phase_id` (omit for a whole-plan report), `notify_user`, `notify_plan_poc`, `notify_phase_poc` (phase report), `notify_phase_pocs` (plan report), `message`. **Nobody is emailed by default**: at least one choice must be `true` (a choice written as text is refused, not guessed), an argument that is not an input is refused by name, the message is at most 2,000 characters.
+- Limits, `mcp/server/gtmEmailLimits.ts`: **at most 10 people per call** (each contact must be a single address: a contact written as "a@x.test, b@x.test" or as a list is refused, because a list is one send to several people; the report service refuses before sending anything when the report would reach more: a new `maxRecipients` option, 400 "it would go to N people and one call may email at most 10. Nothing was emailed."), **about 50 emails an hour per account, all of its keys together** (a call reserves the most it could send, settles to what it attempted, and gives everything back when the route refused before sending, so parallel calls cannot overshoot), and **the same report is not sent twice within 10 minutes** (same account, plan, phase, people chosen and message; the message is hashed, never stored).
+- One audit line per attempt, `mcp_gtm_email`: user, key, plan, phase, which people were chosen, the outcome and the counts. Never the message and never an address.
+- The tool calls the portal routes through `mcpFetch`, so the plan owner check, the delegation and restriction claims stay on the route: a key can email only the people on its own user's plans (proved with two tenants on the real routes). A POST self-call is never retried, so a network blip cannot send a report twice.
+- `manage_gtm_items` still refuses its email arguments (and `send_status_report`), and now says where emailing lives. Behaviour change: the refusal text. **Notifications on `update_work_item` are not offered**: update the item, then send a report.
+
+**What the scope means (a decision, written down).** `gtm:email` bounds the VOLUME an agent can email, not the AUDIENCE. The report goes to the addresses on the plan, and a key can write those itself: `manage_gtm_plan update dri` needs only `tools:execute`, so a key that holds `gtm:email` can put any address on a plan it owns and email it, with up to 2,000 characters of its own text (and more through work item notes, which the report includes), from AgentWeb's system sender. The portal already lets a signed-in user do the same with no limit; this is about a compromised or prompt-injected agent holding an owner's key. The account owner grants the scope knowing that, the caps and the audit line bound and show what happens, and the scope should go only to agents trusted with it. Restricting recipients to the owner's organization, or a per-address cap shared across accounts, would narrow it; neither is done here because contacts on a plan are often people outside the organization, and it would change what the portal does too.
+
+**Found by the second independent review and NOT changed here, with the reason**
+- **The audit line's `apiKeyId` is the key that opened the MCP session.** A second key of the same user that reuses that session id is checked on its own scopes (per request, so no scope is ever borrowed) but logged under the opener's id, as every MCP tool's audit line is. `userId` is always right. Binding sessions to keys is a change to the session layer (including the cross-instance rehydration path) for every tool, so it is not made inside an email-scope PR.
+- **No process-wide hourly ceiling across accounts, and no per-address cap across accounts.** N accounts can each send 50 an hour, and any signed-in user can mint a `gtm:email` key. The portal route (`POST /api/gtm-plan/:planId/send-status-report`) already lets any signed-in user email any contact with no limit at all, so a ceiling on the MCP tool alone would bound the new automation and not the real exposure; the right place is the route, which is a separate decision about portal behaviour.
+- **No "sent by an agent on behalf of <owner>" line in reports sent over MCP.** It would change the email copy that customers' contacts receive, and the repo rule is that customer-facing copy Harsha has not reviewed does not merge. Today those reports say only "automated status report from AgentWeb", so a recipient cannot tell who caused one; the audit line is how an owner sees it.
+- **Recipient domains in the audit line:** the route answers counts, not addresses.
+
+**What this does and does not bound**
+- The 10-people cap, the hourly budget and the cooldown are enforced per process, in memory. Production runs one backend instance (Elastic Beanstalk MinSize=MaxSize=1, checked 2026-11-24), so they are exact there; if the backend scales out, each instance counts separately (the audit line shows it). A restart empties the counters.
+- A call can send up to 10 emails, so the hour is "about 50": the reservation makes it at most 50 attempted emails per ACCOUNT per hour, including parallel calls and every key of that account (minting more keys buys no more email).
+- A 5xx or a timeout from the route keeps the reservation and the cooldown (the mail service may have taken some); a 4xx gives them back.
+- The scope controls this TOOL, not every route to a GTM email: a key that may start an Emma run (`emma_send_message` and the others in `AGENT_EXECUTION_TOOLS`) reaches Emma's own `send_gtm_status_report` inside that run with no scope and no cap, as for `memory:org`. Keeping those tools out of an outside agent's allowlist is the control for that.
+- Report subjects now collapse line breaks, control characters and runs of spaces in a plan or phase title to a single space, and a mailbox written in different cases (or with stray spaces) is one person, for the portal and Emma as well (both were reachable before; an agent that can write titles and contacts makes them matter). With a cap set (only this tool sets one), a contact that holds more than one address (ASCII or fullwidth commas, semicolons, spaces, line breaks or invisible separators) is refused before anything is sent: how Resend treats a comma-joined `to` is unverified, and the hourly budget counts sends. Only an owner can write such a contact (the MCP tools accept one address per contact). Addresses of failed sends still appear in the existing error log lines.
+- The two reports use the same sender domain as all platform mail; separating bulk reputation is an infrastructure step (see PR #4236).
+
+**Tests:** limiter (fake clock), tool (request, refusals, send flow, audit), HTTP scope gate against the real registry, key creation and discovery, and the real routes with two tenants. The public tool inventory snapshot gains the new tool and the reworded `manage_gtm_items` description.
+
+## ENG-2840: Eight account reads for outside agents over MCP (2026-11-25)
+
+- Eight tools that Emma has now exist on the MCP server (`backend/src/mcp/server/accountReadTools.ts`): `list_connected_account_posts`,
+  `load_connected_account_metrics`, `get_post_analytics` (a connected LinkedIn or Instagram account), `search_user_guide` (the public docs),
+  `get_user_profile` (the key's own email, display name, company name, plan), `get_ads_thresholds` (the caller's own Meta ad account),
+  `get_hot_lead_call_settings` and `get_lead_notification_settings` (organization settings). Same pattern as the lead reads: arguments checked
+  by name and by value, then the portal's own route as the key's own user (`search_user_guide` and `get_user_profile` are in-process), a
+  refusal is an error carrying only a short text, a 5xx or an unreachable service is a fixed text, a 4xx passes through.
+- Social reads cost something the others do not. Each can go live to LinkedIn or Instagram with the ACCOUNT OWNER's OAuth token (a plain
+  organization member reading a teammate's shared page uses the teammate's token, as in the portal), may refresh and store that token, and may
+  cache posts. The LinkedIn app quota is shared by every tenant; the portal throttles the same call per account (`routes/socialPosts.ts`),
+  Emma's tool and the `/api/emma` routes do not. Through MCP a call goes through `socialReadGuard`: an answer is kept 60 s per (caller, tool,
+  arguments) (a refusal or failure is never kept; an `success: true` answer that is empty because the provider call failed IS kept for the 60 s;
+  two identical calls at the same moment both go upstream; the memory is per caller, so one tenant's answer never serves another), and each
+  caller has an allowance of 30 provider-call units a minute per account across the three tools, each call costing what it can cost the provider:
+  posts 1 (plus 5 per post with metrics: a personal LinkedIn post with metrics is up to five calls), account metrics 4 (a LinkedIn company page is four calls), post analytics 5 per post (a personal
+  LinkedIn post is five sequential calls; at most 5 posts per call). An answer from memory costs nothing; a call that does not fit is refused
+  with the seconds to wait. The budget is per caller, not per account: members of one organization reading the owner's shared page each have
+  their own; one user's several keys share one allowance and there is no cap across callers. Inputs are bounded in the handler: `limit` 1 to 50 (default 10; with `include_metrics` at most 5, because a personal LinkedIn post with metrics is up to five provider calls), `include_metrics` default false (Emma's own tool defaults to true although its schema says false), `force_reload` is not an
+  input, dates `YYYY-MM-DD`, real, both or neither, at most 366 days (the range ends at 00:00 UTC of `end_date`), `post_ids` 1 to 5 distinct ids of
+  the shapes the posts tool hands out (a LinkedIn urn, an Instagram media number, a YouTube video id: Instagram puts the id into a Graph path; an
+  invented single path word of 11 characters still matches the YouTube shape and reaches one Graph path segment, bounded by the units), and
+  account and post ids refuse zero-width and bidirectional embedding/override characters (not the isolates U+2066-2069 or tag characters: the
+  account id is only compared exactly and never echoed). A personal LinkedIn profile shows only the posts created through AgentWeb (plus a long
+  instruction-style message addressed to Emma); `get_post_analytics` omits LinkedIn company-page posts the provider does not return. They are not `readOnly`
+  (policy 'write', need `tools:execute`). The other five are read-only, so a `tools:read` key (and an OAuth client) can call them, including the
+  two settings reads (the owner/admin rule is enforced on the route, whatever the key's scope). The routes themselves are unchanged and keep their token-budget class (`exempt` for the two GET
+  routes, as before).
+- Org settings: `get_lead_notification_settings` has a new thin route, `GET /api/emma/lead-notification-settings` (class `exempt`: a
+  settings read), that requires `org:configure`. Emma's own read has no role check, so any member of an organization can read its Slack channel
+  id and mentioned Slack user ids; the MCP tool is stricter on purpose, like `get_hot_lead_call_settings` (owner/admin enforced in its service;
+  its revision hash is dropped). Emma's tool is unchanged (both now call the same `readLeadNotificationSettings`).
+- `get_ads_thresholds` self-calls `GET /api/ads-thresholds/meta/:accountId`, whose ownership check is the caller's OWN connected Meta ad
+  accounts (the store key is not user-scoped, so that check is the tenant fence). Accounts shared by a teammate are not found (as in the
+  portal). The account id must be the numeric id (`act_` allowed): names are not matched, unlike Emma's own tool.
+- `search_user_guide` has no tenant data; its query is limited to 500 characters in the handler (the schema limit is not enforced on the MCP
+  path), and a docs outage is a fixed text (no Notion fallback: its content is not known to be public). `get_user_profile` is largely covered by
+  `get_account_status`; the new fields are the display name and company name.
+- NOT exposed, and why: `get_website_analytics`, `get_ga4_key_events`, `get_seo_metrics`. The GA4 property id and the Search Console domain
+  are saved with a format check only (`routes/seo.ts`, `analyticsConfigValidator.ts`), with no proof that the customer owns them, and are read
+  through the platform's shared Google service account; a research read of the code also found that deploying a landing page to a managed
+  subdomain adds the platform's own shared property and domain to the user's config (`services/v0Service.ts`), and the readers filter by an
+  exclude list, so another tenant's pages and queries could come back (code path read, not production data). That is a portal and Emma issue
+  today, which exposing it over MCP would widen: it needs an ownership proof first. Also not exposed: `search_ads_knowledge_base` (discovery
+  spends platform Foreplay credits, 1 per ad, up to 20 per call, no budget, and the platform key is the silent fallback), `account_summary`
+  (full-account scans, up to 20 model calls and live social calls per request), `get_clarity_metrics` (configured ids and links only).
+- Proof: unit tests of every request builder, refusal, error text and the guard (`mcp/server/__tests__/accountReadTools.test.ts`), and two
+  tenants through the real MCP server, tool, route and handler with the provider-facing posts service as the only double
+  (`mcp.accountReads.twoTenant.test.ts`): a foreign account id is refused by the real resolver before any provider call, a shared teammate
+  account is reachable only once shared and with the owner's token, the memory is per caller, a plain member is refused both settings reads,
+  and another tenant's ad account id is a 403. Not covered: the provider calls themselves, and an owner's own settings where the fake database
+  holds no plan or billing data.
+
+## ENG-2812: a share-link visitor cannot reopen the owner's session limit; pause wording without numbers (2026-11-25)
+
+Follow-up to the per-session turn/spend limit (PR #4242).
+
+**Found live on the test instance.** A share-link visitor who typed "continue" on a paused session reopened the owner's window and got an answer. `startSessionLimit` read the raw typed text and did not ask who typed it (the same class as ENG-3164).
+
+**What changed**
+- A visitor's turn never opens a new window, whatever the word ("continue", "yes", "keep going"...). The owner on the same session still can, also from their own share link.
+- A visitor on a paused session gets: "This shared chat has reached its limit. The person who shared it can reply "continue" to keep going."
+- A visitor's own turns never show the 75% / 90% notices (their advice, "start a new session", means nothing to them), and those turns do not claim a notice, so the owner's next turn still gets it. A visitor can still read a notice or pause text the OWNER's turn stored earlier in the shared transcript. The cost: an owner who is away gets no warning before the window fills (the pause text is the warning).
+- Owner decision (2026-11-25): the pause text carries no numbers (no step count, no dollar figure): "This session has reached its limit. Reply "continue" to keep going in this session, or start a new session." The exact usage is still logged (`session_limit_paused`) and stored on the message (`sessionLimitPaused`).
+
+**Which signal.** `isInteractiveShare`, the flag the share route already passes (`!viewerIsOwner`, so false for the owner on their own link). It crosses the worker boundary (controller payload, worker entry, then positional argument 9 of `generateMarketingResponse`, which is the function that runs in the worker). The in-process `isShareVisitorTurn` marker was NOT used on purpose: replies are generated in a forked worker, where that set is empty.
+
+**Limits (not changed here)**
+- Slack sessions and MCP agents: a "continue" typed there is judged by its text only (as before).
+- A visitor on a paused session sees the pause text and cannot reopen; only the owner can.
+- The kill switch `SESSION_LIMIT_ENFORCE=false` still disables the whole limit.
+
+**Tests.** `sessionLimit.test.ts`: visitor cannot confirm (several words, the owner still can), visitor wording, visitor notices neither shown nor claimed, new wording exact, and the wiring (the call site passes `isShareVisitor`, the flag crosses the worker boundary, the share route sends `!viewerIsOwner`).
+
+## ENG-2840: Two lanes in the shared email queue (2026-11-24)
+
+All platform email (about 30 call sites in 12 source files: support, webhooks, admin, intake, roadmap, hot-lead notices, send-as-sender, Emma, ...) funnels through ONE in-memory queue in `services/resendService.ts`, paced at 500 ms a send. It had no priority and no bound, and a Resend retry sleeps inside the worker. Production runs one backend instance (EB `Agentweb-backend-env-prod-3`, MinSize=MaxSize=1), so when several senders overlapped (several GTM reports at once, or later several outside agents over MCP, each emailing many contacts) a password reset or a support reply could wait behind all of their mail, and an unbounded queue is also unbounded memory. One report sends one email at a time, so a single report holds one slot only: the lanes matter when senders overlap, and they cap how much automated mail can wait at once.
+
+**What changed**
+- `EmailLane = 'transactional' | 'bulk'` and an optional `lane` on `sendEmail` / `sendSystemEmail`. **An email that names no lane is transactional, exactly as before**, so none of the existing callers change.
+- Two queues. The transactional one is the old one (unbounded, as before). The bulk one is bounded: at most 100 bulk emails waiting. The count is bulk mail only, so a backlog of transactional mail never makes bulk mail fail.
+- The worker serves transactional mail first. While bulk mail waits, every eleventh send is a bulk one, so bulk mail is never starved by a steady stream of transactional mail. The worker now chooses the next email AFTER the 500 ms pacing gap (it used to choose before it), so mail that arrives during the gap is considered.
+- A full bulk lane refuses at once with `EmailQueueFullError` (`code: 'EMAIL_QUEUE_FULL'`, "Nothing was sent. Try again in a minute."). Nothing is queued, so nothing waits and memory stays bounded. The GTM report code already counts a refused send as a failed recipient, so a report says so honestly instead of throwing.
+- The three GTM emails (work item update notification, phase status report, plan status report) now use the bulk lane. Nothing else changed lane.
+- The non-production email guard keeps the lane when it drops some recipients and queues the rest. `lane` never reaches Resend.
+- Queue log lines now carry `lane=` and the depth of both lanes.
+
+**What this does and does not guarantee**
+- A transactional email waits behind at most the one send already in flight and the 500 ms pacing gap that follows it, plus one bulk slot per eleven transactional sends while bulk mail waits. "In flight" includes that send's retries: the retry sleeps are 1 s then 2 s, plus up to three Resend calls, and a Resend call has no timeout, so a hung call holds the worker for as long as the network allows (as it did before this change).
+- The cost for bulk mail: once a bulk email is first in its lane it waits for at most ten more transactional sends (about 5 seconds under a sustained transactional stream). The GTM report routes hold the HTTP request open while their emails send, so a report can take that much longer in that case; a single report to N recipients still takes about N x 0.5 s, as before.
+- The ~30 existing callers all stay in the transactional lane, so they still share a lane with each other. Moving a heavy existing sender (a drip or sequence send) to the bulk lane is a one-word change per call site; it is not done here because it changes when those emails go out.
+- Sender reputation is not separated by this change: both lanes send from the same Resend domain. A separate sending domain for bulk mail is an infrastructure step; code for it cannot be proven live without it, so it is not added.
+- Per-process: the bound and the counters live in memory. Exact on today's single instance; revisit if the backend ever scales out.
+
+**Next, in their own PRs:** an opt-in `gtm:email` key scope that lets MCP agents send these emails, with a recipient cap per call, an hourly budget per key and an audit line.
+
+Tests: `src/__tests__/resendService.lanes.test.ts` (21), additions in `gtmPlanNotificationService.test.ts`; the existing queue, retry, error and guard tests pass unchanged.
+
+## ENG-2840: Admin GTM status report routes answer for what the report did (2026-11-24)
+
+The two admin routes `POST /api/admin/gtm-plans/:planId/send-status-report` and `.../phases/:phaseId/send-status-report` called the report functions and ignored what they returned, then answered `200 "... sent successfully"` whatever happened. The report functions have returned counts (`recipients`, `sent`, `failed`, `suppressed`) since ENG-2840 W2-4, and the customer routes (`routes/gtmPlan.ts`) and Emma's tool already answer with them through `describeStatusReport` (the MCP tool does not email at all); the admin routes were the one place left that still said "sent" for a report that went to nobody or was refused by the mail service.
+
+**What changed**
+- Both admin routes now answer through `describeStatusReport`, exactly as the customer routes do: `400` when nobody was chosen or the chosen contacts have no address, `502` when the mail service refused every email, `200` with exact counts otherwise (`sent`, `failed`, `suppressed`; a partial send says "sent to 2 of 3 recipients; 1 could not be sent"), and an email the non-production guard held back is not called sent.
+- Failure answers are `{ success: false, error: <message> }`, the same shape the customer routes use.
+
+**Behaviour change to know:** a request that chooses no recipient used to get `200 "Plan status report sent successfully"` and now gets `400`. The admin screen (`partner-portal/src/pages/GTMPlans.tsx`) closes its dialog only when `success` is true and logs any error to the console, so on a failed report the dialog now stays open instead of closing as if the report went out. It does not show the message; showing it is a front-end change that is not part of this fix.
+
+**Tests:** the status report tests in `admin.gtmPlans.test.ts` now run the real report code and the real route against a mail service double that says what it did (sent, nobody chosen, every email refused, a partial send, a guard-suppressed send). The old tests passed because the mail mock had no `sendSystemEmail`, so every send threw and was swallowed while the route still said "sent successfully", and they stubbed the notification service with `jest.doMock` after the route was imported, which replaced nothing. The old "missing notification options" test asserted the bug (`200` for a report to nobody) and is replaced by the `400` case.
+
+## ENG-2812: Per-session turn/spend limit enforced (2026-11-24)
+
+- `backend/src/services/sessionLimit.ts` counts every agent-loop model call on the session item
+  (`sessionLimitTurns`, `sessionLimitSpendMicroUsd`, atomic ADD) and pauses the loop before its next
+  call once the window is used up. Window caps: 150 turns / $20 at the $80 Starter allowance, scaled by
+  the tier's live `llmUsagePolicy.hardCostThresholdMicroUsd` (Pro/Super Premium 375 / $50, Max 1688 / $225,
+  Sandbox 938 / $125; Free and unlimited tiers 150 / $20). No config row is written.
+- A person replies "continue" (or keep going / yes / proceed ...) to open a fresh window; unattended
+  scheduled runs cannot confirm and stop with `terminationReason: 'session_limit'`. The controller's
+  media / work-plan auto-continuations and the verified-chat retry loop all stop on `pausedBySessionLimit`.
+- 75% / 90% notices are appended once per window to the in-app reply (never on unattended or Slack runs),
+  each claimed with a conditional write.
+- Not covered: the owner's own Claude plan route (AgentWeb does not pay for those turns), Live Voice.
+- Kill switch: `SESSION_LIMIT_ENFORCE=false`. Every DynamoDB error fails open.
+
+## ENG-3176: linkedin_manage_post normalizes post_urn before socialActions calls (2026-11-23)
+
+list_comments/comment/react/repost now accept a post URL or URL-encoded URN and reduce it to `urn:li:(share|ugcPost|activity):<id>`. A bare number or unrecognised value returns a model-facing validation message instead of LinkedIn's "Syntax exception in path variables". delete_post and get_analytics are unchanged. Code: `backend/src/emma/impl/linkedinPostUrn.ts`.
+
+## ENG-3165: Caller-URL SSRF refusal counted as by_design, not a create_html_template bug (2026-11-21)
+
+The failure classifier now reads the caller-URL guard refusal ("That URL cannot be fetched. Use a public https link.") as `by_design`, so the agent-mode failure-cluster loop stops filing the guard working correctly (e.g. a loopback probe) as a tool bug. The guard is unchanged.
+
+## ENG-2998: Stop unattended retries when every remaining plan step is blocked (2026-11-14)
+
+The reported Luma run exhausted 20 attempts despite all three work-plan steps being blocked by an unavailable prerequisite (`no_key`). Scheduled verification now stops with failure when a plan contains blocked steps and no pending/in-progress step remains. The failure alert retains blocked step titles and notes. Completed/skipped plans and pending/deferred retries keep their existing paths. The completion-gate continuation uses the same check.
+
+No customer credentials, schedules, persistence models, or outbound actions were changed. Offline regression evidence: three fixtures fail at 20 worker calls on the old code and stop at one call on the fix. Scheduler/automatic-continuation/failure-reason suites pass; typecheck passes. Deployment and live-model parity remain unverified.
+
+## ENG-2984: keep draft-send lease tokens out of lead responses (2026-11-14)
+
+- The existing shared CRM response sanitizer now removes `emailDraftSendClaimedAt` for single-lead, list, search and update responses without mutating the stored lead or draft.
+- Opslane's internal-marker exposure reproduced as three failing sanitizer regressions (unscoped, allowlisted and ordinary viewers), then passed. Existing concurrency tests remain green.
+- No persistence write, lease duration, send eligibility or customer-facing wording changes in this slice. The parent PR remains data-plane approval held; the separate abandoned-claim refusal finding is not addressed here.
+
+## ENG-2984: Storage-free duplicate-send guards (2026-11-13)
+
+- `send_email_to_lead` claims the stored draft with a conditional DynamoDB update that sets the transient
+  `emailDraftSendClaimedAt` attribute on the `AW-Leads` item (`crmDb.claimLeadEmailDraft`, condition
+  `emailDraft = :expected` and no fresh claim). The claim value is an ownership token (ISO timestamp + UUID).
+  The draft stays stored during the send and is cleared only after success. Two concurrent invocations for one
+  lead send at most once; the loser returns "Email draft already sent or changed". A failed send releases the
+  claim (`releaseLeadEmailDraftClaim`, conditional on the caller's token, so an expired sender cannot drop a
+  replacement sender's claim). A crashed sender's claim expires after 5 minutes. New attribute only; no tables or indexes.
+- `resendService.sendEmail` computes one deterministic `Idempotency-Key`
+  (`buildResendIdempotencyKey`: tenant, sorted recipients, content hash, intent) per send and passes it
+  on every attempt, so a timed-out request that actually landed is replayed by Resend rather than delivered
+  twice. Callers can pass `tenantId` + `idempotencyIntent` for cross-call dedupe; without an intent a per-call
+  nonce is used, so separate identical sends are still not merged (unchanged behaviour). Resend keys expire after 24h.
+- LinkedIn `send-message` without `list_id`/`lead_id` runs a fire-and-forget SHADOW check after sending:
+  it reads the chat the send returned (`getOutboundMessagesInChat`, no profile lookup) and logs
+  `SHADOW would-block (ENG-2984)` if an identical outbound message was already there. It never blocks.
+  Grep that marker in prod logs to size the would-block rate before deciding on enforcement.
+- Review limitation: the five-minute draft lease is not a permanent sent-message ledger. A provider
+  acceptance followed by process loss, or a provider call outliving the lease, can still be replayed.
+  ENG-2964 owns durable sent/ambiguous outcomes; this slice only prevents overlapping ordinary calls
+  and retries within a single Resend invocation. Rollback is a code revert; existing lease attributes
+  become inert and require no destructive cleanup.
+
 ## ENG-2840: the GTM plan tools on the MCP server now work; status reports say what was sent (2026-11-24)
 
 Wave 2, slice W2-4. `manage_gtm_plan` and `manage_gtm_items` (outside agents, over MCP) were mostly broken: most actions failed on every call, and the rest succeeded while dropping what the agent sent. No table, index, stored attribute or migration changes: a plan is still one row, and every write has the shape the customer portal already writes.
