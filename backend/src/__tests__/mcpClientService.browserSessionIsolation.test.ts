@@ -42,6 +42,9 @@ jest.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
   StreamableHTTPClientTransport: jest.fn().mockImplementation(() => ({ onclose: null, onerror: null })),
 }));
 
+// ENG-3187: a navigate call now asks whether its host is public (a DNS lookup). These suites are about pooling and retries, so the lookup is stubbed and they need no network.
+jest.mock('../utils/ssrfGuard', () => ({ ...jest.requireActual('../utils/ssrfGuard'), assertPublicHostname: jest.fn().mockResolvedValue(undefined) }));
+
 import { McpClientService } from '../mcp/client/mcpClientService';
 
 function makeClient(overrides: Record<string, unknown> = {}) {
