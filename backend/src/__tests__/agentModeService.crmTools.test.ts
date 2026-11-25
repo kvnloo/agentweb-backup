@@ -932,6 +932,21 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.recentEngagements).toHaveLength(1);
     });
 
+    // ENG-2840 (W2-5a): the allowance on how many email bodies one read may fetch (set only by the MCP lead tools)
+    it('passes the fetch allowance on to the data layer, and calls it exactly as before without one', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      await service.getLeadDetails(listId, leadId, userId, { maxContentFetches: 10 });
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId, { maxContentFetches: 10 });
+
+      await service.getLeadDetails(listId, leadId, userId);
+      // exactly three arguments: Emma's own tool and the portal fetch every missing body, as before
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId);
+    });
+
     it('should truncate HTML email draft to preview', async () => {
       const leadWithDraft = {
         ...mockLead,
@@ -1959,6 +1974,19 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.engagementSummary.total).toBe(5);
       expect(result.engagements).toHaveLength(2);
       expect(result.engagements[0].eventType).toBe('email.sent');
+    });
+
+    it('passes the fetch allowance on to the data layer, and calls it exactly as before without one (ENG-2840 W2-5a)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      await service.getLeadEngagements(listId, leadId, userId, 5, { maxContentFetches: 10 });
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId, { maxContentFetches: 10 });
+
+      await service.getLeadEngagements(listId, leadId, userId, 5);
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId);
     });
 
     it('should truncate HTML email content in engagements (legacy string format)', async () => {

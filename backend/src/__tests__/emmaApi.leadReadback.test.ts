@@ -99,6 +99,13 @@ describe('POST /api/emma/lead-details (get_lead_details projection)', () => {
     expect(mockCrmDb.getLeadById).not.toHaveBeenCalled();
   });
 
+  it('an identity in the body changes nothing on lead-details when the allowance is present either', async () => {
+    mockService.getLeadDetails.mockResolvedValueOnce({ success: true, lead: {} });
+    await request(app).post('/api/emma/lead-details')
+      .send({ list_id: 'list-1', lead_id: 'l1', max_content_fetches: 10, userId: 'someone-else', user_id: 'someone-else' });
+    expect(mockService.getLeadDetails).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', { maxContentFetches: 10 });
+  });
+
   it('max_content_fetches on lead-details: passed on when valid, absent otherwise (the readback verifier sends none and is unchanged)', async () => {
     const post = (body: Record<string, unknown>) => {
       mockService.getLeadDetails.mockResolvedValueOnce({ success: true, lead: {} });
@@ -167,6 +174,13 @@ describe('POST /api/emma/lead-engagements (get_lead_engagements projection)', ()
       await post({ max_content_fetches: bad });
       expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', undefined);
     }
+  });
+
+  it('an identity in the body changes nothing when the allowance is present either', async () => {
+    mockService.getLeadEngagements.mockResolvedValueOnce({ success: true, engagements: [] });
+    await request(app).post('/api/emma/lead-engagements')
+      .send({ list_id: 'list-1', lead_id: 'l1', max_content_fetches: 10, userId: 'someone-else', user_id: 'someone-else' });
+    expect(mockService.getLeadEngagements).toHaveBeenLastCalledWith('list-1', 'l1', 'caller-1', undefined, { maxContentFetches: 10 });
   });
 
   it('the allowance reaches the data layer through the real handler', async () => {
