@@ -440,6 +440,26 @@ describe('CRM Group Email Endpoints', () => {
       );
     });
 
+    it('treats {{first_name}} (snake_case) as covered by a populated First Name', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'a@test.com', firstName: 'Alice' },
+          { leadId: '2', email: 'b@test.com' }, // genuinely missing
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      mockReq.body = { subject: 'Hello {{first_name}}', htmlContent: '<p>Hi {{firstName}} / {{First Name}}</p>' };
+
+      await findHandler('/lists/:listId/group-email/prepare', 'post')!(mockReq, mockRes);
+
+      const result = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(result.readyCount).toBe(1);
+      expect(result.notReadyCount).toBe(1);
+      expect(result.variableCoverage.first_name).toEqual({ present: 1, missing: 1 });
+      expect(result.variableCoverage.firstName).toEqual({ present: 1, missing: 1 });
+    });
+
     it('should return 400 if subject and htmlContent are missing', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
         listId: 'list-1',
@@ -547,6 +567,36 @@ describe('CRM Group Email Endpoints', () => {
       const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       expect(response.sent).toBe(1);
       expect(response.skippedUnsubscribed).toBe(1);
+    });
+
+    it('sends to leads using {{first_name}} instead of skipping them, and substitutes the name', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'a@test.com', firstName: 'Alice', lastName: 'Ng' },
+          { leadId: '2', email: 'b@test.com', lastName: 'Lee' }, // no first name -> skipped
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+      mockReq.body = {
+        senderEmail: 'me@test.com',
+        senderName: 'Me',
+        subject: 'Hello {{first_name}}',
+        htmlContent: '<p>Hi {{first_name}} {{last_name}}</p>',
+      };
+
+      await findHandler('/lists/:listId/group-email/send', 'post')!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      expect(call.to).toBe('a@test.com');
+      expect(call.subject).toBe('Hello Alice');
+      expect(call.html).toContain('Hi Alice Ng');
+      expect(call.html).not.toContain('{{');
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.sent).toBe(1);
+      expect(response.skippedMissingVars).toBe(1);
     });
 
     describe('ENG-2367 — RFC 8058 List-Unsubscribe headers', () => {

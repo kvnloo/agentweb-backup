@@ -14,8 +14,26 @@ const LEAD_STANDARD_FIELDS = STANDARD_FIELDS.filter(
  * arbitrary unknown tokens return false.
  */
 export function isSupportedVariable(varName: string): boolean {
-  if (varName.startsWith('customFields.')) return true;
-  return LEAD_STANDARD_FIELDS.includes(varName);
+  if (varName.trim().startsWith('customFields.')) return true;
+  const canonical = canonicalVariableName(varName);
+  return canonical !== null && LEAD_STANDARD_FIELDS.includes(canonical);
+}
+
+// Lookup key: lowercase with spaces/underscores/hyphens removed, so
+// firstName, first_name, first name, First Name, FIRST-NAME all resolve the same.
+const STANDARD_FIELD_BY_KEY: Record<string, string> = Object.fromEntries(
+  STANDARD_FIELDS.map((f) => [f.toLowerCase(), f]),
+);
+STANDARD_FIELD_BY_KEY['companyname'] = 'company';
+
+/**
+ * Maps any accepted spelling of a standard variable (camelCase, snake_case,
+ * spaced, any case) to its canonical lead field, e.g. "first_name" -> "firstName".
+ * Returns null for non-standard names (including customFields.* paths).
+ */
+export function canonicalVariableName(varName: string): string | null {
+  const key = varName.trim().replace(/[\s_-]+/g, '').toLowerCase();
+  return STANDARD_FIELD_BY_KEY[key] ?? null;
 }
 
 /**
@@ -113,6 +131,7 @@ export function extractVariables(template: string): string[] {
  * Check whether a lead has a non-empty value for a given variable name.
  */
 export function leadHasVariable(lead: Record<string, any>, varName: string): boolean {
+  varName = varName.trim();
   if (varName.startsWith('customFields.')) {
     const fieldName = varName.slice('customFields.'.length);
     const customFields = lead.customFields;
@@ -122,7 +141,8 @@ export function leadHasVariable(lead: Record<string, any>, varName: string): boo
     }
     return false;
   }
-  const val = lead[varName];
+  const canonical = canonicalVariableName(varName);
+  const val = lead[canonical ?? varName];
   return val != null && val !== '';
 }
 
@@ -266,16 +286,6 @@ export function checkEmailFormat(html: string): EmailFormatWarning[] {
   return warnings;
 }
 
-// Map spaced/alternate variable names that users commonly type to their camelCase keys.
-// e.g. "first name" → "firstName"
-const VARIABLE_ALIASES: Record<string, string> = {
-  'first name': 'firstName',
-  'last name': 'lastName',
-  'First Name': 'firstName',
-  'Last Name': 'lastName',
-  'First name': 'firstName',
-  'Last name': 'lastName',
-};
 
 /**
  * Injects <meta name="color-scheme" content="light"> into the <head> if not already present.
@@ -302,18 +312,13 @@ export function substituteVariables(template: string, lead: Record<string, any>)
 
   let result = template;
 
-  // Replace standard fields: {{firstName}}, {{lastName}}, etc.
-  for (const field of STANDARD_FIELDS) {
-    const regex = new RegExp(`\\{\\{${field}\\}\\}`, 'g');
-    result = result.replace(regex, lead[field] != null ? String(lead[field]) : '');
-  }
-
-  // Replace aliased field names: {{first name}}, {{last name}}, etc.
-  for (const [alias, canonical] of Object.entries(VARIABLE_ALIASES)) {
-    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\{\\{${escaped}\\}\\}`, 'g');
-    result = result.replace(regex, lead[canonical] != null ? String(lead[canonical]) : '');
-  }
+  // Replace standard fields in any accepted spelling: {{firstName}}, {{first_name}},
+  // {{first name}}, {{First Name}}, ... (same resolver as leadHasVariable).
+  result = result.replace(/\{\{([^}]+)\}\}/g, (match, rawName: string) => {
+    const canonical = canonicalVariableName(rawName);
+    if (!canonical) return match;
+    return lead[canonical] != null ? String(lead[canonical]) : '';
+  });
 
   // Replace custom fields: {{customFields.xxx}}
   result = result.replace(/\{\{customFields\.([^}]+)\}\}/g, (_match, fieldName) => {
