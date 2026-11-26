@@ -271,6 +271,13 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       expect(post).not.toHaveBeenCalled();
     });
 
+    it('the ceiling is shared by every place a key is named, so the multiplied text is never built for an object that cannot fit', async () => {
+      const key = `tool-responses/${MY_SESSION}/call1.txt`;
+      const instruction = Array(10).fill(key).join(' ');
+      await performDataAnalysis([], instruction, 'me');
+      expect(readS3).toHaveBeenCalledWith(key, undefined, { maxBytes: Math.floor((3 * (200_000 - instruction.length)) / 10) });
+    });
+
     it('a key named many times stops as soon as the instruction is over the limit', async () => {
       const key = `tool-responses/${MY_SESSION}/call1.txt`;
       readS3.mockResolvedValueOnce('x'.repeat(5_000));
