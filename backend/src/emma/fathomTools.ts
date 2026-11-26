@@ -24,8 +24,9 @@ const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
 const FATHOM_MAX_PAGES = 20;
 
 /**
- * ENG-2840 (W2-9): each Fathom request gives up after 30 s. Without it a request that never answers held the call (and the
- * MCP route that runs this tool) open with no bound. With it, fathom_get_meetings takes at most 20 pages x 30 s.
+ * ENG-2840 (W2-9): axios's `timeout` on each Fathom request. In Node it is an idle timer (30 s with no data on the socket), not a cap on
+ * the whole request: a request that never answers now fails instead of holding the call open forever, but a slow trickle can run longer.
+ * An outside (MCP) caller is bounded by its self-call's own wait (meetingEventReadTools.ts TIMEOUTS_MS), not by this.
  */
 export const FATHOM_REQUEST_TIMEOUT_MS = 30_000;
 
