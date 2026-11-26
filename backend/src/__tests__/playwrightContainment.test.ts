@@ -14,7 +14,7 @@ import {
   processIsAlive,
   withoutBrowserClientMeta,
 } from '../mcp/client/playwrightContainment';
-import { STDIO_CHILD_ENV_ALLOWLIST, buildStdioChildEnv } from '../mcp/client/stdioChildEnv';
+import { ALLOWED_PREFIXES, STDIO_CHILD_ENV_ALLOWLIST, buildStdioChildEnv } from '../mcp/client/stdioChildEnv';
 import { SsrfBlockedError } from '../utils/ssrfGuard';
 
 // The NAMES (never values) the production backend environment held on 2026-11-25, read from Elastic Beanstalk, plus the ones a host adds itself.
@@ -49,7 +49,7 @@ describe('playwrightChildEnv', () => {
   it('passes on at least everything the shared stdio allow-list passes on, names and prefixes (the two lists must not drift apart)', () => {
     const probe: NodeJS.ProcessEnv = {};
     for (const name of STDIO_CHILD_ENV_ALLOWLIST) probe[name] = `v-${name}`;
-    for (const prefix of ['LC_', 'XDG_', 'NODE_', 'PLAYWRIGHT_', 'npm_', 'SSL_', 'HTTP', 'FONT', 'GTK_', 'DBUS_', 'DISPLAY', 'WAYLAND_', 'GIO_', 'GDK_']) {
+    for (const prefix of [...ALLOWED_PREFIXES, 'NODE_', 'PLAYWRIGHT_', 'npm_', 'SSL_', 'HTTP', 'FONT', 'GTK_', 'DBUS_', 'DISPLAY', 'WAYLAND_', 'GIO_', 'GDK_']) {
       probe[`${prefix}PROBE`] = 'v';
     }
     const browser = playwrightChildEnv(probe);
