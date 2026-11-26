@@ -2421,6 +2421,9 @@ async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
     response = await axios.get(csvUrl, {
       maxRedirects: 0,
       timeout: SEED_CSV_TIMEOUT_MS,
+      // axios's timeout only fires when the connection goes quiet; the signal makes 60 s a limit on the whole download (a body sent
+      // one byte at a time would otherwise be held in memory for as long as the sender likes).
+      signal: AbortSignal.timeout(SEED_CSV_TIMEOUT_MS),
       maxContentLength: SEED_CSV_MAX_BYTES,
       maxBodyLength: SEED_CSV_MAX_BYTES,
       lookup: (_hostname: string, options: any, callback: any) => {
@@ -2431,6 +2434,9 @@ async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
   } catch (err: any) {
     if (/maxContentLength|maxBodyLength|too large/i.test(String(err?.message || ''))) {
       throw new Error(`csv_url: the file is larger than ${SEED_CSV_MAX_BYTES / (1024 * 1024)} MB, the most a seed audience CSV may be`);
+    }
+    if (err?.code === 'ERR_CANCELED' || err?.code === 'ECONNABORTED' || err?.name === 'CanceledError' || err?.name === 'TimeoutError') {
+      throw new Error(`csv_url: the file did not download within ${SEED_CSV_TIMEOUT_MS / 1000} s`);
     }
     throw err;
   }
