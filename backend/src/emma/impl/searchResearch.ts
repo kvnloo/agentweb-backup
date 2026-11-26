@@ -486,17 +486,27 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
       for (const key of uniqueKeys) keyDecisions.push(await fileAccess.check(key));
       if (keyDecisions.includes('refuse')) return refuseFile();
       if (keyDecisions.includes('unavailable')) return fileCheckUnavailable();
+      const instructionTooLarge = (size?: number) => ({
+        success: false,
+        message: `After resolving tool-response references, the analysis_instruction is too large (${size !== undefined ? `${size.toLocaleString()} characters, ` : ''}max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`
+      });
       for (const key of uniqueKeys) {
         try {
-          const content = await getS3ObjectAsString(key);
+          // Read at most what could still fit in the instruction (a character is at most 3 UTF-8 bytes): a larger object is refused
+          // without loading it, as the whole instruction would be refused after it anyway.
+          const allowance = Math.max(0, 3 * (MAX_INLINE_INSTRUCTION_CHARS - resolved.length));
+          const content = await getS3ObjectAsString(key, undefined, { maxBytes: allowance });
           if (content) {
             // Replace all occurrences of the key with the actual content inline
             resolved = resolved.split(key).join(`\n[Content of ${key}]:\n${content}\n`);
             resolvedKeys.push(key);
+            // A key named many times multiplies its content: stop as soon as the instruction is over the limit.
+            if (resolved.length > MAX_INLINE_INSTRUCTION_CHARS) return instructionTooLarge(resolved.length);
           } else {
             failedKeys.push(key);
           }
-        } catch {
+        } catch (readErr) {
+          if ((readErr as any)?.name === 'S3ObjectTooLargeError') return instructionTooLarge();
           failedKeys.push(key);
         }
       }

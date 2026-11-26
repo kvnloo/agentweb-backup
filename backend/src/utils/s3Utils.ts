@@ -231,6 +231,8 @@ export async function getS3ObjectAsString(
       if (buffer.byteLength > maxBytes) throw new S3ObjectTooLargeError(maxBytes);
       return buffer.toString('utf-8');
     } catch (error) {
+      // A ranged read of an empty object answers 416 InvalidRange: with a limit set, that object is simply empty (as a full read was).
+      if (options?.maxBytes !== undefined && ((error as any)?.code === 'InvalidRange' || (error as any)?.statusCode === 416)) return '';
       lastError = error;
       if (attempt >= maxRetries || !isTransientS3Error(error)) throw error;
       // Exponential backoff with light jitter: 100ms, 200ms, 400ms (+ up to 50ms).
