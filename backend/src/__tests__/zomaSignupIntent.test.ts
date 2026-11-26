@@ -40,6 +40,19 @@ describe('ENG-3124 Google OAuth state carries the Zoma intent', () => {
 
 describe('ENG-2781 Databricks-origin signup intent', () => {
   const { encodeGoogleOAuthState, parseGoogleOAuthState } = require('../services/zomaSignupIntent');
+  const FLAG = process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED;
+  beforeEach(() => { process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED = 'true'; });
+  afterAll(() => { if (FLAG === undefined) delete process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED; else process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED = FLAG; });
+
+  it('a .db intent minted while the flag was on is refused once the flag is off (no replay)', () => {
+    const db = mintZomaSignupIntent({ databricks: true });
+    delete process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED;
+    expect(isDatabricksSignupIntent(db)).toBe(false);
+    expect(hasValidZomaSignupIntent(db)).toBe(false);
+    expect(isZomaSignup({ signupIntent: db })).toBe(false);
+    expect(parseGoogleOAuthState(`customer~${db}`).databricksSignup).toBeUndefined();
+    expect(isZomaSignup({ signupIntent: mintZomaSignupIntent() })).toBe(true);
+  });
 
   it('a Databricks intent is still a valid Zoma intent, and only it is Databricks-origin', () => {
     const db = mintZomaSignupIntent({ databricks: true });

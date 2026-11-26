@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 import { getJwtSecret } from '../config/jwt';
+import { zomaDatabricksLaunchEnabled } from './zomaOpenWindow';
 
 // Domain-separated from login tokens. The consent page already forwards signupIntent.
 const signature = (payload: string) => createHmac('sha256', getJwtSecret()).update(`zoma-signup:${payload}`).digest('base64url');
@@ -22,6 +23,8 @@ function readZomaSignupIntent(intent: unknown): { databricks: boolean } | null {
   const parts = intent.split('.');
   const databricks = parts.length === 3 && parts[1] === DATABRICKS_MARKER;
   if (parts.length !== 2 && !databricks) return null;
+  // A .db intent minted while the launch flag was on is not honored once the flag is off.
+  if (databricks && !zomaDatabricksLaunchEnabled()) return null;
   const expiry = parts[0];
   const mac = parts[parts.length - 1];
   if (!/^\d+$/.test(expiry) || !mac || Number(expiry) <= Date.now() / 1000) return null;
