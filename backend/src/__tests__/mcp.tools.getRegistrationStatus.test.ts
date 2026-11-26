@@ -203,3 +203,18 @@ describe('extractRegistrationStatusEmails Opslane regressions (ENG-3189)', () =>
   });
 });
 });
+
+describe('ENG-3189 extractor edge cases', () => {
+  it('keeps a "Last, First <addr>" contact as one entry', () => {
+    const r = extractRegistrationStatusEmails('Doe, Jane <jane@acme.com>, bob@acme.com');
+    expect(r.emails).toEqual(['jane@acme.com', 'bob@acme.com']);
+    expect(r.skipped).toEqual([]);
+  });
+  it('bounds total pieces scanned', () => {
+    const many = Array.from({ length: 5000 }, () => 'x'.repeat(500)).join(',');
+    const r = extractRegistrationStatusEmails(many);
+    expect(r.emails).toEqual([]);
+    expect(r.skipped.length).toBeLessThanOrEqual(2001);
+    expect(r.skipped[r.skipped.length - 1]).toBe('[truncated: too many entries]');
+  });
+});

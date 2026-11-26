@@ -4675,6 +4675,9 @@ Typical prompts this answers:
 // non-ASCII domain) are looked up rather than skipped.
 const REGISTRATION_EMAIL_PATTERN = /[\p{L}\p{N}.!#$%&'*+/=?^_`{|}~-]+@[\p{L}\p{N}.-]+\.(?:xn--[A-Za-z0-9-]+|\p{L}{2,})/gu;
 const REGISTRATION_EMAIL_PIECE_MAX = 512;
+// Bound total extractor work: the route accepts at most 1000 emails, so pieces
+// beyond this are reported (truncated) instead of scanned.
+const REGISTRATION_EMAIL_MAX_PIECES = 2000;
 
 /**
  * ENG-3189: models pass `emails` as an array, a comma/space-separated string,
@@ -4685,6 +4688,8 @@ const REGISTRATION_EMAIL_PIECE_MAX = 512;
 export function extractRegistrationStatusEmails(raw: unknown): { emails: string[]; skipped: unknown[] } {
   const emails: string[] = [];
   const skipped: unknown[] = [];
+  let pieceCount = 0;
+  let truncated = false;
   const visit = (value: unknown, depth: number): void => {
     if (Array.isArray(value) && depth < 3) {
       value.forEach((v) => visit(v, depth + 1));
@@ -4706,7 +4711,17 @@ export function extractRegistrationStatusEmails(raw: unknown): { emails: string[
       // Split list separators first so a piece with no address
       // ("a@x.com, not-an-email") is reported in `skipped`, not dropped.
       const pieces: string[] = [];
-      for (const piece of trimmed.split(/[,;\n]+/)) {
+      const rawPieces = trimmed.split(/[,;\n]+/);
+      // "Last, First <addr>": a bare name before a display-name contact is part
+      // of that contact, not a separate entry with no address.
+      for (let i = 0; i < rawPieces.length - 1; i++) {
+        const cur = rawPieces[i].trim();
+        if (cur && !cur.includes('@') && /^[\p{L}][\p{L}\s.'-]{0,80}$/u.test(cur) && /^\s*[^<@,]{0,80}<[^>]*@/.test(rawPieces[i + 1])) {
+          rawPieces[i + 1] = `${cur} ${rawPieces[i + 1].trim()}`;
+          rawPieces[i] = '';
+        }
+      }
+      for (const piece of rawPieces) {
         const part = piece.trim();
         if (!part) continue;
         // A long whitespace-separated list ("a@x.com b@y.com ...") arrives as one
@@ -4716,6 +4731,12 @@ export function extractRegistrationStatusEmails(raw: unknown): { emails: string[
       }
       for (const part of pieces) {
         if (!part) continue;
+        if (pieceCount >= REGISTRATION_EMAIL_MAX_PIECES) {
+          if (!truncated) skipped.push('[truncated: too many entries]');
+          truncated = true;
+          return;
+        }
+        pieceCount += 1;
         // Bound regex input: an address is <=254 chars; a display-name
         // contact fits well under this. Oversized pieces are reported, not scanned.
         if (part.length > REGISTRATION_EMAIL_PIECE_MAX) {
