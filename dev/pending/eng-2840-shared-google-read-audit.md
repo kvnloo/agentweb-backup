@@ -10,7 +10,8 @@
 - This change is step 1 of a two-step fix and changes nothing a customer can do: it writes one structured `shared_google_read` line per
   configured resource per call to the application log (`services/sharedGoogleAudit.ts`): `kind` (`drive-file`, `ga4`, `gsc`), `userId`, `idHash`
   (12 hex characters of a SHA-256 of the id; a Search Console property is first lowercased and stripped of its scheme, trailing slash and
-  `sc-domain:` prefix, so one property has one hash), `source` (the function or route), then when known `orgId` (analytics lines only: the
+  `sc-domain:` prefix, so the forms of one site share a hash; this also merges an http and an https URL-prefix property and a domain property
+  of the same site, which Google treats as separate, erring toward more matches), `source` (the function or route), then when known `orgId` (analytics lines only: the
   Drive reader does not know the caller's organization), `configSource` (`self`: the caller's
   own config; `org`: the organization's, shared with a member), `platform` (true when the id is one of the platform's own landing-page GA4
   properties or Search Console domains from `getLandingPagesConfig`, which deploying a landing page adds to the deployer's config; the list is
