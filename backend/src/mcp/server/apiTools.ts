@@ -4671,7 +4671,7 @@ Typical prompts this answers:
  * a JSON-encoded array string, or a comma/semicolon/whitespace-separated
  * string — and return trimmed, non-empty strings.
  */
-const REGISTRATION_EMAIL_PATTERN = /[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+const REGISTRATION_EMAIL_PATTERN = /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 
 /**
  * ENG-3189: models pass `emails` as an array, a comma/space-separated string,

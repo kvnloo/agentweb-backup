@@ -1223,6 +1223,19 @@ export function validateAndRepairToolArgs(
     }
   }
 
+  // ENG-3189: get_registration_status declares `emails: array`, but models send a
+  // comma-separated or quoted-list string ("a@x.com, b@y.com" / "\"a@x.com\", \"b@y.com\"").
+  // The type check below rejected those before the tool's own coercion ran.
+  // Extract the addresses into an array; a string with no address is left as-is
+  // so it still surfaces as type_mismatch.
+  if (input.toolName === 'get_registration_status' && typeof repairedArgs.emails === 'string') {
+    const found = repairedArgs.emails.match(/[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g);
+    if (found && found.length > 0) {
+      repairedArgs.emails = found;
+      repairs.push('emails:string_split');
+    }
+  }
+
   for (const [name, propSchema] of Object.entries(properties)) {
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
     const typeIssue = validateJsonSchemaType(name, repairedArgs[name], propSchema);

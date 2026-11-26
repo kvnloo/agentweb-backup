@@ -25,7 +25,7 @@ jest.mock('../services/agentModeService', () => ({
 
 import { mcpToolRegistry } from '../mcp/server/registry';
 import { mcpFetch } from '../mcp/server/httpClient';
-import '../mcp/server/apiTools';
+import { extractRegistrationStatusEmails } from '../mcp/server/apiTools';
 
 const mockMcpFetch = mcpFetch as jest.MockedFunction<typeof mcpFetch>;
 
@@ -165,5 +165,12 @@ describe('get_registration_status', () => {
       mockMcpFetch.mockRejectedValue(new Error('API error (403): Admin access required'));
       await expect(mcpToolRegistry.execute('get_registration_status', { emails: [] }, context)).rejects.toThrow('403');
     });
+  });
+
+  it('keeps full addresses with RFC 5322 atext characters (no suffix match)', () => {
+    expect(extractRegistrationStatusEmails(['a!b@example.com', 'x=y/z@acme.io']).emails).toEqual([
+      'a!b@example.com',
+      'x=y/z@acme.io',
+    ]);
   });
 });

@@ -3991,4 +3991,27 @@ describe('ENG-2572 — evaluate wrap runs even without a resolved input schema',
     });
     expect(result.status).toBe('valid');
   });
+
+  // ENG-3189: Opslane run 2488 — string emails were rejected as type_mismatch
+  // before the tool's own coercion could run.
+  describe('get_registration_status string emails', () => {
+    const schema = {
+      type: 'object',
+      properties: { emails: { type: 'array', items: { type: 'string' } }, include_chat_session_count: { type: 'boolean' } },
+      required: ['emails'],
+    };
+    it.each([
+      ['comma-separated', 'lead1@acme.com, lead2@acme.com'],
+      ['quoted list', '"lead1@acme.com", "lead2@acme.com"'],
+    ])('splits a %s string into the two addresses', (_label, emails) => {
+      const result = validateAndRepairToolArgs({ toolName: 'get_registration_status', args: { emails }, inputSchema: schema, effect: 'read' } as any);
+      expect(result.status).not.toBe('invalid');
+      expect(result.repairs).toContain('emails:string_split');
+      expect((result.args as any).emails).toEqual(['lead1@acme.com', 'lead2@acme.com']);
+    });
+    it('leaves a string with no address as a type_mismatch', () => {
+      const result = validateAndRepairToolArgs({ toolName: 'get_registration_status', args: { emails: 'none' }, inputSchema: schema, effect: 'read' } as any);
+      expect(result.status).toBe('invalid');
+    });
+  });
 });
