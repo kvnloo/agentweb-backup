@@ -40,3 +40,14 @@ it('a transient error is still retried with a limit set', async () => {
   await expect(getS3ObjectAsString('k', 'b', { maxBytes: 10, sleep: async () => undefined })).resolves.toBe('ok');
   expect(mockGetObject).toHaveBeenCalledTimes(2);
 });
+
+it('with a limit, an empty object (S3 answers 416 InvalidRange to a ranged read) reads as empty text, not an error', async () => {
+  mockGetObject.mockReturnValueOnce({ promise: async () => { throw Object.assign(new Error('range'), { code: 'InvalidRange', statusCode: 416 }); } });
+  await expect(getS3ObjectAsString('k', 'b', { maxBytes: 10, sleep: async () => undefined })).resolves.toBe('');
+  expect(mockGetObject).toHaveBeenCalledTimes(1);
+});
+
+it('without a limit, a 416 is not special-cased', async () => {
+  mockGetObject.mockReturnValue({ promise: async () => { throw Object.assign(new Error('range'), { code: 'InvalidRange', statusCode: 416 }); } });
+  await expect(getS3ObjectAsString('k', 'b', { sleep: async () => undefined })).rejects.toThrow('range');
+});

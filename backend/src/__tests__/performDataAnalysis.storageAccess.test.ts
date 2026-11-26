@@ -259,10 +259,30 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
   });
 
   describe('tool-response keys written inside the instruction text', () => {
+    it('reads an inlined key with a byte ceiling of what still fits (3 bytes a character), and refuses one over it unread', async () => {
+      const key = `tool-responses/${MY_SESSION}/call1.txt`;
+      const instruction = `Use ${key} and total the clicks.`;
+      await performDataAnalysis([], instruction, 'me');
+      expect(readS3).toHaveBeenCalledWith(key, undefined, { maxBytes: 3 * (200_000 - instruction.length) });
+      readS3.mockRejectedValueOnce(Object.assign(new Error('too large'), { name: 'S3ObjectTooLargeError' }));
+      post.mockClear();
+      const r = await performDataAnalysis([], instruction, 'me');
+      expect(r).toMatchObject({ success: false, message: expect.stringMatching(/analysis_instruction is too large/) });
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it('a key named many times stops as soon as the instruction is over the limit', async () => {
+      const key = `tool-responses/${MY_SESSION}/call1.txt`;
+      readS3.mockResolvedValueOnce('x'.repeat(5_000));
+      const r = await performDataAnalysis([], Array(60).fill(key).join(' '), 'me');
+      expect(r).toMatchObject({ success: false, message: expect.stringMatching(/analysis_instruction is too large/) });
+      expect(post).not.toHaveBeenCalled();
+    });
+
     it('inlines the caller\'s own tool response', async () => {
       const key = `tool-responses/${MY_SESSION}/call1.txt`;
       await performDataAnalysis([], `Use ${key} and total the clicks.`, 'me');
-      expect(readS3).toHaveBeenCalledWith(key);
+      expect(readS3).toHaveBeenCalledWith(key, undefined, { maxBytes: expect.any(Number) });
       const sent = post.mock.calls[0][1].contents[0].parts.at(-1).text as string;
       expect(sent).toContain('a,b\n1,2');
     });
