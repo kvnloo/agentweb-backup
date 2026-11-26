@@ -984,6 +984,15 @@ export function validateAndRepairToolArgs(
     : [];
   const allowAdditional = schema.additionalProperties !== false;
   let repairedArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+  // ENG-3189: get_registration_status reads `emails ?? email`; map the singular
+  // key before unknown-key/required checks reject it.
+  if (input.toolName === 'get_registration_status') {
+    if ((repairedArgs.emails === undefined || repairedArgs.emails === null) && repairedArgs.email !== undefined && repairedArgs.email !== null) {
+      repairedArgs.emails = repairedArgs.email;
+      delete repairedArgs.email;
+      repairs.push('email->emails');
+    }
+  }
   if (input.toolName === 'call_hubspot_api') {
     const normalized = normalizeHubSpotArgs(repairedArgs);
     if (JSON.stringify(normalized) !== JSON.stringify(repairedArgs)) {

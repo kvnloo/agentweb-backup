@@ -4010,6 +4010,17 @@ describe('ENG-2572 — evaluate wrap runs even without a resolved input schema',
       expect(result.repairs).toContain('emails:string_wrap');
       expect((result.args as any).emails).toEqual([emails]);
     });
+    it('chat path: wrapped comma list still yields one status entry per address', () => {
+      const { extractRegistrationStatusEmails } = require('../mcp/server/apiTools');
+      const result = validateAndRepairToolArgs({ toolName: 'get_registration_status', args: { emails: 'lead1@acme.com, lead2@acme.com' }, inputSchema: schema, effect: 'read' } as any);
+      expect(extractRegistrationStatusEmails((result.args as any).emails).emails).toEqual(['lead1@acme.com', 'lead2@acme.com']);
+    });
+    it('accepts the singular email key', () => {
+      const result = validateAndRepairToolArgs({ toolName: 'get_registration_status', args: { email: 'a@x.com' }, inputSchema: { ...schema, additionalProperties: false }, effect: 'read' } as any);
+      expect(result.status).not.toBe('invalid');
+      expect((result.args as any).emails).toEqual(['a@x.com']);
+      expect((result.args as any).email).toBeUndefined();
+    });
     it('turns {email} objects (direct or JSON-array string) into strings', () => {
       for (const emails of [[{ email: 'a@x.com' }, 'b@y.com', 7], '[{"email":"a@x.com"},"b@y.com",7]']) {
         const result = validateAndRepairToolArgs({ toolName: 'get_registration_status', args: { emails }, inputSchema: schema, effect: 'read' } as any);
