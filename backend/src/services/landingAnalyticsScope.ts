@@ -13,8 +13,8 @@
  *  - `hasLocationOn` gates the platform property the metrics route adds for a host named in `?domain=`.
  * A caller with no own location gets an impossible filter (an empty answer of the usual shape), never the unfiltered property.
  *
- * Own locations = the domains the caller (and the members of the caller's organization: one tenant) own in AW-CustomDomains (managed
- * subdomains and custom domains: the whole host), plus each own non-archived landing page's live URL (customDomainUrl, else deployedUrl):
+ * Own locations = the active domains the caller (and the members of the caller's organization: one tenant) own in AW-CustomDomains
+ * (managed subdomains and verified custom domains: the whole host; a pending row is not ownership), plus each own non-archived landing page's live URL (customDomainUrl, else deployedUrl):
  * its host when that host is owned, or is a project's own `*.vercel.app` host; otherwise, on a platform domain, only its host AND path
  * prefix (a shared platform host is never claimed whole). A read failure of these lists fails closed (no own location). Cached 5 minutes
  * per caller (a failed read is not cached). The platform ids are cached 10 minutes; the managed base's Search Console domain is always
@@ -142,6 +142,9 @@ async function loadOwnLocations(userId: string, orgId: string | undefined): Prom
     ]);
     const hosts = new Set<string>();
     for (const d of domainLists.flat()) {
+      // Only an attached, verified domain is ownership: a pending custom-domain row can be written for any host nobody has attached yet
+      // (even one of AgentWeb's own), and has no traffic of its own anyway.
+      if ((d as any)?.status !== "active") continue;
       const host = bareDomain((d as any)?.domain ?? "");
       if (host) hosts.add(host);
     }
