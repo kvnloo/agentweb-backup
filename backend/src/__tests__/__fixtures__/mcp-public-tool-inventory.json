@@ -163,7 +163,7 @@
   {
     "name": "create_html_file",
     "listed": false,
-    "description": "Turn a draft (Markdown or plain text, or a complete HTML document) into a styled HTML document or email and save it; answers its s3_url. content_draft is at most 90000 characters. A complete HTML document is saved as it is; anything else is rendered by a model (this can take several minutes and is counted against your account's monthly usage). document_type \"email\" makes email-safe HTML; default \"document\". One call of yours at a time, 20 an hour. The file is stored in your own AgentWeb storage and anyone holding its URL can open it. Read it back with read_file_content. Any other argument is refused by name.",
+    "description": "Turn a draft (Markdown or plain text, or a complete HTML document) into a styled HTML document or email and save it; answers its s3_url. content_draft is at most 90000 characters. A complete HTML document is saved as it is; anything else is rendered by a model (this can take several minutes and is counted against your account's monthly usage; if no answer comes within 9 minutes the call reports that, and the file may still appear in your storage). document_type \"email\" makes email-safe HTML; default \"document\". One call of yours at a time, 20 an hour. The file is stored in your own AgentWeb storage and anyone holding its URL can open it. Read it back with read_file_content. Any other argument is refused by name.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4209,7 +4209,7 @@
   {
     "name": "perform_data_analysis",
     "listed": false,
-    "description": "Analyse data with code: a model writes and runs Python in Google's isolated sandbox (no network, no access to your account) on the files you give and the instruction. file_urls: up to 5 storage URLs of files in your own AgentWeb storage (CSV, JSON, text, spreadsheets saved as CSV; not PDF or Office). analysis_instruction: what to compute, with any small inline data (at most 20000 characters). Answers the analysis (Markdown), the code that ran, and links to any charts or files it produced. Can take many minutes; counted against your account's monthly usage. One call of yours at a time, 10 an hour. Charts and files it saves go to your own storage; the file is stored in your own AgentWeb storage and anyone holding its URL can open it. Any other argument is refused by name.",
+    "description": "Analyse data with code: a model writes and runs Python in Google's isolated sandbox (no network, no access to your account) on the files you give and the instruction. file_urls: up to 5 storage URLs of files in your own AgentWeb storage (CSV, JSON, text, spreadsheets saved as CSV; not PDF or Office). analysis_instruction: what to compute, with any small inline data (at most 20000 characters). Answers the analysis (Markdown), whether code ran (codeExecuted), and links to any charts or files it produced. A file of another account is refused. Can take many minutes: an answer that does not come within 9 minutes is reported as not answered in time, and charts may still appear in your storage. Counted against your account's monthly usage. One call of yours at a time, 10 an hour. Charts and files it saves go to your own storage; the file is stored in your own AgentWeb storage and anyone holding its URL can open it. Any other argument is refused by name.",
     "inputSchema": {
       "type": "object",
       "properties": {
