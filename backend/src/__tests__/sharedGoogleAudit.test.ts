@@ -14,7 +14,7 @@ beforeEach(() => {
   mockLandingConfig.mockReset();
   mockLandingConfig.mockResolvedValue(null);
 });
-afterEach(() => info.mockRestore());
+afterEach(() => jest.restoreAllMocks());
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const lines = () => info.mock.calls.map((c) => JSON.parse(String(c[0])));
 
@@ -138,7 +138,6 @@ describe('the platform\'s own landing-page analytics ids are marked', () => {
     auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['999000111'], source: 's' });
     expect(mockLandingConfig).toHaveBeenCalledTimes(2);
     expect(lines().map((l) => l.platform)).toEqual([undefined, true, true]);
-    (Date.now as jest.Mock).mockRestore();
   });
 
   it('a rejected load (should it ever reject) is also unknown, and never reaches the read', async () => {

@@ -65,3 +65,13 @@ describe('GET /api/seo/product-metrics', () => {
     expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ga4', userId: 'user-1', ids: ['123456789'], source: 'GET /api/seo/product-metrics' }));
   });
 });
+
+describe('POST /api/seo/config/ga/test', () => {
+  it('audits the property id the caller probes, after the numeric check', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-1', email: 'u@example.com' });
+    await request(app).post('/api/seo/config/ga/test').send({ propertyId: 'not-a-number' });
+    expect(sources()).not.toContain('POST /api/seo/config/ga/test');
+    await request(app).post('/api/seo/config/ga/test').send({ propertyId: '123456789' });
+    expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ga4', userId: 'user-1', ids: ['123456789'], source: 'POST /api/seo/config/ga/test' }));
+  });
+});
