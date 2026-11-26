@@ -24,6 +24,8 @@ import './gtmTools';
 import './gtmEmailTool';
 import './leadReadTools';
 import './accountReadTools';
+import './fileReadTool';
+import './leadEngagementTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -1684,6 +1686,7 @@ mcpToolRegistry.register({
         search: { type: 'string', description: 'Only leads matching this text (list action)' },
         status: { type: 'string', description: 'Only leads with this pipeline status (list action)' },
         engaged_only: { type: 'boolean', description: 'Only leads that have engaged (list action)' },
+        status_note: { type: 'string', description: 'Optional, update action with updates.status only: a note (1 to 500 characters) kept on the pipeline status change event, like a reason for the change. Recorded only when the status really changes (the answer has statusNoteRecorded); it is not the lead\'s own notes field. A note containing clicked, replied or received marks the lead as engaged.' },
         client_id: {
           type: 'string',
           description: "Admin-only. Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Supported for 'list', 'get', and 'add'. For 'add', the real write additionally requires the MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED flag; dry_run:true always works regardless of the flag. Still rejected for 'update'/'delete' (broader authorization review pending).",

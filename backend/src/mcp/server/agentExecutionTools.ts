@@ -56,6 +56,8 @@ export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
   'read_client_meta_budgets',
   'configure_landing_page_subdomain',
   'create_blog_article',
+  // Records one custom event on a lead through Emma's handler (leadEngagementTool.ts); it never runs the agent.
+  'add_lead_engagement',
   'create_knowledge_base_file',
   'create_lead_list',
   'create_schedule_from_template',
@@ -159,6 +161,8 @@ export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
   'publish_blog_article',
   'publish_landing_page_changes',
   'read_email',
+  // The text of one file in the caller's own storage (fileReadTool.ts): a parse, no model call.
+  'read_file_content',
   'read_knowledge_base_files',
   'read_landing_page_file',
   'resolve_landing_page_by_url',

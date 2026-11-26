@@ -16,6 +16,7 @@
 export type McpToolSideEffect = 'read' | 'write';
 
 export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> = Object.freeze({
+  add_lead_engagement: 'write',
   assess_client_health: 'write',
   cancel_smartlead_push: 'write',
   check_account_tracking_health: 'write',
@@ -127,6 +128,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   read_client_meta_activity: 'write',
   read_client_meta_budgets: 'write',
   read_email: 'read',
+  read_file_content: 'read',
   read_knowledge_base_files: 'write',
   read_landing_page_file: 'write',
   resolve_landing_page_by_url: 'write',

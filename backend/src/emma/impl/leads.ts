@@ -2461,9 +2461,25 @@ export async function getLeadEngagements(listId: string, leadId: string, userId:
     }
   }
 
+/**
+ * ENG-2840 (W2-7): limits for an event written by an outside agent (the MCP tool `add_lead_engagement`). Emma's own tool passes none.
+ * `channel` is stamped into the event's data and is what `maxChannelEvents` counts; a lead whose stored record is `maxLeadBytes` or more
+ * takes no event; an `idempotencyKey` already on one of the lead's events records nothing (the answer says so). The append is made only if
+ * the lead did not change since it was read, so two calls with the same key at once cannot both record.
+ */
+export interface AgentEngagementLimits {
+  channel: string;
+  maxChannelEvents: number;
+  maxLeadBytes: number;
+  idempotencyKey?: string;
+}
+
+const AGENT_ENGAGEMENT_ATTEMPTS = 3;
+
 export async function addLeadEngagement(
     listId: string, leadId: string, eventType: string,
-    userId: string, eventData?: any, eventDate?: string
+    userId: string, eventData?: any, eventDate?: string,
+    agentLimits?: AgentEngagementLimits,
   ): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -2484,7 +2500,7 @@ export async function addLeadEngagement(
         return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
-      const lead = await crmDb.getLeadById(listId, leadId);
+      const lead = await crmDb.getLeadById(listId, leadId, agentLimits ? { consistentRead: true } : undefined);
       if (!lead) {
         // ENG-2808: tell the model how to recover instead of retrying the same pair.
         return {
@@ -2493,6 +2509,10 @@ export async function addLeadEngagement(
           error: 'The specified lead does not exist in this list',
           hint: 'Do not retry with the same lead_id/list_id. Look the lead up with search_leads (by name or email) to get its current lead_id and list_id, then call add_lead_engagement again.',
         };
+      }
+
+      if (agentLimits) {
+        return await addAgentLeadEngagement(crmDb, listId, leadId, lead, eventType, eventData, eventDate, agentLimits);
       }
 
       await crmDb.addLeadEngagement(listId, leadId, {
@@ -2512,6 +2532,44 @@ export async function addLeadEngagement(
       return { success: false, message: 'Failed to add lead engagement', error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
+
+/** The outside-agent path of addLeadEngagement (see AgentEngagementLimits). `lead` is the consistent read made by the caller. */
+async function addAgentLeadEngagement(
+  crmDb: any, listId: string, leadId: string, firstRead: any, eventType: string, eventData: any, eventDate: string | undefined,
+  limits: AgentEngagementLimits,
+): Promise<any> {
+  const leadName = `${firstRead.firstName || ''} ${firstRead.lastName || ''}`.trim();
+  // `channel` and `idempotencyKey` are the server's: a caller's own values for them are dropped, then ours are set.
+  const { channel: _channel, idempotencyKey: _key, ...callerData } = (eventData && typeof eventData === 'object' ? eventData : {}) as Record<string, unknown>;
+  const data = { ...callerData, channel: limits.channel, ...(limits.idempotencyKey ? { idempotencyKey: limits.idempotencyKey } : {}) };
+  let lead = firstRead;
+  for (let attempt = 1; attempt <= AGENT_ENGAGEMENT_ATTEMPTS; attempt++) {
+    const events: any[] = Array.isArray(lead.engagements) ? lead.engagements : [];
+    if (limits.idempotencyKey && events.some((e) => e?.eventData?.idempotencyKey === limits.idempotencyKey)) {
+      return { success: true, recorded: false, duplicate: true, message: 'An event with this idempotency_key is already on the lead; nothing was recorded again.', eventType, leadName };
+    }
+    if (events.filter((e) => e?.eventData?.channel === limits.channel).length >= limits.maxChannelEvents) {
+      return { success: false, message: `This lead already holds ${limits.maxChannelEvents} events recorded by outside agents, the most it takes. Nothing was recorded.` };
+    }
+    if (Buffer.byteLength(JSON.stringify(lead), 'utf8') >= limits.maxLeadBytes) {
+      return { success: false, message: 'This lead\'s stored record is nearly full, so it takes no more events from outside agents. Nothing was recorded.' };
+    }
+    try {
+      await crmDb.addLeadEngagement(listId, leadId, {
+        eventType,
+        eventData: data,
+        createdAt: eventDate || new Date().toISOString(),
+      }, typeof lead.updatedAt === 'string' ? { expectedUpdatedAt: lead.updatedAt } : {});
+      return { success: true, recorded: true, message: `Engagement "${eventType}" recorded for ${leadName}`.trim(), eventType, leadName };
+    } catch (err: any) {
+      if (!err?.preconditionFailed) throw err;
+      // The lead changed between the read and the append: read it again and decide again (the key may now be on it).
+      lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+      if (!lead) return { success: false, message: 'Lead not found' };
+    }
+  }
+  return { success: false, message: 'The lead kept changing while the event was being recorded. Nothing was recorded; try again.' };
+}
 
 export async function sendEmailToLead(listId: string, leadId: string, userId: string): Promise<any> {
     try {

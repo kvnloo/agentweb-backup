@@ -122,6 +122,8 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
   'POST /lead-details': 'metered',
   'POST /lead-engagements': 'metered',
   'POST /lead-list-statuses': 'metered',
+  // ENG-2840 (W2-7): records one event on a lead for the MCP tool add_lead_engagement
+  'POST /add-lead-engagement': 'metered',
   // ENG-2840 (W2-6a): a settings read (no spend, no third party): an account over its quota may still read its own settings
   'GET /lead-notification-settings': 'exempt',
   'GET /actions': 'exempt',
