@@ -14,7 +14,7 @@ import { handleMetaToolkitCall } from '../mcp/metaToolkitGateway';
 const account: any = { platform: 'meta', account_id: '111', config: { account_type: 'ad_account', ad_account_id: '111', access_token: 'token', granted_scopes: ['ads_management'] } };
 it.each([[false, false], [true, false], [false, true], [true, true]])('readiness card=%s account=%s emits only real observed milestones', async (paid, connected) => {
   await getZomaReadiness('u1', {
-    getUser: async () => ({ userId: 'u1' }), resolvePaymentMethod: async () => ({ hasPaymentMethod: paid }),
+    getUser: async () => ({ userId: 'u1', zomaAdsExperience: 'runs_ads' }), resolvePaymentMethod: async () => ({ hasPaymentMethod: paid }),
     listAccounts: async () => connected ? [account] : [], now: Date.now, frontendUrl: () => 'https://example.com', pagesUrl: () => 'https://api.example.com',
     findLiveCustomerId: async () => 'cus_1', createPaymentMethodSetupSession: async () => ({ url: 'https://stripe.test/setup' }),
     buildMetaConnectUrl: async () => 'https://meta.test/connect', googleEnabled: () => false,
@@ -22,6 +22,35 @@ it.each([[false, false], [true, false], [false, true], [true, true]])('readiness
   expect(emitActivation).toHaveBeenCalledWith('u1', S.OnboardingStarted);
   expect((emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.AdAccountConnected)).toBe(connected);
   expect((emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.OnboardingCompleted)).toBe((process.env.ZOMA_REQUIRE_PAYMENT_METHOD === 'true' ? paid : true) && connected);
+});
+const readyDeps = (over: any = {}) => ({
+  getUser: async () => ({ userId: 'u1', zomaAdsExperience: 'runs_ads' }), resolvePaymentMethod: async () => ({ hasPaymentMethod: true }),
+  listAccounts: async () => [account], now: Date.now, frontendUrl: () => 'https://example.com', pagesUrl: () => 'https://api.example.com',
+  findLiveCustomerId: async () => 'cus_1', createPaymentMethodSetupSession: async () => ({ url: 'https://stripe.test/setup' }),
+  buildMetaConnectUrl: async () => 'https://meta.test/connect', googleEnabled: () => false, xAdsEnabled: () => false, ...over,
+});
+const completed = () => (emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.OnboardingCompleted);
+it('ads-experience question unanswered: no completion even with a write-ready account', async () => {
+  (emitActivation as jest.Mock).mockClear();
+  await getZomaReadiness('u1', readyDeps({ getUser: async () => ({ userId: 'u1' }) }) as any);
+  expect(completed()).toBe(false);
+});
+it('Meta Page blocker open: account connected but setup not completed', async () => {
+  (emitActivation as jest.Mock).mockClear();
+  const noPage = { ...account, config: { ...account.config, has_meta_pages: false } };
+  const r = await getZomaReadiness('u1', readyDeps({ listAccounts: async () => [noPage] }) as any);
+  expect(r.writes_enabled).toBe(true);
+  expect(r.blocker).not.toBeNull();
+  expect((emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.AdAccountConnected)).toBe(true);
+  expect(completed()).toBe(false);
+});
+it('X-only account counts as connected and completed', async () => {
+  (emitActivation as jest.Mock).mockClear();
+  const x: any = { platform: 'x_ads', account_id: 'x1', config: { ad_account_id: 'x1', access_token: 't', access_token_secret: 's' } };
+  const r = await getZomaReadiness('u1', readyDeps({ listAccounts: async () => [x], xAdsEnabled: () => true, buildXAdsConnectUrl: async () => 'https://x.test' }) as any);
+  expect(r.x_ads?.ready).toBe(true);
+  expect((emitActivation as jest.Mock).mock.calls.some(c => c[1] === S.AdAccountConnected)).toBe(true);
+  expect(completed()).toBe(r.x_ads!.writes_enabled);
 });
 it('unknown account never emits onboarding', async () => {
   await expect(getZomaReadiness('missing', { getUser: async () => undefined } as any)).rejects.toThrow();

@@ -119,7 +119,19 @@ export function activationCsv(rows: ReturnType<typeof activationProgress>[]): st
 }
 /** Toolkit result observer. Never infers live delivery from a preview, PAUSED create,
  * ACTIVE configured status alone, or an unconfirmed read-back. */
-export async function observeActivationWrite(userId: string, args: any, execute: () => Promise<any>, emit = emitActivation) {
+/** Telemetry must never hold an executed write's result hostage: cap each emit's wait. */
+export const ACTIVATION_EMIT_TIMEOUT_MS = 2000;
+function boundedEmit(emit: typeof emitActivation, timeoutMs: number): typeof emitActivation {
+  return (...a) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); });
+    const run = Promise.resolve().then(() => emit(...a)).catch(() => false);
+    return Promise.race([run, timeout]).finally(() => clearTimeout(timer));
+  };
+}
+
+export async function observeActivationWrite(userId: string, args: any, execute: () => Promise<any>, rawEmit = emitActivation, timeoutMs = ACTIVATION_EMIT_TIMEOUT_MS) {
+  const emit = boundedEmit(rawEmit, timeoutMs);
   const ad = args.entity_type === 'AD';
   const create = ad && args.action === 'CREATE';
   const launch = ad && args.action === 'UPDATE' && args.params?.status === 'ACTIVE';

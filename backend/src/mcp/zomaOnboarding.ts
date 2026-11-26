@@ -464,8 +464,13 @@ export async function getZomaReadiness(
   readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads, readiness.x_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
   readiness.docs_url = zomaDocsUrl(deps);
   await emitActivation(userId, ActivationStage.OnboardingStarted);
-  if (meta.ready || readiness.google_ads?.ready) await emitActivation(userId, ActivationStage.AdAccountConnected);
-  if (writes_enabled || readiness.google_ads?.writes_enabled) await emitActivation(userId, ActivationStage.OnboardingCompleted);
+  if (meta.ready || readiness.google_ads?.ready || readiness.x_ads?.ready) await emitActivation(userId, ActivationStage.AdAccountConnected);
+  // Completion is first-write-wins, so require the full setup: the ads question answered and a
+  // write-ready provider (Meta only counts once its Page blocker is clear).
+  const answered = adsExperience !== null && adsExperience !== 'not_interested';
+  if (answered && ((writes_enabled && !blocker) || readiness.google_ads?.writes_enabled || readiness.x_ads?.writes_enabled)) {
+    await emitActivation(userId, ActivationStage.OnboardingCompleted);
+  }
   return readiness;
 }
 

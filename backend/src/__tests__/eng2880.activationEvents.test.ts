@@ -79,6 +79,17 @@ describe('ENG-2880 real write-result boundary', () => {
     expect(execute).toHaveBeenCalledTimes(1);
     return emit;
   };
+  it('a stalled activation sink cannot hold the confirmed write result hostage', async () => {
+    const result = { success: true, verification: 'CONFIRMED', status: 'PAUSED', id: 'ad1' };
+    const emit = jest.fn(() => new Promise<boolean>(() => {}));
+    const execute = jest.fn().mockResolvedValue(result);
+    await expect(observeActivationWrite('u1', create, execute, emit as any, 20)).resolves.toBe(result);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+  it('a throwing activation sink never fails the write', async () => {
+    const result = { success: true, verification: 'CONFIRMED', status: 'PAUSED', id: 'ad1' };
+    await expect(observeActivationWrite('u1', create, async () => result, jest.fn().mockRejectedValue(new Error('ddb')) as any, 20)).resolves.toBe(result);
+  });
   it('preview starts creation but does not complete or activate', async () => {
     const emit = await run(create, { status: 'PREVIEW' });
     expect(emit.mock.calls).toEqual([['u1', S.AdCreationStarted]]);
