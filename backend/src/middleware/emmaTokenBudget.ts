@@ -78,6 +78,15 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
   'POST /meta-ads/insights': 'metered',
   'POST /meta-ads/metrics': 'metered',
   'POST /post-analytics': 'metered',
+
+  // ─── Provider reads for MCP tools (ENG-2840 W2-9) ─────────────────────────
+  'POST /fathom-meetings': 'metered',
+  'POST /fathom-transcript': 'metered',
+  'POST /luma-events': 'metered',
+  'POST /luma-guests': 'metered',
+  'POST /hubspot-read': 'metered',
+  'POST /linkedin-ads/insights': 'metered',
+  'POST /linkedin-ads/read': 'metered',
   'POST /data-analysis': 'metered',
 
   // ─── Files & HTML ─────────────────────────────────────────────────────────
@@ -122,6 +131,8 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
   'POST /lead-details': 'metered',
   'POST /lead-engagements': 'metered',
   'POST /lead-list-statuses': 'metered',
+  // ENG-2840 (W2-7): records one event on a lead for the MCP tool add_lead_engagement
+  'POST /add-lead-engagement': 'metered',
   // ENG-2840 (W2-6a): a settings read (no spend, no third party): an account over its quota may still read its own settings
   'GET /lead-notification-settings': 'exempt',
   'GET /actions': 'exempt',

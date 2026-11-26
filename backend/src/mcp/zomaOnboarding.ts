@@ -92,7 +92,12 @@ export interface ZomaGoogleAdsAccountSummary {
 
 export interface ZomaReadiness {
   email?: string;
-  payment: { ready: boolean; link?: string; error?: string };
+  /**
+   * ENG-3195: `required: false` is present only while no card is asked for at setup
+   * (ZOMA_REQUIRE_PAYMENT_METHOD unset). `ready` is then true without any card on file, so the
+   * checklist leaves the "Payment method on file" line out instead of ticking it.
+   */
+  payment: { ready: boolean; required?: false; link?: string; error?: string };
   meta: { ready: boolean; accounts: ZomaMetaAccountSummary[]; link?: string };
   /**
    * ENG-2823/ENG-2973: always present. While the Google Ads provider is disabled
@@ -348,16 +353,21 @@ async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
   return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP });
 }
 
-/**
- * True when any Stripe customer for this user has a saved payment method, asked live every
- * time (ENG-2571): the user-row `has_payment_method` flag is never cleared when a card or
- * customer is removed, so it cannot make a user ready on its own.
- */
-async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<boolean> {
+function zomaPaymentMethodRequired(): boolean {
   // Card requirement paused (2026-11-10, eng lead). Set ZOMA_REQUIRE_PAYMENT_METHOD=true to re-enable.
   // ENG-3131: a card is now asked for at the first publish (zomaBilling.ts), so leave this unset: setting
   // it brings back the card wall at signup, which the paid-launch plan rules out.
-  if (process.env.ZOMA_REQUIRE_PAYMENT_METHOD !== 'true') return true;
+  return process.env.ZOMA_REQUIRE_PAYMENT_METHOD === 'true';
+}
+
+/**
+ * True when any Stripe customer for this user has a saved payment method, asked live every
+ * time (ENG-2571): the user-row `has_payment_method` flag is never cleared when a card or
+ * customer is removed, so it cannot make a user ready on its own. Always true while no card
+ * is required (see zomaPaymentMethodRequired).
+ */
+async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<boolean> {
+  if (!zomaPaymentMethodRequired()) return true;
   return (await deps.resolvePaymentMethod(user, userId)).hasPaymentMethod;
 }
 
@@ -412,7 +422,7 @@ export async function getZomaReadiness(
   // ENG-3128: no setup links until the question is answered, and none for "just a friend".
   const mintLinks = opts.mintLinks !== false && adsExperience !== null && adsExperience !== 'not_interested';
 
-  const payment: ZomaReadiness['payment'] = { ready: false };
+  const payment: ZomaReadiness['payment'] = zomaPaymentMethodRequired() ? { ready: false } : { ready: false, required: false };
   try {
     payment.ready = await hasPaymentMethod(user, userId, deps);
     if (!payment.ready && mintLinks) payment.link = await paymentSetupLink(user, userId, deps);
@@ -609,7 +619,8 @@ export function formatZomaStatus(r: ZomaReadiness): string {
     'Zoma setup:',
     `  [x] AgentWeb login${r.email ? ` (${r.email})` : ''}`,
     `  ${box(r.ads_experience !== null)} How familiar you are with ads${r.ads_experience ? ` (${r.ads_experience})` : ''}`,
-    `  ${box(r.payment.ready)} Payment method on file`,
+    // ENG-3195: no card is asked for at setup, so there is nothing to claim as on file.
+    ...(r.payment.required === false ? [] : [`  ${box(r.payment.ready)} Payment method on file`]),
     `  ${box(r.meta.ready)} Meta ad account connected${
       r.meta.accounts.length ? ` (${r.meta.accounts.map((a) => `${a.account_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})` : ''
     }${!r.meta.ready && r.google_ads.available && r.google_ads.ready && r.meta.link ? ` → ${r.meta.link}` : ''}`,

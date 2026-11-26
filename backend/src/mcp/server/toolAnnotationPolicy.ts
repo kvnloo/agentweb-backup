@@ -16,6 +16,24 @@
 export type McpToolSideEffect = 'read' | 'write';
 
 export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> = Object.freeze({
+  add_lead_engagement: 'write',
+  // ENG-2840 (W2-8) content tools (contentTools.ts)
+  create_html_file: 'write',
+  create_html_from_template: 'write',
+  describe_image: 'read',
+  list_html_templates: 'read',
+  perform_data_analysis: 'write',
+  update_html_file: 'write',
+  // ENG-2840 (W2-9) provider reads (siteScanAndLookupTools.ts; find_or_lookup_email records quota use)
+  call_hubspot_api: 'write',
+  call_linkedin_ads_insights_api: 'write',
+  call_linkedin_marketing_api: 'write',
+  fathom_get_meetings: 'write',
+  fathom_get_transcript: 'write',
+  find_or_lookup_email: 'write',
+  luma_get_guests: 'write',
+  luma_list_events: 'write',
+  scan_website_links: 'read',
   assess_client_health: 'write',
   cancel_smartlead_push: 'write',
   check_account_tracking_health: 'write',
@@ -127,6 +145,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   read_client_meta_activity: 'write',
   read_client_meta_budgets: 'write',
   read_email: 'read',
+  read_file_content: 'read',
   read_knowledge_base_files: 'write',
   read_landing_page_file: 'write',
   resolve_landing_page_by_url: 'write',

@@ -2392,6 +2392,10 @@ function audienceRowKey(hashedRow: string[]): string {
  * `resolveOrCreateSeedAudience` (confirmed by whole-backend grep) — moved
  * alongside it as a plain, non-exported module function.
  */
+/** Largest seed-audience CSV fetched from a caller's URL, and how long the fetch may take. */
+const SEED_CSV_MAX_BYTES = 50 * 1024 * 1024;
+const SEED_CSV_TIMEOUT_MS = 60_000;
+
 async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
   // Greptile finding: this is a server-side fetch of a caller-supplied URL
   // with no destination restriction — a classic SSRF vector (cloud metadata
@@ -2411,13 +2415,31 @@ async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
   // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
   // maxRedirects:0 makes axios surface a redirect as an error instead —
   // same defense already used by routes/crm.ts's load-from-url path.
-  const response = await axios.get(csvUrl, {
-    maxRedirects: 0,
-    lookup: (_hostname: string, options: any, callback: any) => {
-      if (typeof options === 'function') callback = options;
-      callback(null, address, family);
-    },
-  } as any);
+  // ENG-2840: bounded too. With no size cap and no timeout, an endless or very slow body was held in memory without limit.
+  let response: any;
+  try {
+    response = await axios.get(csvUrl, {
+      maxRedirects: 0,
+      timeout: SEED_CSV_TIMEOUT_MS,
+      // axios's timeout only fires when the connection goes quiet; the signal makes 60 s a limit on the whole download (a body sent
+      // one byte at a time would otherwise be held in memory for as long as the sender likes).
+      signal: AbortSignal.timeout(SEED_CSV_TIMEOUT_MS),
+      maxContentLength: SEED_CSV_MAX_BYTES,
+      maxBodyLength: SEED_CSV_MAX_BYTES,
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        callback(null, address, family);
+      },
+    } as any);
+  } catch (err: any) {
+    if (/maxContentLength|maxBodyLength|too large/i.test(String(err?.message || ''))) {
+      throw new Error(`csv_url: the file is larger than ${SEED_CSV_MAX_BYTES / (1024 * 1024)} MB, the most a seed audience CSV may be`);
+    }
+    if (err?.code === 'ERR_CANCELED' || err?.code === 'ECONNABORTED' || err?.name === 'CanceledError' || err?.name === 'TimeoutError') {
+      throw new Error(`csv_url: the file did not download within ${SEED_CSV_TIMEOUT_MS / 1000} s`);
+    }
+    throw err;
+  }
   if (Array.isArray(response.data)) {
     return response.data;
   }
@@ -3301,7 +3323,23 @@ export async function launchRetargetingCampaign(userId: string, args: any, deps:
 //    / callLinkedInAdsInsightsApi
 // ============================================================================
 
-async function getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
+/**
+ * ENG-2840 (W2-9): optional bounds for the read actions, given only by the outside-agent read routes
+ * (routes/emmaLinkedInAdsReadRoutes.ts): the service's page and element caps and per-request timeout, and at most
+ * `maxReferencedPosts` referenced posts expanded by CREATIVE LIST. Emma passes none, and then every call is exactly what it was.
+ */
+export type LinkedInReadBounds = linkedInAdsService.LinkedInRequestBounds & { maxReferencedPosts?: number };
+
+/** A failed LinkedIn read, thrown with the same message as before, carrying LinkedIn's HTTP status for the read routes. */
+function linkedInReadError(result: linkedInAdsService.LinkedInAdsApiResult, fallback: string): Error & { linkedInStatus?: number } {
+  return Object.assign(new Error(result.error || fallback), { linkedInStatus: result.status });
+}
+
+async function getLinkedInAdsCredentials(
+  userId: string,
+  accountId?: string,
+  li: linkedInAdsService.LinkedInAdsReadCalls = linkedInAdsService,
+): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
   const { getAccountsWithOwnerIncludingOrgShared } = await import('../../services/connectedAccountsDb');
   // Include org-shared accounts so a teammate's LinkedIn Ads account that was
   // shared with the org (sharedWithOrg=true) is usable, not just visible. Each
@@ -3348,7 +3386,7 @@ async function getLinkedInAdsCredentials(userId: string, accountId?: string): Pr
   const { getLinkedInAdsConfig } = await import('../../config/integrations');
   const oauthConfig = await getLinkedInAdsConfig();
 
-  const newTokens = await linkedInAdsService.refreshAccessToken(
+  const newTokens = await li.refreshAccessToken(
     cfg.refresh_token,
     oauthConfig.clientId,
     oauthConfig.clientSecret
@@ -3380,32 +3418,39 @@ function linkedInReadBackFailure(result: linkedInAdsService.LinkedInAdsApiResult
   return { success: false, errorType: result.errorType, errorCode: result.errorType, fields: result.fields, error: result.error };
 }
 
+/** The largest file call_linkedin_marketing_api downloads to upload to LinkedIn (LinkedIn's own limits are at or above these). */
+export const LINKEDIN_UPLOAD_MAX_BYTES = { image: 20 * 1024 * 1024, document: 100 * 1024 * 1024, video: 200 * 1024 * 1024 } as const;
+
 export async function callLinkedInMarketingApi(
   userId: string,
   entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL' | 'CONVERSATION_AD',
   action: string,
   account_id: string,
-  params: any = {}
+  params: any = {},
+  bounds?: LinkedInReadBounds
 ): Promise<any> {
   console.log(`AgentMode: callLinkedInMarketingApi -> ${entity_type} / ${action}`);
 
-  const { accountId, accessToken, organizationUrn, personUrn } = await getLinkedInAdsCredentials(userId, account_id);
+  // The read actions call LinkedIn through `li`: this service itself for Emma (no bounds), the bounded calls for the read routes.
+  const li: linkedInAdsService.LinkedInAdsReadCalls = bounds ? linkedInAdsService.boundedReadCalls(bounds) : linkedInAdsService;
+  const { accountId, accessToken, organizationUrn, personUrn } = await getLinkedInAdsCredentials(userId, account_id, li);
+  const cut = (data: any) => (data?.truncated ? { truncated: true } : {});
 
   switch (entity_type) {
     case 'AD_ACCOUNT': {
       if (action === 'LIST') {
-        const result = await linkedInAdsService.listAdAccounts(accessToken);
-        if (!result.success) throw new Error(result.error || 'Failed to list ad accounts');
-        return { success: true, adAccounts: result.data?.elements || [] };
+        const result = await li.listAdAccounts(accessToken);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list ad accounts');
+        return { success: true, adAccounts: result.data?.elements || [], ...cut(result.data) };
       }
       throw new Error(`Unknown action "${action}" for AD_ACCOUNT`);
     }
 
     case 'CAMPAIGN_GROUP': {
       if (action === 'LIST') {
-        const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId, params);
-        if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
-        return { success: true, campaignGroups: result.data?.elements || [] };
+        const result = await li.listCampaignGroups(accessToken, accountId, params);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list campaign groups');
+        return { success: true, campaignGroups: result.data?.elements || [], ...cut(result.data) };
       }
       if (action === 'CREATE') {
         const result = await linkedInAdsService.createCampaignGroup(accessToken, accountId, params);
@@ -3425,9 +3470,9 @@ export async function callLinkedInMarketingApi(
 
     case 'CAMPAIGN': {
       if (action === 'LIST') {
-        const result = await linkedInAdsService.listCampaigns(accessToken, accountId, params);
-        if (!result.success) throw new Error(result.error || 'Failed to list campaigns');
-        return { success: true, campaigns: result.data?.elements || [] };
+        const result = await li.listCampaigns(accessToken, accountId, params);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list campaigns');
+        return { success: true, campaigns: result.data?.elements || [], ...cut(result.data) };
       }
       if (action === 'CREATE') {
         const result = await linkedInAdsService.createCampaign(accessToken, accountId, params);
@@ -3448,8 +3493,8 @@ export async function callLinkedInMarketingApi(
     case 'CREATIVE': {
       if (action === 'LIST') {
         if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
-        const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
-        if (!result.success) throw new Error(result.error || 'Failed to list creatives');
+        const result = await li.listCreatives(accessToken, accountId, params.campaign_id);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list creatives');
         const rawCreatives: any[] = result.data?.elements || [];
         // ENG-239: a content.reference creative only carries a bare post URN
         // pointer -- expand it with the referenced post's own fields
@@ -3457,13 +3502,22 @@ export async function callLinkedInMarketingApi(
         // without a manual follow-up POST/GET per creative. A failed read
         // (e.g. deleted post) degrades to the bare creative rather than
         // failing the whole LIST.
+        // ENG-2840: with bounds, only the first `maxReferencedPosts` are expanded (one LinkedIn call each); Emma expands every one.
+        const expandLimit = bounds?.maxReferencedPosts ?? Infinity;
+        let expanded = 0;
+        let notExpanded = 0;
         const creatives = await Promise.all(rawCreatives.map(async (creative) => {
           const postUrn = creative?.content?.reference;
           if (!postUrn) return creative;
-          const postResult = await linkedInAdsService.getPost(accessToken, postUrn);
+          if (expanded >= expandLimit) {
+            notExpanded++;
+            return creative;
+          }
+          expanded++;
+          const postResult = await li.getPost(accessToken, postUrn);
           return postResult.success ? { ...creative, referencedPost: postResult.data } : creative;
         }));
-        return { success: true, creatives };
+        return { success: true, creatives, ...cut(result.data), ...(notExpanded > 0 ? { referencedPostsNotExpanded: notExpanded } : {}) };
       }
       if (action === 'CREATE') {
         if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
@@ -3535,8 +3589,8 @@ export async function callLinkedInMarketingApi(
       }
       if (action === 'GET') {
         if (!params.post_urn) throw new Error('POST GET requires params.post_urn');
-        const result = await linkedInAdsService.getPost(accessToken, params.post_urn);
-        if (!result.success) throw new Error(result.error || 'Failed to get post');
+        const result = await li.getPost(accessToken, params.post_urn);
+        if (!result.success) throw linkedInReadError(result, 'Failed to get post');
         return { success: true, post: result.data };
       }
       throw new Error(`Unknown action "${action}" for POST`);
@@ -3544,14 +3598,14 @@ export async function callLinkedInMarketingApi(
 
     case 'TARGETING': {
       if (action === 'LIST_FACETS') {
-        const result = await linkedInAdsService.listTargetingFacets(accessToken);
-        if (!result.success) throw new Error(result.error || 'Failed to list targeting facets');
+        const result = await li.listTargetingFacets(accessToken);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list targeting facets');
         return { success: true, facets: result.data?.elements || [] };
       }
       if (action === 'SEARCH') {
         if (!params.facet) throw new Error('SEARCH requires facet');
-        const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
-        if (!result.success) throw new Error(result.error || 'Failed to search targeting entities');
+        const result = await li.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
+        if (!result.success) throw linkedInReadError(result, 'Failed to search targeting entities');
         return { success: true, entities: result.data?.elements || [] };
       }
       if (action === 'ESTIMATE_REACH') {
@@ -3561,24 +3615,42 @@ export async function callLinkedInMarketingApi(
         if (!targetingCriteria) {
           throw new Error('ESTIMATE_REACH requires targeting: pass targeting_include (array of { facet_urn, values }) or targeting_criteria.');
         }
-        const result = await linkedInAdsService.getAudienceCount(accessToken, targetingCriteria);
-        if (!result.success) throw new Error(result.error || 'Failed to estimate audience reach');
+        const result = await li.getAudienceCount(accessToken, targetingCriteria);
+        if (!result.success) throw linkedInReadError(result, 'Failed to estimate audience reach');
         return { success: true, audienceCount: result.data };
       }
       throw new Error(`Unknown action "${action}" for TARGETING`);
     }
 
     case 'MEDIA': {
-      // Helper: if the URL is an S3 URL from our bucket, presign it before downloading.
-      // This handles the case where the user uploads a file to the chat (stored in S3)
-      // and Emma receives the S3 URL — direct S3 access requires a presigned URL.
-      const { presignS3Url, isS3Url } = await import('../../utils/s3Utils');
-      const resolveDownloadUrl = (url: string): string => {
+      // The file to upload, read safely (ENG-2840): a file of OUR bucket (a chat upload) only when the storage rule lets this caller read
+      // that key, read through the SDK with a byte ceiling; any other URL only through the SSRF-guarded fetch, with a byte ceiling and a
+      // time limit. Before, any key of our bucket was presigned for any caller and any URL was fetched with no guard, size cap or timeout.
+      const downloadForUpload = async (url: unknown, field: string, maxBytes: number, timeoutMs: number): Promise<{ buffer: Buffer; contentType: string }> => {
+        if (typeof url !== 'string' || !url.trim()) throw new Error(`${field} must be a URL`);
+        const tooLarge = () => new Error(`${field}: the file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB, the most that can be uploaded here`);
+        const { isS3Url, extractS3KeyFromUrl, getS3ObjectAsBuffer } = await import('../../utils/s3Utils');
         if (isS3Url(url)) {
-          const presigned = presignS3Url(url);
-          return presigned || url;
+          const key = extractS3KeyFromUrl(url);
+          const { checkOurBucketKeyRead, TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_UNAVAILABLE_MESSAGE } = await import('./toolStorageAccess');
+          const decision = key ? await checkOurBucketKeyRead('call_linkedin_marketing_api', userId, key) : 'refuse';
+          if (decision !== 'allow') throw new Error(decision === 'unavailable' ? TOOL_FILE_UNAVAILABLE_MESSAGE : TOOL_FILE_REFUSAL_MESSAGE);
+          try {
+            const { buffer, contentType } = await getS3ObjectAsBuffer(key as string, undefined, maxBytes);
+            return { buffer, contentType: contentType || '' };
+          } catch (err: any) {
+            if (/exceeds the .* limit/.test(String(err?.message || ''))) throw tooLarge();
+            throw err;
+          }
         }
-        return url;
+        const { fetchCallerUrlBuffer, CallerUrlTooLargeError } = await import('../../utils/callerUrlFetch');
+        try {
+          const fetched = await fetchCallerUrlBuffer(url, { tool: 'call_linkedin_marketing_api', userId, maxBytes, timeoutMs });
+          return { buffer: fetched.buffer, contentType: fetched.contentType || '' };
+        } catch (err: any) {
+          if (err instanceof CallerUrlTooLargeError) throw tooLarge();
+          throw err;
+        }
       };
 
       if (action === 'UPLOAD_IMAGE') {
@@ -3591,10 +3663,9 @@ export async function callLinkedInMarketingApi(
         const imageUrn: string = initResult.data?.value?.image || initResult.data?.image;
         if (!uploadUrl || !imageUrn) throw new Error('LinkedIn did not return uploadUrl or image URN');
         // Step 2: download the image (presign if S3 URL) and PUT to LinkedIn's signed URL
-        const axios = require('axios');
-        const imageResp = await axios.get(resolveDownloadUrl(params.image_url), { responseType: 'arraybuffer' });
-        const contentType = imageResp.headers['content-type'] || 'image/jpeg';
-        await linkedInAdsService.uploadImageBinary(uploadUrl, Buffer.from(imageResp.data), contentType);
+        const image = await downloadForUpload(params.image_url, 'image_url', LINKEDIN_UPLOAD_MAX_BYTES.image, 60_000);
+        const contentType = image.contentType || 'image/jpeg';
+        await linkedInAdsService.uploadImageBinary(uploadUrl, image.buffer, contentType);
         return { success: true, image_urn: imageUrn, message: 'Image uploaded to LinkedIn. Use image_urn in CREATIVE/CREATE_INLINE.' };
       }
       if (action === 'UPLOAD_VIDEO') {
@@ -3602,10 +3673,8 @@ export async function callLinkedInMarketingApi(
         // Emma never asks the user for file_size — it's derived from the downloaded buffer.
         if (!params.video_url) throw new Error('UPLOAD_VIDEO requires video_url (a public URL to the video file)');
         const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
-        const axios = require('axios');
-        // Step 1: download video (presign if S3 URL — handles user-uploaded files from chat)
-        const videoResp = await axios.get(resolveDownloadUrl(params.video_url), { responseType: 'arraybuffer' });
-        const videoBuffer = Buffer.from(videoResp.data);
+        // Step 1: download the video (a chat upload of the caller's own, or a public URL), bounded
+        const videoBuffer = (await downloadForUpload(params.video_url, 'video_url', LINKEDIN_UPLOAD_MAX_BYTES.video, 180_000)).buffer;
         const fileSizeBytes = videoBuffer.length;
         // Step 2: initialize upload — fileSizeBytes auto-calculated from buffer
         const initResult = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, fileSizeBytes);
@@ -3632,11 +3701,10 @@ export async function callLinkedInMarketingApi(
         // Convenience action: download document from URL and upload to LinkedIn.
         if (!params.document_url) throw new Error('UPLOAD_DOCUMENT requires document_url (a public URL to the document, e.g. PDF)');
         const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
-        const axios = require('axios');
-        // Step 1: download document (presign if S3 URL — handles user-uploaded files from chat)
-        const docResp = await axios.get(resolveDownloadUrl(params.document_url), { responseType: 'arraybuffer' });
-        const docBuffer = Buffer.from(docResp.data);
-        const contentType = docResp.headers['content-type'] || 'application/pdf';
+        // Step 1: download the document (a chat upload of the caller's own, or a public URL), bounded
+        const doc = await downloadForUpload(params.document_url, 'document_url', LINKEDIN_UPLOAD_MAX_BYTES.document, 120_000);
+        const docBuffer = doc.buffer;
+        const contentType = doc.contentType || 'application/pdf';
         // Step 2: initialize upload
         const initResult = await linkedInAdsService.initializeDocumentUpload(accessToken, ownerUrn);
         if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize document upload');
@@ -3735,13 +3803,16 @@ export async function callLinkedInAdsInsightsApi(
     campaigns?: string[];
     adGroups?: string[];
     creatives?: string[];
-  }
+  },
+  bounds?: LinkedInReadBounds
 ): Promise<any> {
   console.log(`AgentMode: callLinkedInAdsInsightsApi -> pivot=${params.pivot}`);
 
-  const { accountId: resolvedAccountId, accessToken } = await getLinkedInAdsCredentials(userId, account_id);
+  // Same rule as callLinkedInMarketingApi: Emma (no bounds) calls this service exactly as before; the read route passes a timeout.
+  const li: linkedInAdsService.LinkedInAdsReadCalls = bounds ? linkedInAdsService.boundedReadCalls(bounds) : linkedInAdsService;
+  const { accountId: resolvedAccountId, accessToken } = await getLinkedInAdsCredentials(userId, account_id, li);
 
-  const result = await linkedInAdsService.getAdAnalytics(
+  const result = await li.getAdAnalytics(
     accessToken,
     resolvedAccountId,
     params.pivot,
@@ -3751,7 +3822,7 @@ export async function callLinkedInAdsInsightsApi(
     { campaign_group_ids: params.campaign_groups, campaign_ids: params.campaigns, creative_ids: params.creatives }
   );
   if (!result.success) {
-    throw new Error(result.error || 'LinkedIn Ads API request failed');
+    throw linkedInReadError(result, 'LinkedIn Ads API request failed');
   }
   return { success: true, analytics: result.data?.elements || result.data };
 }

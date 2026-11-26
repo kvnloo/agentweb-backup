@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import { STATUS_NOTE_MAX_CHARS } from '../utils/agentEngagementLimits';
 import { statusAfterReviewedSend, missingReviewDraftError, REVIEW_DRAFT_STATUS } from '../utils/leadSchema';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
@@ -2986,6 +2987,27 @@ router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Resp
  * @access Private
  */
 // ENG-2157: registered for PATCH as well - the customer portal's deal editor (DealSection) has always sent PATCH here, which 404'd, so deal edits were lost on reload.
+/**
+ * ENG-2840 (W2-7): an optional note for the `status.changed` event this route writes when the status really changes (the MCP tool
+ * `manage_leads update` sends it as `status_note`). It is taken out of the body before anything else reads it, so it is never stored on
+ * the lead itself (the lead's own `notes` field is a different thing). Text, 1 to 500 characters after trimming, no control characters
+ * other than line breaks and tabs.
+ */
+function takeStatusNote(body: any): { note?: string; error?: string } {
+  if (!body || typeof body !== 'object' || !('statusNote' in body)) return {};
+  const raw = body.statusNote;
+  delete body.statusNote;
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'string') return { error: 'statusNote must be text' };
+  const note = raw.trim();
+  // Checked on the text as sent: trim() would remove some control characters from the ends and hide them.
+  if (note === '' || note.length > STATUS_NOTE_MAX_CHARS || /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(raw)) {
+    return { error: `statusNote must be 1 to ${STATUS_NOTE_MAX_CHARS} characters with no control characters` };
+  }
+  if (body.status === undefined) return { error: 'statusNote goes with a status change: send status too' };
+  return { note };
+}
+
 const updateLeadHandler = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
@@ -3006,6 +3028,10 @@ const updateLeadHandler = async (req: Request, res: Response) => {
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
+
+    const statusNote = takeStatusNote(req.body);
+    if (statusNote.error) return res.status(400).json({ message: statusNote.error });
+    let statusNoteRecorded = false;
 
     // ENG-2157: server-owned keys (sync ids, attribution, auto-send marker, write flags). Default mode only reports them.
     updates = guardLeadPutBody(req.body, { channel: leadWriteChannel(req), userId }).body;
@@ -3088,9 +3114,11 @@ const updateLeadHandler = async (req: Request, res: Response) => {
             to: updates.status,
             dealValue: updates.dealValue ?? existingLead.dealValue ?? null,
             dealCurrency: updates.dealCurrency ?? existingLead.dealCurrency ?? 'USD',
+            ...(statusNote.note !== undefined ? { notes: statusNote.note } : {}),
           },
           createdAt: new Date().toISOString(),
         });
+        statusNoteRecorded = statusNote.note !== undefined;
       }
     }
 
@@ -3115,7 +3143,8 @@ const updateLeadHandler = async (req: Request, res: Response) => {
       void validateLeadEmailInBackground(listId, leadId, updates.email, userId);
     }
 
-    res.json(sanitizeLeadForResponse(updatedLead, userId));
+    const answer = sanitizeLeadForResponse(updatedLead, userId);
+    res.json(statusNote.note !== undefined ? { ...answer, statusNoteRecorded } : answer);
   } catch (error: any) {
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
