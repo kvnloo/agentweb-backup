@@ -22,6 +22,29 @@ function refuse(reason: string, message: string, extra: Record<string, unknown> 
 
 class MetaReadError extends Error {}
 
+/** Default window length (days, inclusive of today) when the caller omits since/until. */
+export const DEFAULT_WINDOW_DAYS = 7;
+
+const isBlank = (v: unknown): boolean => v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+const shiftDays = (d: string, days: number): string =>
+  new Date(Date.parse(`${d}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+
+/**
+ * ENG-3190: callers (the model) often omit the window. A blank `until` means today (UTC); a
+ * blank `since` means DEFAULT_WINDOW_DAYS ending at `until`. Supplied values are never altered,
+ * so a malformed date still refuses as invalid_window.
+ */
+export function resolveBudgetWindow(since: unknown, until: unknown, nowMs: number = Date.now()):
+  { since: unknown; until: unknown; defaulted: boolean } {
+  const sinceBlank = isBlank(since);
+  const untilBlank = isBlank(until);
+  const resolvedUntil = untilBlank ? new Date(nowMs).toISOString().slice(0, 10) : until;
+  const resolvedSince = sinceBlank && validDate(resolvedUntil)
+    ? shiftDays(resolvedUntil, -(DEFAULT_WINDOW_DAYS - 1))
+    : since;
+  return { since: resolvedSince, until: resolvedUntil, defaulted: sinceBlank || untilBlank };
+}
+
 /** One Graph read. A Graph error body, a truncated page set, or a non-array body is a failure. */
 async function readRows(url: string, what: string): Promise<any[]> {
   const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
@@ -50,8 +73,8 @@ const budget = (v: unknown): string | null => (typeof v === 'string' && v !== ''
 export async function readClientMetaBudgets(
   callerUserId: string,
   clientNameOrEmail: string,
-  since: string,
-  until: string,
+  rawSince: string | undefined,
+  rawUntil: string | undefined,
   callerIsAdmin?: boolean,
 ): Promise<any> {
   const isAdmin = callerIsAdmin !== undefined
@@ -60,6 +83,9 @@ export async function readClientMetaBudgets(
   if (!isAdmin) {
     return { ...refuse('not_admin', 'Access denied. Only admin users can read a client\'s Meta budgets.'), error: 'Admin access required' };
   }
+  const window = resolveBudgetWindow(rawSince, rawUntil);
+  const since = window.since as string;
+  const until = window.until as string;
   if (!validDate(since) || !validDate(until) || since > until) {
     return refuse('invalid_window', 'since and until must be real dates in YYYY-MM-DD form, with since on or before until. Nothing was read.');
   }
@@ -120,6 +146,7 @@ export async function readClientMetaBudgets(
       credential_source: useConnectedAccount ? 'client_connection' : 'legacy_shared_token',
       since,
       until,
+      window_defaulted: window.defaulted,
       account_spend: accountRows[0]?.spend ?? '0',
       currency: accountRows[0]?.account_currency ?? null,
       budget_units: 'minor currency units (cents), as Meta returns them',

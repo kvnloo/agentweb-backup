@@ -4141,7 +4141,7 @@
   {
     "name": "read_client_meta_budgets",
     "listed": false,
-    "description": "Read one managed client's Meta ad budgets and spend for an exact date window. Admin-only, read-only; never changes a budget.\n\nResolves the client (exact email, or a name that matches exactly one client) to the same Meta ad account and token assess_client_health reads. Returns the ad account id read, account spend for the window, and per campaign and per ad set: status, current daily or lifetime budget (minor currency units, as Meta returns them), and spend for the window.\n\nRefuses instead of guessing, with a reason: ambiguous_client (several clients match; ask with the email), client_not_found, no_meta_connection, credential_pair_mismatch, invalid_window, and meta_read_failed (a Meta read failed; no numbers are reported, which is not the same as zero spend).",
+    "description": "Read one managed client's Meta ad budgets and spend for an exact date window. Admin-only, read-only; never changes a budget.\n\nResolves the client (exact email, or a name that matches exactly one client) to the same Meta ad account and token assess_client_health reads. Returns the ad account id read, account spend for the window, and per campaign and per ad set: status, current daily or lifetime budget (minor currency units, as Meta returns them), and spend for the window. Omit since/until to read the last 7 days through today (UTC); the result echoes the window read and window_defaulted.\n\nRefuses instead of guessing, with a reason: ambiguous_client (several clients match; ask with the email), client_not_found, no_meta_connection, credential_pair_mismatch, invalid_window, and meta_read_failed (a Meta read failed; no numbers are reported, which is not the same as zero spend).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4151,17 +4151,15 @@
         },
         "since": {
           "type": "string",
-          "description": "First day of the window, YYYY-MM-DD (inclusive)."
+          "description": "First day of the window, YYYY-MM-DD (inclusive). Optional: defaults to 7 days ending at until."
         },
         "until": {
           "type": "string",
-          "description": "Last day of the window, YYYY-MM-DD (inclusive)."
+          "description": "Last day of the window, YYYY-MM-DD (inclusive). Optional: defaults to today (UTC)."
         }
       },
       "required": [
-        "client_name_or_email",
-        "since",
-        "until"
+        "client_name_or_email"
       ]
     },
     "sideEffect": "write",

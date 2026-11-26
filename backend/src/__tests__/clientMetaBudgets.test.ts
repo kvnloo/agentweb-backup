@@ -13,7 +13,7 @@ jest.mock('../services/metaTokenRefresh', () => ({
   ensureFreshMetaAdAccountToken: jest.fn().mockResolvedValue({ attempted: false, refreshed: false }),
 }));
 
-import { readClientMetaBudgets } from '../services/clientMetaBudgetsService';
+import { readClientMetaBudgets, resolveBudgetWindow } from '../services/clientMetaBudgetsService';
 import { fetchWithRetryAndPaging } from '../utils/metaApiFetch';
 import { getMetaAccessToken } from '../utils/secretsManager';
 
@@ -176,5 +176,51 @@ describe('ENG-3069 readClientMetaBudgets', () => {
     expect(r.success).toBe(false);
     expect(r.reason).toBe('invalid_window');
     expect(metaFetch).not.toHaveBeenCalled();
+  });
+
+  // ENG-3190: the model omitted since/until and the declared schema rejected 3/6 calls.
+  it('defaults a missing window to the last 7 days through today (UTC) and says so', async () => {
+    jest.useFakeTimers({ now: new Date('2026-11-25T18:00:00Z'), doNotFake: ['nextTick', 'setImmediate'] });
+    try {
+      admin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue(client);
+      (getAccountsByUserId as jest.Mock).mockResolvedValue([ownAccount]);
+      graphRouter();
+      const r = await readClientMetaBudgets('admin', 'owner@haven.com', undefined, '');
+      expect(r.success).toBe(true);
+      expect(r.since).toBe('2026-11-19');
+      expect(r.until).toBe('2026-11-25');
+      expect(r.window_defaulted).toBe(true);
+      expect(metaFetch.mock.calls[0][0]).toContain(encodeURIComponent(JSON.stringify({ since: '2026-11-19', until: '2026-11-25' })));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a supplied window is used verbatim and window_defaulted is false', async () => {
+    admin();
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue(client);
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([ownAccount]);
+    graphRouter();
+    const r = await readClientMetaBudgets('admin', 'owner@haven.com', '2026-11-01', '2026-11-15');
+    expect(r.since).toBe('2026-11-01');
+    expect(r.window_defaulted).toBe(false);
+  });
+
+  it('a missing since anchors 7 days back from a supplied until; a malformed supplied date still refuses', async () => {
+    expect(resolveBudgetWindow(undefined, '2026-03-02')).toEqual({ since: '2026-02-24', until: '2026-03-02', defaulted: true });
+    admin();
+    const r = await readClientMetaBudgets('admin', 'owner@haven.com', undefined, 'yesterday');
+    expect(r.reason).toBe('invalid_window');
+    expect(metaFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('ENG-3190 read_client_meta_budgets MCP contract', () => {
+  it('declares only client_name_or_email as required, so a call without a window passes validation', () => {
+    const inv = require('./__fixtures__/mcp-public-tool-inventory.json');
+    const list: any[] = Array.isArray(inv) ? inv : inv.tools ?? Object.values(inv);
+    const tool = list.find((t: any) => t?.name === 'read_client_meta_budgets');
+    expect(tool.inputSchema.required).toEqual(['client_name_or_email']);
   });
 });

@@ -4282,7 +4282,7 @@ mcpToolRegistry.register({
     name: 'read_client_meta_budgets',
     description: `Read one managed client's Meta ad budgets and spend for an exact date window. Admin-only, read-only; never changes a budget.
 
-Resolves the client (exact email, or a name that matches exactly one client) to the same Meta ad account and token assess_client_health reads. Returns the ad account id read, account spend for the window, and per campaign and per ad set: status, current daily or lifetime budget (minor currency units, as Meta returns them), and spend for the window.
+Resolves the client (exact email, or a name that matches exactly one client) to the same Meta ad account and token assess_client_health reads. Returns the ad account id read, account spend for the window, and per campaign and per ad set: status, current daily or lifetime budget (minor currency units, as Meta returns them), and spend for the window. Omit since/until to read the last 7 days through today (UTC); the result echoes the window read and window_defaulted.
 
 Refuses instead of guessing, with a reason: ambiguous_client (several clients match; ask with the email), client_not_found, no_meta_connection, credential_pair_mismatch, invalid_window, and meta_read_failed (a Meta read failed; no numbers are reported, which is not the same as zero spend).`,
     inputSchema: {
@@ -4292,14 +4292,17 @@ Refuses instead of guessing, with a reason: ambiguous_client (several clients ma
           type: 'string',
           description: 'The client\'s email address, or a display name that matches exactly one client.'
         },
-        since: { type: 'string', description: 'First day of the window, YYYY-MM-DD (inclusive).' },
-        until: { type: 'string', description: 'Last day of the window, YYYY-MM-DD (inclusive).' }
+        since: { type: 'string', description: 'First day of the window, YYYY-MM-DD (inclusive). Optional: defaults to 7 days ending at until.' },
+        until: { type: 'string', description: 'Last day of the window, YYYY-MM-DD (inclusive). Optional: defaults to today (UTC).' }
       },
-      required: ['client_name_or_email', 'since', 'until']
+      required: ['client_name_or_email']
     }
   },
   execute: async (args: any, context: any) => {
-    const qs = new URLSearchParams({ since: String(args.since ?? ''), until: String(args.until ?? '') });
+    const qs = new URLSearchParams();
+    for (const key of ['since', 'until']) {
+      if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') qs.set(key, String(args[key]));
+    }
     const data = await mcpFetch({
       method: 'GET',
       path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}/meta-budgets?${qs.toString()}`,
