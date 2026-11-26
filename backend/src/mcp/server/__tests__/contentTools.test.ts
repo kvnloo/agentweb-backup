@@ -7,7 +7,7 @@ jest.mock('../httpClient', () => ({ mcpFetch: jest.fn() }));
 
 import { mcpFetch } from '../httpClient';
 import { mcpToolRegistry } from '../registry';
-import { CallGuard, GUARDS, MAX_ANALYSIS_FILES, MAX_HTML_OPERATIONS, TIMEOUTS_MS, ownStorageUrl } from '../contentTools';
+import { CallGuard, GUARDS, MAX_ANALYSIS_FILES, MAX_HTML_OPERATIONS, TIMEOUTS_MS, ownStorageS3Uri, ownStorageUrl } from '../contentTools';
 import { MCP_TOOL_SIDE_EFFECTS } from '../toolAnnotationPolicy';
 
 const mockFetch = mcpFetch as jest.Mock;
@@ -147,11 +147,16 @@ describe('describe_image', () => {
 });
 
 describe('perform_data_analysis', () => {
-  it('sends own-storage file URLs and the instruction with a long timeout; answers analysis, code and file links', async () => {
-    mockFetch.mockResolvedValueOnce({ success: true, analysis: 'mean 3', codeExecuted: 'print(3)', fileUrls: [OWN_IMG], formattedContent: 'x', message: 'm' });
+  it('sends own-storage files as s3:// keys (the path where Emma checks the owner) with the instruction; answers analysis, code flag and file links', async () => {
+    mockFetch.mockResolvedValueOnce({ success: true, analysis: 'mean 3', codeExecuted: true, fileUrls: [OWN_IMG], formattedContent: 'x', message: 'm' });
     const a = parse(await call('perform_data_analysis', { file_urls: [OWN_CSV], analysis_instruction: 'mean of column a' }));
-    expect(a).toEqual({ analysis: 'mean 3', codeExecuted: 'print(3)', fileUrls: [OWN_IMG] });
-    expect(mockFetch.mock.calls[0][0]).toMatchObject({ path: '/api/emma/data-analysis', timeoutMs: TIMEOUTS_MS.perform_data_analysis, body: { file_urls: [OWN_CSV], analysis_instruction: 'mean of column a' } });
+    expect(a).toEqual({ analysis: 'mean 3', codeExecuted: true, fileUrls: [OWN_IMG] });
+    expect(mockFetch.mock.calls[0][0]).toMatchObject({ path: '/api/emma/data-analysis', timeoutMs: TIMEOUTS_MS.perform_data_analysis, body: { file_urls: ['s3://agentweb-user-files/users/user-1/files/1/abc/data.csv'], analysis_instruction: 'mean of column a' } });
+  });
+
+  it('the s3:// key is the object\'s real name: the URL path is decoded once; a malformed encoding is refused', () => {
+    expect(ownStorageS3Uri('t', 'f', 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/u/files/1/a/my%20data.csv')).toBe('s3://agentweb-user-files/users/u/files/1/a/my data.csv');
+    expect(() => ownStorageS3Uri('t', 'f', 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/u/files/1/a/bad%E0%A4%A.csv')).toThrow(/not a valid storage URL/);
   });
   it('inline data with no files works; more than 5 files or an oversize instruction is refused', async () => {
     mockFetch.mockResolvedValueOnce({ success: true, analysis: 'ok' });
@@ -159,6 +164,19 @@ describe('perform_data_analysis', () => {
     expect(mockFetch.mock.calls[0][0].body.file_urls).toEqual([]);
     await expect(call('perform_data_analysis', { file_urls: Array(MAX_ANALYSIS_FILES + 1).fill(OWN_CSV), analysis_instruction: 'x' })).rejects.toThrow(/at most 5 storage URLs/);
     await expect(call('perform_data_analysis', { analysis_instruction: 'x'.repeat(20_001) })).rejects.toThrow(/20001 characters/);
+  });
+});
+
+describe('text fields', () => {
+  it('content keeps ordinary text with joined emoji and right-to-left scripts; a title or id refuses invisible and direction characters', async () => {
+    const zwj = String.fromCharCode(0x200d);
+    const zwnj = String.fromCharCode(0x200c);
+    const rlm = String.fromCharCode(0x200f);
+    const content = `Team ${String.fromCodePoint(0x1f468)}${zwj}${String.fromCodePoint(0x1f469)} and ${'\u0645\u06cc'}${zwnj}${'\u062e\u0648\u0627\u0647\u0645'} ${rlm}shalom`;
+    mockFetch.mockResolvedValueOnce({ success: true, s3_url: OWN });
+    await expect(call('create_html_file', { title: 'T', content_draft: content, format_requirements: content })).resolves.toBeDefined();
+    await expect(call('create_html_file', { title: `T${zwj}`, content_draft: 'x' })).rejects.toThrow(/title holds control or invisible characters/);
+    await expect(call('create_html_file', { title: 'T', content_draft: `x${String.fromCharCode(0)}` })).rejects.toThrow(/content_draft holds control/);
   });
 });
 
@@ -189,6 +207,26 @@ describe('guards', () => {
     await expect(call('describe_image', { image_url: OWN_IMG }, 'u1')).rejects.toThrow(/HTTP 500/);
     expect(GUARDS.describe_image.inFlight).toBe(0);
   });
+  it.each([
+    ['create_html_file', { title: 'T', content_draft: 'x' }],
+    ['create_html_from_template', { template_id: 't1' }],
+    ['update_html_file', { file_url: OWN, update_type: 'css', operations: [{ action: 'remove', selector: 'p' }] }],
+    ['describe_image', { image_url: OWN_IMG }],
+    ['perform_data_analysis', { analysis_instruction: 'x' }],
+  ])('%s holds one slot per caller while it runs', async (tool, args) => {
+    let release!: (v: unknown) => void;
+    mockFetch.mockImplementationOnce(() => new Promise((r) => { release = r; }));
+    const first = call(tool, args, 'u-guard');
+    await expect(call(tool, args, 'u-guard')).rejects.toThrow(/another call of yours to this tool is still running/);
+    release({ success: true });
+    await first;
+    expect((GUARDS as any)[tool].inFlight).toBe(0);
+  });
+
+  it('every wait ends before the 600 s load-balancer cut', () => {
+    for (const ms of Object.values(TIMEOUTS_MS)) expect(ms).toBeLessThan(600_000);
+  });
+
   it('the process cap and the hourly cap', () => {
     const g = new CallGuard('t', 2, 3);
     g.enter('a', 0); g.enter('b', 0);
