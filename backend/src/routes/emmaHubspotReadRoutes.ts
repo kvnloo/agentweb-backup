@@ -13,7 +13,7 @@
  *  - `{ success: false, message }` (HTTP 200) when the handler refused or HubSpot answered an error: a fixed text chosen here from the
  *    HubSpot status, or (no status: Emma's own account, sign-in and timeout errors) from the kind of error; the handler's raw `err.message`
  *    is never passed on. The one free text kept is HubSpot's own `message` on a 400 (redacted by the handler, cleaned again and cut here).
- *  - HTTP 403 with LinkedIn's fixed text when the caller is an evaluation sandbox whose denied tool classes cover this tool: Emma refuses
+ *  - HTTP 403 with a fixed text (the one the LinkedIn read routes use) when the caller is an evaluation sandbox whose denied tool classes cover this tool: Emma refuses
  *    that through her registry, and this route calls her implementation directly, so it applies the check itself.
  *  - HTTP 500 with a fixed text on anything unexpected.
  */
