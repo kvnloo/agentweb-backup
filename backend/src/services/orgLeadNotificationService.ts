@@ -162,6 +162,11 @@ async function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, jo
   for (const key of ['company', 'title', 'notes', 'linkedin']) {
     if (string(lead[key])) answerFields[key] = lead[key];
   }
+  // ENG-2936: repeat submissions append notes oldest-first, and render() keeps the first 300
+  // chars, so a long earlier note hid the newest one. For a repeat-submission alert, show the
+  // newest end of the notes instead.
+  const notesText = string(answerFields.notes);
+  if (job.submissionId && notesText.length > 300) answerFields.notes = `…${notesText.slice(-299)}`;
   let hasAnswers = false;
   const seen = new Set<string>();
   for (const [key, value] of [...Object.entries(answerFields), ...Object.entries(customFields)]) {

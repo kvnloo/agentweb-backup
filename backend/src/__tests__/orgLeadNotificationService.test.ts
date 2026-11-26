@@ -491,6 +491,16 @@ it('deduplicates a submission retry while allowing separate submissions of the s
   expect(postMessage.mock.calls[0][0].text).toContain('Submitted: Sep 23, 2026, 6:00 PM PT');
 });
 
+it('ENG-2936: a repeat-submission alert shows the newest appended note, not the oldest 300 chars', async () => {
+  lead.notes = `OLD-START ${'A'.repeat(360)} OLD-END\n\nNEWEST-SHORT-NOTE`;
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill', { submissionId: 'repeat-2', submittedAt: '2026-09-24T01:00:00Z' });
+  const repeatText = postMessage.mock.calls[0][0].text;
+  expect(repeatText).toContain('NEWEST-SHORT-NOTE');
+  expect(repeatText).not.toContain('OLD-START');
+  await dispatchLeadCreated('list-a', 'lead-a', 'form_fill');
+  expect(postMessage.mock.calls[1][0].text).toContain('OLD-START');
+});
+
 it.each([null, [], 'wrong-type', { fbclid: {}, gclid: ['bad'] }])('ignores malformed click-id and extra-param boundaries %j', async value => {
   lead.firstTouch = { clickIds: value, extraParams: value, referrer: {} };
   lead.clickIds = value;
