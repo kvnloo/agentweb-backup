@@ -14,7 +14,7 @@ import {
   processIsAlive,
   withoutBrowserClientMeta,
 } from '../mcp/client/playwrightContainment';
-import { STDIO_CHILD_ENV_ALLOWLIST } from '../mcp/client/stdioChildEnv';
+import { STDIO_CHILD_ENV_ALLOWLIST, buildStdioChildEnv } from '../mcp/client/stdioChildEnv';
 import { SsrfBlockedError } from '../utils/ssrfGuard';
 
 // The NAMES (never values) the production backend environment held on 2026-11-25, read from Elastic Beanstalk, plus the ones a host adds itself.
@@ -46,8 +46,14 @@ describe('playwrightChildEnv', () => {
     }
   });
 
-  it('allows at least every name the shared stdio allow-list allows (the two lists must not drift apart)', () => {
-    for (const name of STDIO_CHILD_ENV_ALLOWLIST) expect(PLAYWRIGHT_ENV_ALLOWED_NAMES.has(name)).toBe(true);
+  it('passes on at least everything the shared stdio allow-list passes on, names and prefixes (the two lists must not drift apart)', () => {
+    const probe: NodeJS.ProcessEnv = {};
+    for (const name of STDIO_CHILD_ENV_ALLOWLIST) probe[name] = `v-${name}`;
+    for (const prefix of ['LC_', 'XDG_', 'NODE_', 'PLAYWRIGHT_', 'npm_', 'SSL_', 'HTTP', 'FONT', 'GTK_', 'DBUS_', 'DISPLAY', 'WAYLAND_', 'GIO_', 'GDK_']) {
+      probe[`${prefix}PROBE`] = 'v';
+    }
+    const browser = playwrightChildEnv(probe);
+    expect(Object.keys(buildStdioChildEnv(probe)).filter((name) => !(name in browser))).toEqual([]);
   });
 
   it('has nothing on the allow-list that looks like a secret', () => {
@@ -74,12 +80,6 @@ describe('playwrightChildEnv', () => {
     expect(playwrightChildEnv({ PATH: '/bin', HOME: undefined })).toEqual({ PATH: '/bin' });
   });
 
-  it('gives the browser server the whole environment again only when the rollback switch asks for it', () => {
-    const child = playwrightChildEnv(backendEnv(), {}, { inheritFullEnv: true });
-    expect(child.JWT_SECRET).toBe('value-of-JWT_SECRET');
-    expect(child.PATH).toBe(HOST_VARIABLES.PATH);
-    expect(playwrightChildEnv(backendEnv(), {}, { inheritFullEnv: false })).not.toHaveProperty('JWT_SECRET');
-  });
 });
 
 describe('withoutBrowserClientMeta', () => {

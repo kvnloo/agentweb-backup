@@ -71,7 +71,7 @@ import fs from 'fs';
 import path from 'path';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { internalMcpServers } from '../mcp/client/mcp_config';
-import { PLAYWRIGHT_INHERIT_ENV_FLAG, PLAYWRIGHT_WORK_ROOT } from '../mcp/client/playwrightContainment';
+import { PLAYWRIGHT_WORK_ROOT } from '../mcp/client/playwrightContainment';
 
 const NONCE = `eng3187-${process.pid}`;
 const DAY = 24 * 60 * 60 * 1000;
@@ -91,7 +91,7 @@ describe('Playwright MCP containment (ENG-3187)', () => {
     mockGetServerConfig.mockReset();
     mockStdio.mockImplementation(() => ({ onclose: null, onerror: null }));
     Object.assign(process.env, SECRETS);
-    delete process.env[PLAYWRIGHT_INHERIT_ENV_FLAG];
+    delete process.env.MCP_PLAYWRIGHT_INHERIT_ENV;
     (McpClientService as any).playwrightBrowsersInstall = Promise.resolve();
     service = new McpClientService();
   });
@@ -169,15 +169,12 @@ describe('Playwright MCP containment (ENG-3187)', () => {
       expect(env).not.toHaveProperty('JWT_SECRET');
     });
 
-    it('returns the whole environment only when the rollback switch is exactly "true"', () => {
-      process.env[PLAYWRIGHT_INHERIT_ENV_FLAG] = '1';
-      makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::h1`);
-      expect(transportOptions().env).not.toHaveProperty('JWT_SECRET');
-      process.env[PLAYWRIGHT_INHERIT_ENV_FLAG] = 'true';
+    it('has no switch back to the whole environment (the old rollback variable does nothing)', () => {
+      process.env.MCP_PLAYWRIGHT_INHERIT_ENV = 'true';
       makeTransport('playwright', PLAYWRIGHT_CONFIG, `user-${NONCE}::h2`);
-      const { env, cwd } = transportOptions();
-      expect(env.JWT_SECRET).toBe('jwt-value');
-      expect(cwd).toBeTruthy();
+      expect(transportOptions().env).not.toHaveProperty('JWT_SECRET');
+      makeTransport('other-server', { transport: 'stdio', command: 'node', args: ['server.js'] });
+      expect(transportOptions().env).not.toHaveProperty('JWT_SECRET');
     });
 
     it('gives every other stdio server the shared allow-list environment plus its own, and no working folder of ours', () => {
@@ -512,7 +509,7 @@ describe('Playwright MCP containment (ENG-3187)', () => {
     });
 
     it('starts the browser server from the contained environment, in its own folder, and remembers the folder by transport', () => {
-      expect(source).toMatch(/env: isPlaywrightMcp\n\s*\? playwrightChildEnv\(process\.env, resolvedEnv, \{ inheritFullEnv: process\.env\[PLAYWRIGHT_INHERIT_ENV_FLAG\] === 'true' \}\)\n\s*: buildStdioChildEnv\(process\.env, resolvedEnv\),\n\s*\.\.\.\(playwrightWorkDir \? \{ cwd: playwrightWorkDir \} : \{\}\),/);
+      expect(source).toMatch(/env: isPlaywrightMcp\n\s*\? playwrightChildEnv\(process\.env, resolvedEnv\)\n\s*: buildStdioChildEnv\(process\.env, resolvedEnv\),\n\s*\.\.\.\(playwrightWorkDir \? \{ cwd: playwrightWorkDir \} : \{\}\),/);
       expect(source).toMatch(/if \(playwrightWorkDir\) this\.playwrightTransportDirs\.set\(transport, playwrightWorkDir\);\n\s*return transport;/);
     });
 

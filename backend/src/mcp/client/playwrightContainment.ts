@@ -32,21 +32,19 @@ export const PLAYWRIGHT_ENV_ALLOWED_NAMES: ReadonlySet<string> = new Set([
 ]);
 const ENV_ALLOWED_PREFIXES = ['LC_', 'XDG_'];
 
-/** Set to the string "true" to give the browser server the backend's whole environment again (the old behaviour). A rollback switch only. */
-export const PLAYWRIGHT_INHERIT_ENV_FLAG = 'MCP_PLAYWRIGHT_INHERIT_ENV';
-
 /**
  * The environment of the browser server. `configuredEnv` is what the server's own configuration sets on purpose; it is passed on as is.
+ * There is deliberately no switch back to the backend's whole environment: the list allows everything the shared stdio list does
+ * (stdioChildEnv.ts), so no start-up failure can need more, and the whole environment is exactly what this keeps from the browser.
  */
 export function playwrightChildEnv(
   parentEnv: NodeJS.ProcessEnv,
   configuredEnv: Record<string, string> = {},
-  options: { inheritFullEnv?: boolean } = {},
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(parentEnv)) {
     if (typeof value !== 'string') continue;
-    if (options.inheritFullEnv || PLAYWRIGHT_ENV_ALLOWED_NAMES.has(name) || ENV_ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+    if (PLAYWRIGHT_ENV_ALLOWED_NAMES.has(name) || ENV_ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
       env[name] = value;
     }
   }
