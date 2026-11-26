@@ -256,6 +256,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       await callResolveOrCreateSeedAudience(USER_ID, ACCOUNT_ID, 'RankAI Warm List', { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' }, { dryRun: false });
       expect(axios.get).toHaveBeenCalledWith('https://s3.example.com/audience.csv', expect.objectContaining({
         timeout: 60_000,
+        signal: expect.any(AbortSignal),
         maxContentLength: 50 * 1024 * 1024,
         maxBodyLength: 50 * 1024 * 1024,
       }));
@@ -265,6 +266,12 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       (axios.get as jest.Mock).mockRejectedValueOnce(new Error('maxContentLength size of 52428800 exceeded'));
       await expect(callResolveOrCreateSeedAudience(USER_ID, ACCOUNT_ID, 'Big', { type: 'csv', csvUrl: 'https://s3.example.com/big.csv' }, { dryRun: false }))
         .rejects.toThrow(/larger than 50 MB/);
+
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any);
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_z', name: 'Slow' } } as any);
+      (axios.get as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED', name: 'CanceledError' }));
+      await expect(callResolveOrCreateSeedAudience(USER_ID, ACCOUNT_ID, 'Slow', { type: 'csv', csvUrl: 'https://s3.example.com/slow.csv' }, { dryRun: false }))
+        .rejects.toThrow(/did not download within 60 s/);
     });
 
     // Greptile finding: resolvePinnedPublicAddress validates one DNS answer,
