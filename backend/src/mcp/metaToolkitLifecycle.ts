@@ -105,7 +105,13 @@ function validateShape(entity: LifecycleEntity, action: LifecycleAction, args: a
   if (args.client_id !== undefined) throw new MetaToolkitRefusal('client_id is not available to external Meta Toolkit callers.');
   const id = args[ID_FIELD[entity]];
   if (typeof id !== 'string' || !/^\d+$/.test(id)) throw new MetaToolkitRefusal(`${entity} ${action} requires ${ID_FIELD[entity]}.`);
-  const params = args.params && typeof args.params === 'object' && !Array.isArray(args.params) ? args.params : {};
+  const params = args.params && typeof args.params === 'object' && !Array.isArray(args.params) ? { ...args.params } : {};
+  // An AD_SET is identified by ad_set_id, so a top-level campaign_id on an AD_SET COPY can only
+  // mean the destination campaign. It used to be dropped silently, copying the ad set back into
+  // its own campaign instead of the one the user named.
+  if (action === 'COPY' && entity === 'AD_SET' && params.campaign_id === undefined && args.campaign_id !== undefined) {
+    params.campaign_id = args.campaign_id;
+  }
   const keys = Object.keys(params).filter((k) => params[k] !== undefined);
   const allowed = action === 'COPY' ? COPY_PARAMS[entity] : [];
   const extra = keys.filter((k) => !allowed.includes(k));
