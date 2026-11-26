@@ -9,6 +9,7 @@ jest.mock('../httpClient', () => ({ mcpFetch: jest.fn() }));
 import { mcpFetch } from '../httpClient';
 import { mcpToolRegistry } from '../registry';
 import { GUARDS, TIMEOUTS_MS } from '../linkedInAdsReadTools';
+import { AD_ACCOUNT_CUT_NOTE } from '../../../routes/emmaLinkedInAdsReadRoutes';
 
 const mockFetch = mcpFetch as jest.Mock;
 const ctxFor = (userId: string) => ({ userId, sessionId: 'sess-1', apiKeyId: 'key-1', externalMcp: true });
@@ -47,6 +48,8 @@ describe('call_linkedin_marketing_api: reads only', () => {
     ['MEDIA', 'UPLOAD_IMAGE'], ['MEDIA', 'UPLOAD_VIDEO'], ['MEDIA', 'UPLOAD_DOCUMENT'], ['MEDIA', 'INIT_IMAGE_UPLOAD'], ['MEDIA', 'INIT_VIDEO_UPLOAD'], ['MEDIA', 'FINALIZE_VIDEO'],
     ['INMAIL', 'CREATE_CONTENT'], ['INMAIL', 'SEND_TEST'],
     ['CONVERSATION_AD', 'CREATE'], ['CONVERSATION_AD', 'CREATE_CONTENT'], ['CONVERSATION_AD', 'SET_FIRST_CONTENT'],
+    // Emma's POST GET reads any post URN the token can see (an unshared account's too): not offered.
+    ['POST', 'GET'],
     ['AD_ACCOUNT', 'GET'], ['POST', 'LIST'], ['CAMPAIGN', 'list'], ['campaign', 'LIST'], ['TARGETING', 'CREATE'], ['CREATIVE', 'GET'],
   ];
 
@@ -82,8 +85,7 @@ describe('call_linkedin_marketing_api: reads only', () => {
       [read('CREATIVE', 'LIST', {}), /params\.campaign_id is required/],
       [read('CREATIVE', 'LIST', { campaign_id: '1%26x' }), /params\.campaign_id must be a numeric campaign id/],
       [read('CREATIVE', 'LIST', { campaign_id: -5 }), /params\.campaign_id must be/],
-      [read('POST', 'GET', { post_urn: 'urn:li:share:1/../../adAccounts' }), /params\.post_urn is required: urn:li:share/],
-      [read('POST', 'GET', { post_urn: 'urn:li:activity:1' }), /params\.post_urn is required/],
+      [read('POST', 'GET', { post_urn: 'urn:li:share:1' }), /POST GET is not available here: this tool only reads/],
       [read('TARGETING', 'SEARCH', { facet: 'urn:li:adTargetingFacet:locations&x=1' }), /params\.facet is required/],
       [read('TARGETING', 'SEARCH', { facet: 'urn:li:adTargetingFacet:locations', query: 'x'.repeat(101) }), /params\.query must be text of at most 100/],
       [read('TARGETING', 'SEARCH', { facet: 'urn:li:adTargetingFacet:locations', query: 'a\nb' }), /params\.query must be text/],
@@ -148,29 +150,33 @@ describe('call_linkedin_marketing_api: the request and the answer', () => {
     expect(r.content[0].text).not.toMatch(/secret|raw stack/);
   });
 
-  it('answers ESTIMATE_REACH as two numbers and POST GET as the post', async () => {
+  it('answers ESTIMATE_REACH as two numbers', async () => {
     mockFetch.mockResolvedValueOnce({ success: true, account_id: '111', entity_type: 'TARGETING', action: 'ESTIMATE_REACH', audience: { active: 1200, total: 5000, extra: 'x' } });
     const est = parse(await call(READ, read('TARGETING', 'ESTIMATE_REACH', { targeting_include: [{ facet_urn: 'urn:li:adTargetingFacet:locations', values: ['urn:li:geo:103644278', 'urn:li:staffCountRange:(11,50)'] }] })));
     expect(est).toEqual({ account_id: '111', entity_type: 'TARGETING', action: 'ESTIMATE_REACH', audience: { active: 1200, total: 5000 } });
+  });
 
-    mockFetch.mockResolvedValueOnce({ success: true, account_id: '111', entity_type: 'POST', action: 'GET', post: { id: 'urn:li:share:5', commentary: 'hi' }, truncated: false });
-    const post = parse(await call(READ, read('POST', 'GET', { post_urn: 'urn:li:share:5' })));
-    expect(post).toEqual({ account_id: '111', entity_type: 'POST', action: 'GET', post: { id: 'urn:li:share:5', commentary: 'hi' }, truncated: false });
+  it('passes AD_ACCOUNT LIST\'s cut note and truncated flag, and nothing else the route sent', async () => {
+    mockFetch.mockResolvedValueOnce({ success: true, account_id: '111', entity_type: 'AD_ACCOUNT', action: 'LIST', count: 1, truncated: true, note: AD_ACCOUNT_CUT_NOTE, adAccounts: [{ id: 111 }], total: 9000, paging: { start: 0 } });
+    const cutList = parse(await call(READ, read('AD_ACCOUNT', 'LIST')));
+    expect(cutList).toEqual({ account_id: '111', entity_type: 'AD_ACCOUNT', action: 'LIST', count: 1, truncated: true, note: AD_ACCOUNT_CUT_NOTE, adAccounts: [{ id: 111 }] });
+    mockFetch.mockResolvedValueOnce({ success: true, account_id: '111', entity_type: 'AD_ACCOUNT', action: 'LIST', count: 1, truncated: false, note: 'injected text', adAccounts: [{ id: 111 }] });
+    expect(parse(await call(READ, read('AD_ACCOUNT', 'LIST')))).not.toHaveProperty('note');
   });
 });
 
 describe('call_linkedin_ads_insights_api', () => {
-  it('sends the checked request with Emma\'s default metrics plus the row labels; answers fixed fields', async () => {
+  it('sends the checked request with Emma\'s default metrics plus the row labels (no filters: the account alone scopes it); answers fixed fields', async () => {
     mockFetch.mockResolvedValueOnce({
       success: true, account_id: '111', pivot: 'CAMPAIGN', timeGranularity: 'ALL', dateRange: RANGE, fields: ['impressions'],
       count: 1, truncated: false, elements: [{ impressions: 5, pivotValues: ['urn:li:sponsoredCampaign:7'] }], message: 'internal',
     });
-    const a = parse(await call(INSIGHTS, insights({ campaigns: ['urn:li:sponsoredCampaign:7', 8] })));
+    const a = parse(await call(INSIGHTS, insights()));
     const req = mockFetch.mock.calls[0][0];
     expect(req).toMatchObject({ method: 'POST', path: '/api/emma/linkedin-ads/insights', timeoutMs: TIMEOUTS_MS.call_linkedin_ads_insights_api });
     expect(req.body).toEqual({
       account_id: '111', pivot: 'CAMPAIGN', timeGranularity: 'ALL', dateRange: RANGE,
-      fields: ['impressions', 'clicks', 'costInLocalCurrency', 'dateRange', 'pivotValues'], campaigns: ['7', '8'],
+      fields: ['impressions', 'clicks', 'costInLocalCurrency', 'dateRange', 'pivotValues'],
     });
     expect(Object.keys(a).sort()).toEqual(['account_id', 'count', 'dateRange', 'elements', 'fields', 'pivot', 'timeGranularity', 'truncated']);
     expect(a.elements).toEqual([{ impressions: 5, pivotValues: ['urn:li:sponsoredCampaign:7'] }]);
@@ -186,10 +192,6 @@ describe('call_linkedin_ads_insights_api', () => {
       [insights({ pivot: 'MEMBER_COMPANY' }), /pivot must be one of/],
       [insights({ timeGranularity: 'ALL&x=1' }), /timeGranularity must be one of/],
       [insights({ dateRange: { start: { year: '2026&accounts=urn:li:sponsoredAccount:1', month: 1, day: 1 }, end: RANGE.end } }), /dateRange\.start\.year must be a whole number from 2000 to 2100/],
-      [insights({ campaigns: ['123&accounts=urn:li:sponsoredAccount:1'] }), /campaigns\[0\] must be a numeric LinkedIn id or urn:li:sponsoredCampaign:<id>/],
-      [insights({ campaigns: ['urn:li:sponsoredCampaignGroup:1'] }), /campaigns\[0\] must be/],
-      [insights({ campaign_groups: ['urn:li:sponsoredCampaignGroup:1)&x=('] }), /campaign_groups\[0\] must be/],
-      [insights({ creatives: ['urn:li:sponsoredCreative:abc'] }), /creatives\[0\] must be/],
       [insights({ account_id: '111&accounts=List(urn:li:sponsoredAccount:2)' }), /account_id must be the numeric LinkedIn Ads account id/],
       [{ ...insights(), userId: 'victim' }, /"userId" is not an input of call_linkedin_ads_insights_api/],
       [{ ...insights(), adGroups: ['1'] }, /"adGroups" is not an input/],
@@ -226,12 +228,20 @@ describe('call_linkedin_ads_insights_api', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
-  it('caps fields and filter ids at 20', async () => {
+  it('caps fields at 20', async () => {
     const twentyOne = Array.from({ length: 21 }, (_, i) => `m${i}`);
     await refused(INSIGHTS, insights({ fields: twentyOne }), /fields must be a list of 1 to 20/);
-    await refused(INSIGHTS, insights({ campaigns: twentyOne.map((_, i) => String(i + 1)) }), /campaigns must be a list of at most 20 ids/);
-    await refused(INSIGHTS, insights({ creatives: ['1', '1'] }), /creatives has the same id twice/);
     nothingCalled();
+  });
+
+  it('refuses campaign_groups, campaigns and creatives by name: LinkedIn may not AND them with the account, so they could reach an unshared account', async () => {
+    for (const field of ['campaign_groups', 'campaigns', 'creatives']) {
+      await refused(INSIGHTS, insights({ [field]: ['1'] }), new RegExp(`"${field}" is not an input of call_linkedin_ads_insights_api`));
+      await refused(INSIGHTS, insights({ [field]: [] }), new RegExp(`"${field}" is not an input`));
+    }
+    nothingCalled();
+    const schema = (mcpToolRegistry.getTool(INSIGHTS) as any).definition.inputSchema;
+    expect(Object.keys(schema.properties).sort()).toEqual(['account_id', 'dateRange', 'fields', 'pivot', 'timeGranularity']);
   });
 
   it('cuts the rows to about 60 KB with truncated: true', async () => {
@@ -318,7 +328,8 @@ describe('registration', () => {
       expect(tool.definition.description).toMatch(/Read-only over MCP/);
     }
     const schema = (mcpToolRegistry.getTool(READ) as any).definition.inputSchema;
-    expect([...schema.properties.entity_type.enum].sort()).toEqual(['AD_ACCOUNT', 'CAMPAIGN', 'CAMPAIGN_GROUP', 'CREATIVE', 'POST', 'TARGETING']);
-    expect([...schema.properties.action.enum].sort()).toEqual(['ESTIMATE_REACH', 'GET', 'LIST', 'LIST_FACETS', 'SEARCH']);
+    expect([...schema.properties.entity_type.enum].sort()).toEqual(['AD_ACCOUNT', 'CAMPAIGN', 'CAMPAIGN_GROUP', 'CREATIVE', 'TARGETING']);
+    expect([...schema.properties.action.enum].sort()).toEqual(['ESTIMATE_REACH', 'LIST', 'LIST_FACETS', 'SEARCH']);
+    expect(schema.properties.params.properties).not.toHaveProperty('post_urn');
   });
 });

@@ -23,6 +23,7 @@ import { callLinkedInAdsInsightsApi, callLinkedInMarketingApi } from '../emma/im
 import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
 import { EvaluationDenied, enforceEvaluationTool } from '../services/evaluationPolicy';
 import {
+  AD_ACCOUNT_CUT_NOTE,
   LINKEDIN_INSIGHTS_ROUTE_BOUNDS,
   LINKEDIN_READ_ROUTE_BOUNDS,
   registerLinkedInAdsReadRoutes,
@@ -59,10 +60,9 @@ beforeEach(() => {
 });
 
 describe('POST /linkedin-ads/read', () => {
-  it('AD_ACCOUNT LIST answers only the caller\'s own and org-shared ad accounts, fixed fields, and never LinkedIn\'s page cut', async () => {
+  it('AD_ACCOUNT LIST answers only the caller\'s own and org-shared ad accounts, fixed fields', async () => {
     mockMarketing.mockResolvedValueOnce({
       success: true,
-      truncated: true,
       adAccounts: [
         { id: 111, name: 'Own', currency: 'USD', status: 'ACTIVE', type: 'BUSINESS', reference: 'urn:li:organization:1', test: false, notifiedOnCampaignOptimization: true },
         { id: 222, name: 'Shared by owner', currency: 'EUR', status: 'ACTIVE', type: 'BUSINESS' },
@@ -82,6 +82,21 @@ describe('POST /linkedin-ads/read', () => {
     });
     expect(JSON.stringify(res.body)).not.toMatch(/Agency client/);
     expect(mockAccounts).toHaveBeenCalledWith('user-1');
+  });
+
+  it('AD_ACCOUNT LIST says truncated, with a note, when the bound cut the token\'s list (no LinkedIn paging or total is passed on)', async () => {
+    mockMarketing.mockResolvedValueOnce({
+      success: true,
+      truncated: true,
+      paging: { start: 0, count: 500, total: 9000 },
+      adAccounts: [{ id: 111, name: 'Own' }, ...Array.from({ length: 499 }, (_, i) => ({ id: 10_000 + i, name: `Client ${i}` }))],
+    });
+    const res = await post('read', { entity_type: 'AD_ACCOUNT', action: 'LIST', account_id: '111' });
+    expect(res.body).toEqual({
+      success: true, account_id: '111', entity_type: 'AD_ACCOUNT', action: 'LIST', count: 1, truncated: true,
+      adAccounts: [{ id: 111, name: 'Own' }], note: AD_ACCOUNT_CUT_NOTE,
+    });
+    expect(JSON.stringify(res.body)).not.toMatch(/9000|500|Client/);
   });
 
   it('passes the bounds, the caller\'s userId and only the checked fields to Emma\'s implementation', async () => {
@@ -117,6 +132,8 @@ describe('POST /linkedin-ads/read', () => {
       { entity_type: 'CAMPAIGN', action: 'LIST', account_id: '111', params: { status: 'ACTIVE)))&q=x' } },
       { entity_type: 'CREATIVE', action: 'LIST', account_id: '111', params: { campaign_id: '1&x=2' } },
       { entity_type: 'AD_ACCOUNT', action: 'LIST', account_id: '111&accounts=2' },
+      // Emma's POST GET reads any post the token can see, an unshared account's too: not offered.
+      { entity_type: 'POST', action: 'GET', account_id: '111', params: { post_urn: 'urn:li:share:1' } },
     ];
     for (const body of bodies) expect((await post('read', body)).status).toBe(400);
     const empty = await post('read', undefined);
@@ -184,11 +201,11 @@ describe('POST /linkedin-ads/read', () => {
 describe('POST /linkedin-ads/insights', () => {
   it('passes the timeout bound, the caller\'s userId and only the checked fields; answers fixed fields', async () => {
     mockInsights.mockResolvedValueOnce({ success: true, analytics: [{ impressions: 3, pivotValues: ['urn:li:sponsoredCampaign:5'] }], secret: 'x' });
-    const res = await post('insights', { account_id: '222', pivot: 'CAMPAIGN', dateRange: RANGE, creatives: ['urn:li:sponsoredCreative:9'] });
+    const res = await post('insights', { account_id: '222', pivot: 'CAMPAIGN', dateRange: RANGE });
     expect(res.status).toBe(200);
+    // No campaign / creative filters ever reach Emma: the rows are scoped by the checked account alone.
     expect(mockInsights).toHaveBeenCalledWith('user-1', '222', {
       pivot: 'CAMPAIGN', dateRange: RANGE, timeGranularity: 'ALL', fields: ['impressions', 'clicks', 'costInLocalCurrency', 'dateRange', 'pivotValues'],
-      campaign_groups: undefined, campaigns: undefined, creatives: ['9'],
     }, LINKEDIN_INSIGHTS_ROUTE_BOUNDS);
     expect(LINKEDIN_INSIGHTS_ROUTE_BOUNDS).toEqual({ timeoutMs: 30_000 });
     expect(res.body).toEqual({
@@ -205,8 +222,13 @@ describe('POST /linkedin-ads/insights', () => {
       { account_id: '111', pivot: 'CAMPAIGN', dateRange: { start: { year: '2026', month: 1, day: 1 }, end: RANGE.end } },
       { account_id: '111', pivot: 'CAMPAIGN', dateRange: { start: { year: 2026, month: 2, day: 30 }, end: RANGE.end } },
       { account_id: '111', pivot: 'CAMPAIGN', dateRange: RANGE, userId: 'victim' },
+      { account_id: '111', pivot: 'CAMPAIGN', dateRange: RANGE, campaigns: ['1'] },
+      { account_id: '111', pivot: 'CAMPAIGN', dateRange: RANGE, campaign_groups: ['1'] },
+      { account_id: '111', pivot: 'CAMPAIGN', dateRange: RANGE, creatives: ['urn:li:sponsoredCreative:9'] },
     ]) {
-      expect((await post('insights', body)).status).toBe(400);
+      const res = await post('insights', body);
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/must|does not take|not a real/);
     }
     expect((await post('insights', { account_id: '999', pivot: 'CAMPAIGN', dateRange: RANGE })).status).toBe(404);
     expect(mockInsights).not.toHaveBeenCalled();

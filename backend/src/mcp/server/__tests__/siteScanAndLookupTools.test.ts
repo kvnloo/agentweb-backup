@@ -6,7 +6,7 @@ jest.mock('../httpClient', () => ({ mcpFetch: jest.fn() }));
 
 import { mcpFetch } from '../httpClient';
 import { mcpToolRegistry } from '../registry';
-import { SITE_TOOL_GUARDS, SCAN_MAX_LINKS, SCAN_MAX_LIST_ENTRIES, SCAN_MAX_PAGES, SCAN_DEADLINE_MS, siteScanDeps } from '../siteScanAndLookupTools';
+import { SITE_TOOL_GUARDS, SCAN_MAX_ANSWER_BYTES, SCAN_MAX_LINKS, SCAN_MAX_LIST_ENTRIES, SCAN_MAX_PAGES, SCAN_DEADLINE_MS, siteScanDeps } from '../siteScanAndLookupTools';
 
 const mockFetch = mcpFetch as jest.Mock;
 const ctxFor = (userId: string) => ({ userId, sessionId: 'sess-1', apiKeyId: 'key-1', externalMcp: true });
@@ -60,6 +60,19 @@ describe('scan_website_links', () => {
     expect(out.broken_links[0].found_on).toHaveLength(5);
     expect(out.lists_cut).toBe(true);
     expect(out.truncated).toBe(true);
+  });
+
+  it('cuts the lists further until the answer fits its byte ceiling, and says so', async () => {
+    const longUrl = (i: number) => `https://example.com/${'x'.repeat(1900)}/${i}`;
+    const many = Array.from({ length: SCAN_MAX_LIST_ENTRIES }, (_, i) => ({ url: longUrl(i), kind: 'internal', status: 404, foundOn: Array(5).fill(longUrl(0)) }));
+    mockCrawl.mockResolvedValueOnce(scanResult({ brokenLinks: many, brokenLinkCount: many.length }));
+    const r = await call('scan_website_links', { url: 'https://example.com/' });
+    expect(Buffer.byteLength(r.content[0].text)).toBeLessThanOrEqual(SCAN_MAX_ANSWER_BYTES + 1000);
+    const out = JSON.parse(r.content[0].text);
+    expect(out.broken_links.length).toBeGreaterThan(0);
+    expect(out.broken_links.length).toBeLessThan(SCAN_MAX_LIST_ENTRIES);
+    expect(out.broken_link_count).toBe(SCAN_MAX_LIST_ENTRIES);
+    expect(out.lists_cut).toBe(true);
   });
 
   it('one scan at a time per caller, ten an hour, and the slot is freed after a failure', async () => {

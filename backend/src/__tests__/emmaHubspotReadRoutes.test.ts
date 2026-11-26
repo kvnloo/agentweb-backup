@@ -3,8 +3,11 @@
  * Mounted here on a bare express Router with a fake authenticated user (the real /api/emma router adds auth and the token budget).
  *  - It refuses writes, raw-REST shapes, bad ids and unknown fields itself (400) and never calls Emma's handler for them.
  *  - It hands the handler ONLY the checked fields, as req.user.userId, with the MCP bound on DEALS GET_CONTACTS.
- *  - Its answer names the account that served the call; a refusal is a short text; anything unexpected is a fixed 500.
- *  - Through the REAL handler (HubSpotService doubled): own vs org-shared account, the 100-contact bound, and Emma's call unchanged.
+ *  - An evaluation sandbox whose denied classes cover the tool gets LinkedIn's fixed 403, and the handler is never called.
+ *  - Its answer names the account that served the call; a refusal is a fixed text (Emma's raw err.message is never passed on); anything
+ *    unexpected is a fixed 500.
+ *  - Through the REAL handler (HubSpotService doubled): own vs org-shared account, the 100-contact bound that stops association paging
+ *    early, and Emma's two-argument call unchanged.
  */
 import express, { Router } from 'express';
 import request from 'supertest';
@@ -13,6 +16,10 @@ const mockCreate = jest.fn();
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: { create: (...a: any[]) => mockCreate(...a), fromToken: jest.fn() },
 }));
+jest.mock('../services/evaluationPolicy', () => {
+  const actual = jest.requireActual('../services/evaluationPolicy');
+  return { ...actual, enforceEvaluationTool: jest.fn(async () => undefined) };
+});
 const mockHandle = jest.fn();
 jest.mock('../emma/impl/adsCrmApis', () => {
   const actual = jest.requireActual('../emma/impl/adsCrmApis');
@@ -20,6 +27,9 @@ jest.mock('../emma/impl/adsCrmApis', () => {
 });
 
 import { registerHubspotReadRoutes, cleanHubspotText, describeServingAccount, refusalMessage } from '../routes/emmaHubspotReadRoutes';
+import { EvaluationDenied, enforceEvaluationTool } from '../services/evaluationPolicy';
+
+const mockEnforce = enforceEvaluationTool as jest.Mock;
 
 const realAds = jest.requireActual('../emma/impl/adsCrmApis');
 
@@ -42,6 +52,8 @@ const post = (body: unknown) => request(app).post('/api/emma/hubspot-read').send
 beforeEach(() => {
   mockHandle.mockReset();
   mockCreate.mockReset();
+  mockEnforce.mockReset();
+  mockEnforce.mockImplementation(async () => undefined);
   mockHandle.mockImplementation((...a: any[]) => realAds.handleHubspotApi(...a));
 });
 
@@ -108,6 +120,15 @@ describe('refused by the route itself (400), the handler never called', () => {
     expect(mockHandle).not.toHaveBeenCalled();
   });
 
+  it('refuses an evaluation sandbox\'s denied tool class with LinkedIn\'s 403, nothing called', async () => {
+    mockEnforce.mockRejectedValueOnce(new EvaluationDenied('Tool "call_hubspot_api" is not available in this sandbox workspace (third_party_writes).'));
+    const res = await post({ entity_type: 'WORKFLOW', action: 'LIST' });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ message: 'This tool is not available in this sandbox workspace' });
+    expect(mockEnforce).toHaveBeenCalledWith('caller-1', 'call_hubspot_api');
+    expect(mockHandle).not.toHaveBeenCalled();
+  });
+
   it('401 without an authenticated user', async () => {
     const res = await request(appFor(null)).post('/api/emma/hubspot-read').send({ entity_type: 'WORKFLOW', action: 'LIST' });
     expect(res.status).toBe(401);
@@ -123,6 +144,7 @@ describe('what the handler is given', () => {
     expect(uid).toBe('caller-1');
     expect(args).toStrictEqual({ entity_type: 'EMAIL', action: 'GET_STATS', account_id: '4242', email_ids: ['11', '12'], start_timestamp: '1767225600000' });
     expect(options.maxDealContacts).toBe(100);
+    expect(mockEnforce).toHaveBeenCalledWith('caller-1', 'call_hubspot_api');
     expect(typeof options.onResolved).toBe('function');
 
     await post({ entity_type: 'DEALS', action: 'SEARCH', deal_stage: 'Closed Won', created_after: 1767225600000 });
@@ -148,7 +170,7 @@ describe('what the handler is given', () => {
 });
 
 describe('refusals and errors', () => {
-  it('maps the handler\'s { success: false } to a short text, never HubSpot\'s raw body', async () => {
+  it('maps the handler\'s { success: false } to a fixed text, never HubSpot\'s raw body nor Emma\'s raw err.message', async () => {
     const cases: Array<[Record<string, unknown>, RegExp]> = [
       [{ success: false, error: 'Request failed with status code 404', status: 404, hubspotError: { message: 'x' } }, /^HubSpot found nothing at that id \(HTTP 404\)/],
       [{ success: false, error: 'Request failed with status code 429', status: 429 }, /rate limit for this portal was reached \(HTTP 429\)/],
@@ -156,9 +178,15 @@ describe('refusals and errors', () => {
       [{ success: false, error: 'Request failed with status code 502', status: 502, hubspotError: '<html>gateway</html>' }, /^HubSpot could not answer \(HTTP 502\)\. Try again later\.$/],
       [{ success: false, error: 'Your HubSpot connection is missing the required permissions. Please reconnect.', status: 403, hubspotError: { message: 'This oauth-token (abcdefghijklmnopqrstuvwxyz0123456789) does not have proper permissions!' } }, /^Your HubSpot connection is missing the required permissions/],
       [{ success: false, error: 'Request failed with status code 400', status: 400, hubspotError: { message: 'Invalid input JSON on line 1' } }, /^HubSpot refused the request \(HTTP 400\): Invalid input JSON on line 1$/],
-      [{ success: false, error: 'HubSpot account not connected. Please connect your HubSpot account in Settings.', status: null }, /^HubSpot account not connected/],
-      [{ success: false, error: `Multiple HubSpot accounts found: [A (ID: 1)\n, B (ID: 2)]. Specify account_id. token pat-na1-${'a'.repeat(36)}`, status: null }, /^Multiple HubSpot accounts found: \[A \(ID: 1\) , B \(ID: 2\)\]\. Specify account_id\. token <redacted>$/],
-      [{ success: false }, /^The HubSpot read was refused\.$/],
+      [{ success: false, error: 'HubSpot account not connected. Please connect your HubSpot account in Settings.', status: null }, /^No HubSpot account is connected\. Connect HubSpot in Settings/],
+      [{ success: false, error: 'No HubSpot account connected. Please connect HubSpot in Settings.' }, /^No HubSpot account is connected\./],
+      [{ success: false, error: `Multiple HubSpot accounts found: [Acme Secret Portal (ID: 1)\n, B (ID: 2)]. Specify account_id. token pat-na1-${'a'.repeat(36)}`, status: null }, /^Several HubSpot accounts are connected: pass account_id \(from list_connected_accounts\)\.$/],
+      [{ success: false, error: 'HubSpot account "hub-9" not found. Please reconnect your account.', status: null }, /^That account_id is not one of your HubSpot accounts or one shared with your organization/],
+      [{ success: false, error: 'Your HubSpot account needs to be reconnected. Go to Settings → Connected Accounts and reconnect HubSpot.', status: null }, /^The HubSpot sign-in needs to be renewed\. Reconnect HubSpot/],
+      [{ success: false, error: 'timeout of 15000ms exceeded', status: null }, /^HubSpot did not answer in time\. Try again later\.$/],
+      [{ success: false, error: 'No deal stage matches "Won ish". Use DEALS LIST_PIPELINES to see stage ids and labels.' }, /^No deal stage matches deal_stage\./],
+      [{ success: false, error: "Cannot read properties of undefined (reading 'x') at /srv/app/dist/emma/impl/adsCrmApis.js:1700", status: null }, /^The HubSpot read failed\. Try again later\.$/],
+      [{ success: false }, /^The HubSpot read failed\. Try again later\.$/],
     ];
     for (const [result, re] of cases) {
       mockHandle.mockResolvedValueOnce(result);
@@ -167,7 +195,7 @@ describe('refusals and errors', () => {
       expect(Object.keys(res.body).sort()).toEqual(['message', 'success']);
       expect(res.body.success).toBe(false);
       expect(res.body.message).toMatch(re);
-      expect(res.body.message).not.toMatch(/abcdefghijklmnopqrstuvwxyz0123456789|gateway/);
+      expect(res.body.message).not.toMatch(/abcdefghijklmnopqrstuvwxyz0123456789|gateway|Acme|pat-na1|hub-9|Won ish|\/srv\/|Cannot read/);
     }
   });
 
@@ -200,17 +228,18 @@ describe('through Emma\'s real handler (HubSpotService doubled)', () => {
     batchReadContacts: jest.fn(async (ids: string[]) => ids.map((id) => ({ id, properties: { email: `c${id}@example.com` } }))),
   });
 
-  it('DEALS GET_CONTACTS over MCP reads at most 100 contacts and says how many the deal has; the account is the caller\'s own', async () => {
+  it('DEALS GET_CONTACTS over MCP stops association paging past 100 ids, reads at most 100 contacts and says the list was cut; own account', async () => {
     const svc = svcFor('caller-1');
     mockCreate.mockResolvedValueOnce(svc);
     const res = await post({ entity_type: 'DEALS', action: 'GET_CONTACTS', deal_id: '777' });
     expect(res.status).toBe(200);
     expect(mockCreate).toHaveBeenCalledWith('caller-1', undefined, 'own');
-    expect(svc.getDealContactAssociations).toHaveBeenCalledWith('777');
+    expect(svc.getDealContactAssociations.mock.calls).toStrictEqual([['777', { stopAfter: 100 }]]);
     expect(svc.batchReadContacts).toHaveBeenCalledTimes(1);
     expect(svc.batchReadContacts.mock.calls[0][0]).toHaveLength(100);
     expect(res.body.account).toEqual({ account_id: 'hub-1', source: 'own' });
-    expect(res.body.result).toMatchObject({ deal_id: '777', contacts_total: 250, contacts_cut: true });
+    expect(res.body.result).toMatchObject({ deal_id: '777', contacts_cut: true });
+    expect(res.body.result.contacts_total).toBeUndefined();
     expect(res.body.result.contacts).toHaveLength(100);
   });
 
@@ -223,10 +252,20 @@ describe('through Emma\'s real handler (HubSpotService doubled)', () => {
     expect(res.body.account).toEqual({ account_id: 'hub-2', source: 'org_shared' });
   });
 
-  it('Emma\'s own call (no options) is unchanged: every contact of the deal, no new fields', async () => {
+  it('a deal with at most 100 contacts is not cut', async () => {
+    const svc = svcFor('caller-1');
+    svc.getDealContactAssociations.mockResolvedValueOnce(contactIds.slice(0, 100));
+    mockCreate.mockResolvedValueOnce(svc);
+    const res = await post({ entity_type: 'DEALS', action: 'GET_CONTACTS', deal_id: '780' });
+    expect(res.body.result.contacts).toHaveLength(100);
+    expect(res.body.result.contacts_cut).toBeUndefined();
+  });
+
+  it('Emma\'s own call (no options) is unchanged: association paging called with the deal id alone, every contact, no new fields', async () => {
     const svc = svcFor('caller-1');
     mockCreate.mockResolvedValueOnce(svc);
     const result = await realAds.handleHubspotApi('caller-1', { entity_type: 'DEALS', action: 'GET_CONTACTS', deal_id: '779' });
+    expect(svc.getDealContactAssociations.mock.calls).toStrictEqual([['779']]);
     expect(svc.batchReadContacts.mock.calls[0][0]).toHaveLength(250);
     expect(result.contacts).toHaveLength(250);
     expect(Object.keys(result).sort()).toEqual(['contacts', 'deal_id', 'success']);

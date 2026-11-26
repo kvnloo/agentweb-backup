@@ -44,6 +44,11 @@ describe('registration', () => {
     expect(mcpToolRegistry.getTool('fathom_get_onboarding_context')).toBeUndefined();
     expect(mcpToolRegistry.getTool('fathom_route_action_items')).toBeUndefined();
     expect(Object.keys((mcpToolRegistry.getTool('luma_get_guests') as any).definition.inputSchema.properties)).not.toContain('include_phone');
+    // Precise about phones: no phone_number field, but answers are free text as guests typed them.
+    const guestsText = (mcpToolRegistry.getTool('luma_get_guests') as any).definition.description;
+    expect(guestsText).toMatch(/There is no phone_number field; registration answers are returned as guests typed them and may contain contact details/);
+    expect(guestsText).toMatch(/third-party content/);
+    expect(guestsText).not.toMatch(/No phone numbers/);
   });
 });
 
@@ -306,6 +311,45 @@ describe('size caps and truncation', () => {
     const a = parse(await call('fathom_get_transcript', { recording_id: 1 }));
     expect(a.count).toBe(1);
     expect(a.transcript[0].text).toBe(`${'z'.repeat(MAX_TURN_TEXT_CHARS)}… [cut at ${MAX_TURN_TEXT_CHARS} characters]`);
+    expect(a.item_texts_cut).toBeUndefined();
+  });
+
+  it('a turn that alone is over the cap is still answered, its texts cut shorter, and paging moves on', async () => {
+    // JSON writes this character as a 6-byte escape, so even the per-turn cap (10,000 characters) is over 60 KB.
+    const ctl = String.fromCharCode(1);
+    const turns = Array.from({ length: 3 }, (_, i) => ({ speaker: `S${i}`, text: ctl.repeat(20_000), start_time: i }));
+    mockFetch.mockResolvedValue({ success: true, transcript: turns });
+    const r1 = await call('fathom_get_transcript', { recording_id: 9 });
+    expect(answerBytes(r1)).toBeLessThanOrEqual(MAX_ANSWER_BYTES);
+    const a = parse(r1);
+    expect(a).toMatchObject({ total_turns: 3, start_turn: 0, count: 1, truncated: true, next_start_turn: 1, item_texts_cut: true });
+    expect(a.transcript[0]).toMatchObject({ speaker: 'S0', start_time: 0 });
+    expect(a.transcript[0].text).toMatch(/… \[cut at \d+ characters\]$/);
+    expect(a.transcript[0].text.length).toBeLessThan(MAX_TURN_TEXT_CHARS);
+    const b = parse(await call('fathom_get_transcript', { recording_id: 9, start_turn: a.next_start_turn }));
+    expect(b).toMatchObject({ start_turn: 1, count: 1, truncated: true, next_start_turn: 2, item_texts_cut: true });
+    expect(b.transcript[0].speaker).toBe('S1');
+    const c = parse(await call('fathom_get_transcript', { recording_id: 9, start_turn: 2 }));
+    expect(c).toMatchObject({ start_turn: 2, count: 1, item_texts_cut: true });
+    expect(c.truncated).toBeUndefined();
+    expect(c.next_start_turn).toBeUndefined();
+  });
+
+  it('a meeting or a guest that alone is over the cap is answered too, never an empty list', async () => {
+    const ctl = String.fromCharCode(1);
+    mockFetch.mockResolvedValueOnce({ success: true, meetings: [
+      { recording_id: 1, title: 'Big', participants: Array.from({ length: 50 }, () => ctl.repeat(200)), action_items: [] },
+      { recording_id: 2, title: 'Next' },
+    ] });
+    const r = await call('fathom_get_meetings', {});
+    expect(answerBytes(r)).toBeLessThanOrEqual(MAX_ANSWER_BYTES);
+    expect(parse(r)).toMatchObject({ total: 2, count: 1, truncated: true, item_texts_cut: true, meetings: [{ recording_id: 1, title: 'Big', participants_count: 50 }] });
+    mockFetch.mockResolvedValueOnce({ success: true, has_more: true, next_cursor: 'c2', guests: [
+      { guest_id: 'g1', email: 'g@example.com', registration_answers: Array.from({ length: 30 }, () => ({ label: ctl.repeat(200), value: ctl.repeat(300) })) },
+    ] });
+    const g = await call('luma_get_guests', { event: 'evt-a', include_registration_answers: true });
+    expect(answerBytes(g)).toBeLessThanOrEqual(MAX_ANSWER_BYTES);
+    expect(parse(g)).toMatchObject({ has_more: true, next_cursor: 'c2', count: 1, item_texts_cut: true, guests: [{ guest_id: 'g1', email: 'g@example.com' }] });
   });
 
   it('many meetings with long summaries: summaries cut, the list cut to about 60 KB with truncated and a note; limit returns fewer', async () => {
