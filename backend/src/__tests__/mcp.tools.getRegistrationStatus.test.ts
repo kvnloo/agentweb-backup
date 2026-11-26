@@ -181,4 +181,12 @@ describe('get_registration_status', () => {
       'x=y/z@acme.io',
     ]);
   });
+  it('reports oversized pieces without regex-scanning them (ENG-3189)', () => {
+    const huge = 'a@' + 'b.'.repeat(5000);
+    const start = Date.now();
+    const { emails, skipped } = extractRegistrationStatusEmails(`ok@acme.com, ${huge}`);
+    expect(Date.now() - start).toBeLessThan(200);
+    expect(emails).toEqual(['ok@acme.com']);
+    expect(skipped).toHaveLength(1);
+  });
 });

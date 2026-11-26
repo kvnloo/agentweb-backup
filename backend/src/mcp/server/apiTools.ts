@@ -4672,6 +4672,7 @@ Typical prompts this answers:
  * string — and return trimmed, non-empty strings.
  */
 const REGISTRATION_EMAIL_PATTERN = /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.(?:xn--[A-Za-z0-9-]+|[A-Za-z]{2,})/g;
+const REGISTRATION_EMAIL_PIECE_MAX = 512;
 
 /**
  * ENG-3189: models pass `emails` as an array, a comma/space-separated string,
@@ -4705,6 +4706,12 @@ export function extractRegistrationStatusEmails(raw: unknown): { emails: string[
       for (const piece of trimmed.split(/[,;\n]+/)) {
         const part = piece.trim();
         if (!part) continue;
+        // Bound regex input: an address is <=254 chars; a display-name
+        // contact fits well under this. Oversized pieces are reported, not scanned.
+        if (part.length > REGISTRATION_EMAIL_PIECE_MAX) {
+          skipped.push(part.slice(0, 80));
+          continue;
+        }
         const found = part.match(REGISTRATION_EMAIL_PATTERN);
         if (found && found.length > 0) emails.push(...found);
         else skipped.push(part);
