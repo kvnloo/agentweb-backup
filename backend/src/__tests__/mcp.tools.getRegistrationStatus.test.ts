@@ -189,4 +189,17 @@ describe('get_registration_status', () => {
     expect(emails).toEqual(['ok@acme.com']);
     expect(skipped).toHaveLength(1);
   });
+
+describe('extractRegistrationStatusEmails Opslane regressions (ENG-3189)', () => {
+  it('extracts every address from a long space-separated list', () => {
+    const list = Array.from({ length: 20 }, (_, n) => `lead-${n + 1}@verify.opslane.com`);
+    const { emails, skipped } = extractRegistrationStatusEmails(list.join(' '));
+    expect(emails).toEqual(list);
+    expect(skipped).toEqual([]);
+  });
+
+  it('extracts addresses with a non-ASCII domain', () => {
+    expect(extractRegistrationStatusEmails('user@bücher.de').emails).toEqual(['user@bücher.de']);
+  });
+});
 });

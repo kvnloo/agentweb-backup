@@ -4671,7 +4671,9 @@ Typical prompts this answers:
  * a JSON-encoded array string, or a comma/semicolon/whitespace-separated
  * string — and return trimmed, non-empty strings.
  */
-const REGISTRATION_EMAIL_PATTERN = /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.(?:xn--[A-Za-z0-9-]+|[A-Za-z]{2,})/g;
+// Unicode letters/digits allowed so internationalized addresses (e.g. a
+// non-ASCII domain) are looked up rather than skipped.
+const REGISTRATION_EMAIL_PATTERN = /[\p{L}\p{N}.!#$%&'*+/=?^_`{|}~-]+@[\p{L}\p{N}.-]+\.(?:xn--[A-Za-z0-9-]+|\p{L}{2,})/gu;
 const REGISTRATION_EMAIL_PIECE_MAX = 512;
 
 /**
@@ -4703,8 +4705,16 @@ export function extractRegistrationStatusEmails(raw: unknown): { emails: string[
       }
       // Split list separators first so a piece with no address
       // ("a@x.com, not-an-email") is reported in `skipped`, not dropped.
+      const pieces: string[] = [];
       for (const piece of trimmed.split(/[,;\n]+/)) {
         const part = piece.trim();
+        if (!part) continue;
+        // A long whitespace-separated list ("a@x.com b@y.com ...") arrives as one
+        // piece; split it on whitespace instead of rejecting it as oversized.
+        if (part.length > REGISTRATION_EMAIL_PIECE_MAX) pieces.push(...part.split(/\s+/));
+        else pieces.push(part);
+      }
+      for (const part of pieces) {
         if (!part) continue;
         // Bound regex input: an address is <=254 chars; a display-name
         // contact fits well under this. Oversized pieces are reported, not scanned.
