@@ -137,9 +137,31 @@ export async function zomaSeatExemption(emailInput: string, deps: ZomaSignupDeps
 
 /** Registration-time admission (password + Google): exemptions first, then the capped seat. */
 export async function admitZomaSignup(email: string, deps: ZomaSignupDeps = defaultSignupDeps): Promise<string> {
-  // ENG-2781 option (a): during the open tester window nobody takes a capped seat.
-  if (zomaOpenTesterWindowActive()) return 'approved';
+  // ENG-2781 option (a): during the open tester window nobody takes a capped seat. The decision
+  // is recorded durably (without touching the counter) so a later authorization after the
+  // window closes still sees 'approved' instead of taking a seat then.
+  if (zomaOpenTesterWindowActive()) return recordOpenWindowAdmission(email);
   return (await zomaSeatExemption(email, deps)) ? 'approved' : admitZoma(email);
+}
+
+/** Approved-without-seat decision for open-window signups. Never overrides an existing decision. */
+export async function recordOpenWindowAdmission(emailInput: string): Promise<string> {
+  const email = emailInput.toLowerCase();
+  if (email === counterKey.email) throw new Error('Invalid admission email');
+  const now = new Date().toISOString();
+  try {
+    await db.update({ TableName: table(), Key: { email },
+      UpdateExpression: 'SET zomaStatus = :approved, approvedAt = :now, approvedBy = :actor, seatExempt = :exempt, joinedAt = if_not_exists(joinedAt, :now)',
+      ConditionExpression: 'attribute_not_exists(zomaStatus)',
+      ExpressionAttributeValues: { ':approved': 'approved', ':now': now, ':actor': 'system:open-window', ':exempt': 'open_window' },
+    }).promise();
+    return 'approved';
+  } catch (err: any) {
+    if (err.code !== 'ConditionalCheckFailedException') throw err;
+    // An existing decision wins, except a waitlisted applicant is let in during the window.
+    const status = (await entry(email))?.zomaStatus;
+    return status === 'rejected' ? 'rejected' : 'approved';
+  }
 }
 
 export async function rejectZoma(emailInput: string, actor: string): Promise<string> {

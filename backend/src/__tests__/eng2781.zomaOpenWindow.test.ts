@@ -61,3 +61,28 @@ describe('assertZomaPublishAllowed during the open window', () => {
     await expect(assertZomaPublishAllowed('u1', { platform: 'meta' }, deps)).rejects.toThrow();
   });
 });
+
+describe('open-window admission is durable (review gap b)', () => {
+  const env = { ...process.env };
+  afterEach(() => { process.env = { ...env }; jest.resetModules(); jest.dontMock('aws-sdk'); });
+  it('writes an approved, seat-exempt row without touching the counter; a later admitZoma sees approved', async () => {
+    jest.resetModules();
+    jest.dontMock('../services/zomaAdmission');
+    const rows: Record<string, any> = {};
+    const update = jest.fn((p: any) => ({ promise: async () => {
+      if (rows[p.Key.email]?.zomaStatus) { const e: any = new Error('c'); e.code = 'ConditionalCheckFailedException'; throw e; }
+      rows[p.Key.email] = { zomaStatus: p.ExpressionAttributeValues[':approved'], seatExempt: p.ExpressionAttributeValues[':exempt'] };
+    } }));
+    const get = jest.fn((p: any) => ({ promise: async () => ({ Item: rows[p.Key.email] }) }));
+    const transactWrite = jest.fn();
+    jest.doMock('aws-sdk', () => ({ __esModule: true, default: { DynamoDB: { DocumentClient: jest.fn(() => ({ update, get, transactWrite })) } } }));
+    process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED = 'true';
+    process.env.ZOMA_OPEN_TESTER_UNTIL = '2999-01-01T00:00:00Z';
+    const m = await import('../services/zomaAdmission');
+    expect(await m.admitZomaSignup('New@X.co', { hasPendingOrgInvite: async () => false })).toBe('approved');
+    expect(rows['new@x.co']).toEqual({ zomaStatus: 'approved', seatExempt: 'open_window' });
+    process.env.ZOMA_OPEN_TESTER_UNTIL = '2000-01-01T00:00:00Z';
+    expect(await m.admitZoma('new@x.co')).toBe('approved');
+    expect(transactWrite).not.toHaveBeenCalled();
+  });
+});
