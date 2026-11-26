@@ -279,8 +279,9 @@ router.post('/describe-media', async (req: Request, res: Response) => {
         userId: userId(req), sessionId: session_id,
       });
     } else {
-      // ENG-1858: meter to the API caller instead of "system".
-      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt, {
+      // ENG-1858: meter to the API caller instead of "system". No model given: the vision model, as Emma's own tool uses (the old
+      // fallback, gpt-4o, is not a registered model and skipped the image download).
+      result = await svc.describeImage(typeof llm_model === 'string' && llm_model ? llm_model : undefined, url, prompt, {
         userId: userId(req), sessionId: session_id, feature: 'describe_image',
       });
     }

@@ -332,23 +332,20 @@ router.get("/channels", authenticateToken, async (req: Request, res: Response) =
     console.log("📡 Fetching Slack channels...");
     
     const channels = await getSlackChannels();
-    
-    // If user has an account-level Slack channel configured, filter to only show that channel
-    if (authReq.user?.userId) {
+
+    // The bot is in every client's channel, so the list is scoped like POST /send-approval: a real (non-delegated) admin sees every
+    // channel; anyone else sees only the channels they may post to (their own, else their organization's, none on WhatsApp). Before,
+    // a user with no personal channel got the whole list (other clients' channel names).
+    if (!isRealAdmin(req)) {
       const { userDb } = await import("../services/db");
-      const user = await userDb.getUserById(authReq.user.userId);
-      
-      const allowedChannels = user?.slackChannels && user.slackChannels.length > 0
-        ? user.slackChannels
-        : user?.slackChannel ? [user.slackChannel] : null;
-      if (allowedChannels) {
-        const filteredChannels = channels.filter(channel => allowedChannels.includes(channel.id));
-        console.log(`✅ Filtered to ${filteredChannels.length} channels based on user's configured Slack channels`);
-        res.json(filteredChannels);
-        return;
-      }
+      const user = authReq.user?.userId ? await userDb.getUserById(authReq.user.userId) : null;
+      const allowed = user ? await getEffectiveAllowedChannels(user) : [];
+      const filteredChannels = channels.filter((channel) => allowed.includes(channel.id));
+      console.log(`✅ Filtered to ${filteredChannels.length} channels the user may post to`);
+      res.json(filteredChannels);
+      return;
     }
-    
+
     console.log(`✅ Successfully fetched ${channels.length} Slack channels`);
     res.json(channels);
   } catch (error: any) {
