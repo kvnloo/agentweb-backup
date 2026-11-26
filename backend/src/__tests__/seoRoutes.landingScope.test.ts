@@ -18,6 +18,12 @@ jest.mock('../services/v0Service', () => ({ getLandingPagesByOwner: jest.fn(asyn
 jest.mock('google-auth-library', () => ({
   JWT: jest.fn().mockImplementation(() => ({ getAccessToken: jest.fn().mockResolvedValue({ token: 'mock-access-token' }) })),
 }));
+// The funnel branch of /metrics reads its stored funnel from AW-Settings with its own DocumentClient.
+jest.mock('aws-sdk', () => ({
+  DynamoDB: { DocumentClient: jest.fn().mockImplementation(() => ({
+    get: () => ({ promise: async () => ({ Item: { funnels: { f1: { stages: jest.requireActual('../services/funnelService').DEFAULT_FUNNEL_STAGES } } } }) }),
+  })) },
+}));
 const mockRunReport = jest.fn();
 jest.mock('@google-analytics/data', () => ({
   BetaAnalyticsDataClient: jest.fn().mockImplementation(() => ({ runReport: mockRunReport })),
@@ -135,5 +141,24 @@ describe('GET /api/seo/product-metrics', () => {
     const reports = mockRunReport.mock.calls.map((c) => c[0]);
     expect(reports.length).toBeGreaterThan(0);
     for (const report of reports) expect(JSON.stringify(report.dimensionFilter ?? {})).not.toContain('inListFilter');
+  });
+});
+
+describe('the other call sites', () => {
+  it('the funnel report on a platform primary property keeps only the caller\'s own hosts', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue(deployer());
+    await request(app).get('/api/seo/metrics').query({ funnelId: 'f1' });
+    const funnelReports = platformReports().filter((r) => JSON.stringify(r).includes('eventName'));
+    expect(funnelReports.length).toBeGreaterThan(0);
+    for (const report of platformReports()) expect(JSON.stringify(report.dimensionFilter)).toContain(OWN_HOST);
+  });
+
+  it('GET /api/seo/debug on the platform domain keeps only the caller\'s own pages', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue(deployer());
+    await request(app).get('/api/seo/debug');
+    expect(gscBodies()).toHaveLength(1);
+    const re = new RegExp(regexOf(gscBodies()[0]));
+    expect(re.test(`https://${OWN_HOST}/`)).toBe(true);
+    expect(re.test(`https://${VICTIM}/`)).toBe(false);
   });
 });

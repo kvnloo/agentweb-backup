@@ -12,11 +12,13 @@ jest.mock('../services/v0Service', () => ({ getLandingPagesByOwner: (...a: any[]
 jest.mock('../services/db', () => ({ orgDb: { getOrgMembers: (...a: any[]) => mockOrgMembers(...a) } }));
 
 import {
+  MANAGED_LANDING_BASE,
   andFilters,
   createLandingAnalyticsScope,
   ga4LocationsFilter,
   gscLocationsFilter,
   gscScopeFilter,
+  normaliseGa4PropertyId,
   resetLandingAnalyticsScopeForTest,
   scopeGaClient,
 } from '../services/landingAnalyticsScope';
@@ -77,12 +79,13 @@ describe('the Search Console filter for the caller\'s own locations', () => {
 });
 
 describe('createLandingAnalyticsScope', () => {
-  it('recognises the platform GA4 properties (any form) and Search Console sites (the domain and its subdomains)', async () => {
+  it('recognises the managed base\'s GA4 property (any form, padded too) and Search Console sites (the base and its subdomains)', async () => {
     const scope = createLandingAnalyticsScope({ userId: 'u1' });
-    expect(await scope.isPlatformGa4('999000111')).toBe(true);
-    expect(await scope.isPlatformGa4('properties/999000222')).toBe(true);
+    for (const id of ['999000111', 'properties/999000111', '0999000111', ' 00999000111 ']) {
+      expect({ id, platform: await scope.isPlatformGa4(id) }).toEqual({ id, platform: true });
+    }
     expect(await scope.isPlatformGa4('123456789')).toBe(false);
-    for (const site of ['sc-domain:agentwebforms.com', 'https://agentwebforms.com/', 'sc-domain:acme.agentwebforms.com', 'sc-domain:agentweb.pro']) {
+    for (const site of ['sc-domain:agentwebforms.com', 'https://agentwebforms.com/', 'sc-domain:acme.agentwebforms.com']) {
       expect({ site, platform: await scope.isPlatformGscSite(site) }).toEqual({ site, platform: true });
     }
     for (const site of ['sc-domain:customer.com', 'https://notagentwebforms.com/']) {
@@ -91,12 +94,38 @@ describe('createLandingAnalyticsScope', () => {
     expect(mockLandingConfig).toHaveBeenCalledTimes(1);
   });
 
-  it('own locations: owned domains whole; a page on an unowned platform host by path only; never the root of a shared host; vercel hosts whole', async () => {
+  it('the other config entries (agentweb.pro audit pages: AgentWeb\'s own site) are not scoped, so AgentWeb\'s own analytics stay whole', async () => {
+    const scope = createLandingAnalyticsScope({ userId: 'u1' });
+    expect(await scope.isPlatformGa4('999000222')).toBe(false);
+    expect(await scope.isPlatformGscSite('sc-domain:agentweb.pro')).toBe(false);
+    expect(await scope.isPlatformGscSite('https://www.agentweb.pro/')).toBe(false);
+  });
+
+  it('normaliseGa4PropertyId drops the prefix, padding and leading zeros', () => {
+    expect(normaliseGa4PropertyId('properties/0042')).toBe('42');
+    expect(normaliseGa4PropertyId(' 000 ')).toBe('0');
+    expect(normaliseGa4PropertyId(999000111)).toBe('999000111');
+  });
+
+  it('the managed base is the one the custom-domain service assigns', () => {
+    expect(MANAGED_LANDING_BASE).toBe(jest.requireActual('../services/customDomainService').SUBDOMAIN_BASE);
+  });
+
+  it('when the config cannot be read, the base\'s Search Console domain is still scoped; its GA4 id cannot be known and that is logged', async () => {
+    mockLandingConfig.mockResolvedValue(null);
+    const scope = createLandingAnalyticsScope({ userId: 'u1' });
+    expect(await scope.isPlatformGscSite('sc-domain:agentwebforms.com')).toBe(true);
+    expect(await scope.isPlatformGa4('999000111')).toBe(false);
+    expect((console.error as jest.Mock).mock.calls.some((c) => /GA4 property could not be loaded/.test(String(c[0])))).toBe(true);
+  });
+
+  it('own locations: owned domains whole; a page on an unowned managed host by path only; never the root of a shared host; vercel hosts whole', async () => {
     mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com' }, { domain: 'www.acme.com' }]);
     mockPagesByOwner.mockResolvedValueOnce([
       { customDomainUrl: 'https://acme.agentwebforms.com/pricing', deployedUrl: 'https://acme-site.vercel.app/pricing' },
+      { deployedUrl: 'https://shared.agentwebforms.com/acme' },
+      { deployedUrl: 'https://shared.agentwebforms.com/' },
       { deployedUrl: 'https://audit.agentweb.pro/acme' },
-      { deployedUrl: 'https://audit.agentweb.pro/' },
       { customDomainUrl: 'not a url' },
     ]);
     const scope = createLandingAnalyticsScope({ userId: 'u1' });
@@ -104,9 +133,9 @@ describe('createLandingAnalyticsScope', () => {
       { host: 'acme.agentwebforms.com' },
       { host: 'www.acme.com' },
       { host: 'acme-site.vercel.app' },
-      { host: 'audit.agentweb.pro', path: '/acme' },
+      { host: 'shared.agentwebforms.com', path: '/acme' },
     ]);
-    expect(await scope.hasLocationOn('audit.agentweb.pro')).toBe(true);
+    expect(await scope.hasLocationOn('shared.agentwebforms.com')).toBe(true);
     expect(await scope.hasLocationOn('other.agentwebforms.com')).toBe(false);
   });
 
@@ -118,10 +147,16 @@ describe('createLandingAnalyticsScope', () => {
     expect(mockListDomains.mock.calls.map((c) => c[0]).sort()).toEqual(['u1', 'u2']);
   });
 
-  it('a failure reading the caller\'s pages fails closed: no own location', async () => {
+  it('a failure reading the caller\'s pages fails closed: no own location; the failure is not remembered', async () => {
     mockListDomains.mockRejectedValueOnce(new Error('throttled'));
-    const scope = createLandingAnalyticsScope({ userId: 'u1' });
-    expect(await scope.locations()).toEqual([]);
+    expect(await createLandingAnalyticsScope({ userId: 'u1' }).locations()).toEqual([]);
+    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com' }]);
+    expect(await createLandingAnalyticsScope({ userId: 'u1' }).locations()).toEqual([{ host: 'acme.agentwebforms.com' }]);
+  });
+
+  it('a record with no user id has no own location', async () => {
+    expect(await createLandingAnalyticsScope({} as any).locations()).toEqual([]);
+    expect(mockListDomains).not.toHaveBeenCalled();
   });
 
   it('the lists are cached per caller (one read in 5 minutes)', async () => {
@@ -130,7 +165,7 @@ describe('createLandingAnalyticsScope', () => {
     expect(mockListDomains).toHaveBeenCalledTimes(1);
   });
 
-  it('platform ids that cannot be read are unknown (nothing is recognised) and are retried after a minute, not on every read', async () => {
+  it('a config that cannot be read is retried after a minute, not on every read', async () => {
     mockLandingConfig.mockResolvedValue(null);
     const scope = createLandingAnalyticsScope({ userId: 'u1' });
     expect(await scope.isPlatformGa4('999000111')).toBe(false);
