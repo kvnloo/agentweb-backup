@@ -261,7 +261,7 @@
  */
 import axios from 'axios';
 import { createHash } from 'crypto';
-import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../../utils/s3Utils';
+import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectStreamAbortable, getS3ObjectMetadata } from '../../utils/s3Utils';
 import { pdfPageRender } from './shared/pdfTextRender';
 import { resolvePinnedPublicAddress, SsrfBlockedError } from '../../utils/ssrfGuard';
 import { getCrmSenders } from './shared/crmSenders';
@@ -721,7 +721,8 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
         if (typeof meta?.ContentLength === 'number' && meta.ContentLength > maxBytes) return fileTooLarge(maxBytes);
       }
       // Private bucket object — stream via SDK (same pattern as filesController)
-      const stream = getS3ObjectStream(s3Key);
+      // With a limit, the stream's destroy() also aborts the S3 request, so stopping early frees the connection.
+      const stream = maxBytes !== undefined ? getS3ObjectStreamAbortable(s3Key) : getS3ObjectStream(s3Key);
       const chunks: Buffer[] = [];
       let received = 0;
       for await (const chunk of stream) {
@@ -894,7 +895,7 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
       content_length: extractedContent.length,
       truncated,
       file_url: normalizedFileUrl,
-      message: `Successfully read ${fileType} file content (${extractedContent.length} characters${truncated ? ` — content was cut at ${MAX_CONTENT_LENGTH} characters; the rest of the file cannot be read with this tool` : ''})`
+      message: `Successfully read ${fileType} file content (${extractedContent.length} characters${truncated ? ' — content was truncated, call again with a byte-range if you need more' : ''})`
     };
 
   } catch (error: any) {

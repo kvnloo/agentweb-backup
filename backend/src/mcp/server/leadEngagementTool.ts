@@ -135,6 +135,8 @@ export function addEngagementRequest(args: unknown, now = Date.now()): Record<st
     if (typeof a.idempotency_key !== 'string' || !IDEMPOTENCY_KEY_RE.test(a.idempotency_key)) {
       refuse('idempotency_key must be 8 to 64 letters, digits, - or _.');
     }
+    // The key is stored in the event's data, which the "engaged" rule scans: a key must not mark the lead engaged by itself.
+    if (/clicked|replied|received/i.test(a.idempotency_key as string)) refuse('idempotency_key must not contain the words clicked, replied or received.');
     body.idempotency_key = a.idempotency_key;
   }
   return body;

@@ -654,6 +654,8 @@ function readFileLimits(body: any): { ownStorageOnly?: true; maxBytes?: number }
     if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > READ_FILE_MAX_BYTES_CEILING) {
       return `max_bytes must be a whole number from 1 to ${READ_FILE_MAX_BYTES_CEILING}`;
     }
+    // The limit is enforced on stored files only (web fetches have their own path), so it is accepted only with own_storage_only.
+    if (!limits.ownStorageOnly) return 'max_bytes applies only together with own_storage_only: true';
     limits.maxBytes = max;
   }
   return limits;
@@ -1099,6 +1101,8 @@ router.post('/lead-engagements', async (req: Request, res: Response) => {
 // at most MCP_ENGAGEMENTS_PER_LEAD of them, a lead whose record is nearly full takes none, and an `idempotency_key` already on the lead
 // records nothing. No owner alert is sent (the CRM route's alert is not called). The shape of `event_data` is checked by the MCP tool.
 const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_-]{8,64}$/;
+// The key is stored in the event's data, which the "engaged" rule scans for these words.
+const ENGAGED_WORDS_RE = /clicked|replied|received/i;
 router.post('/add-lead-engagement', async (req: Request, res: Response) => {
   const body = req.body ?? {};
   if (!isId(body.list_id) || !isId(body.lead_id)) return res.status(400).json({ message: 'list_id and lead_id are required' });
@@ -1109,8 +1113,8 @@ router.post('/add-lead-engagement', async (req: Request, res: Response) => {
   if (body.event_date !== undefined && body.event_date !== null && typeof body.event_date !== 'string') {
     return res.status(400).json({ message: 'event_date must be an ISO 8601 date-time' });
   }
-  if (body.idempotency_key !== undefined && body.idempotency_key !== null && (typeof body.idempotency_key !== 'string' || !IDEMPOTENCY_KEY_RE.test(body.idempotency_key))) {
-    return res.status(400).json({ message: 'idempotency_key must be 8 to 64 letters, digits, - or _' });
+  if (body.idempotency_key !== undefined && body.idempotency_key !== null && (typeof body.idempotency_key !== 'string' || !IDEMPOTENCY_KEY_RE.test(body.idempotency_key) || ENGAGED_WORDS_RE.test(body.idempotency_key))) {
+    return res.status(400).json({ message: 'idempotency_key must be 8 to 64 letters, digits, - or _, without the words clicked, replied or received' });
   }
   try {
     const svc = await getAgentModeService();
