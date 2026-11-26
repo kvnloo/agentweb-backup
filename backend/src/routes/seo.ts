@@ -131,6 +131,8 @@ router.post("/config/ga/test", async (req, res) => {
       return res.status(429).json({ ok: false, reason: "rate_limited", message: "Please wait before testing again" });
     }
     gaTestCooldown.set(uid, now);
+    // Log-only (sharedGoogleAudit.ts): a probe of any property id the caller names, through the shared service account.
+    auditSharedGoogleRead({ kind: 'ga4', userId: uid, ids: [propertyId], source: 'POST /api/seo/config/ga/test' });
     res.json(await testGaProperty(propertyId));
   } catch (error: any) {
     console.error("Error testing GA property:", error.message);

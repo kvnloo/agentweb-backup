@@ -53,18 +53,34 @@ export function hashShared(id: string): string {
  */
 const platformIds: { ids: Set<string> | null; at: number; loading: boolean } = { ids: null, at: 0, loading: false };
 
+/**
+ * The form an id is hashed and compared in. A Search Console property is the same whatever its case, scheme or trailing slash
+ * (`Example.com`, `https://example.com/`, `sc-domain:example.com`); a GA4 property id may be stored as a number.
+ */
+export function normaliseSharedId(kind: SharedGoogleKind, id: string | number): string {
+  const text = String(id).trim();
+  if (kind !== 'gsc') return text;
+  return text.toLowerCase().replace(/^sc-domain:/, '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+}
+
 function refreshPlatformIds(): void {
-  if (platformIds.loading || (platformIds.ids && Date.now() - platformIds.at < PLATFORM_IDS_TTL_MS)) return;
+  // One load at a time, and at most one per PLATFORM_IDS_TTL_MS whether or not the last one worked (no Secrets Manager call per read
+  // while the secret keeps failing).
+  if (platformIds.loading || Date.now() - platformIds.at < PLATFORM_IDS_TTL_MS) return;
   platformIds.loading = true;
   import('../utils/secretsManager')
     .then((m) => m.getLandingPagesConfig())
     .then((config: any) => {
+      // getLandingPagesConfig answers null (never throws) when the secret cannot be read or is incomplete: that is "unknown", so the
+      // last known set (or none) stays; an empty set would mark the platform's own ids `platform: false`.
+      if (!config || typeof config !== 'object') return;
       const ids = new Set<string>();
-      for (const mapping of [config, ...(Array.isArray(config?.additionalDomains) ? config.additionalDomains : [])]) {
-        if (typeof mapping?.ga4PropertyId === 'string' && mapping.ga4PropertyId) ids.add(mapping.ga4PropertyId);
-        if (typeof mapping?.gscDomain === 'string' && mapping.gscDomain) ids.add(mapping.gscDomain);
+      for (const mapping of [config, ...(Array.isArray(config.additionalDomains) ? config.additionalDomains : [])]) {
+        const ga4 = mapping?.ga4PropertyId;
+        if ((typeof ga4 === 'string' && ga4.trim() !== '') || (typeof ga4 === 'number' && Number.isFinite(ga4))) ids.add(normaliseSharedId('ga4', ga4));
+        if (typeof mapping?.gscDomain === 'string' && mapping.gscDomain.trim() !== '') ids.add(normaliseSharedId('gsc', mapping.gscDomain));
       }
-      platformIds.ids = ids;
+      if (ids.size > 0) platformIds.ids = ids;
     })
     .catch(() => {
       // Unknown, not "none": lines keep no `platform` field (or the last known set) until a later load works.
@@ -85,8 +101,8 @@ export function resetPlatformIdsForTest(): void {
 export function auditSharedGoogleRead(entry: SharedGoogleReadAudit): void {
   try {
     const ids = (Array.isArray(entry.ids) ? entry.ids : [])
-      .filter((id) => (typeof id === 'string' && id !== '') || (typeof id === 'number' && Number.isFinite(id)))
-      .map((id) => String(id));
+      .filter((id): id is string | number => (typeof id === 'string' && id.trim() !== '') || (typeof id === 'number' && Number.isFinite(id)))
+      .map((id) => normaliseSharedId(entry.kind, id));
     if (ids.length === 0) return;
     const analytics = entry.kind === 'ga4' || entry.kind === 'gsc';
     if (analytics) refreshPlatformIds();
