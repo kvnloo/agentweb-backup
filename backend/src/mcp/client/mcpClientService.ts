@@ -13,7 +13,6 @@ import { McpOAuthClientProvider, getServerConfig } from "./mcpOAuthClientProvide
 import { buildMcpToolTelemetry } from "./mcpToolTelemetry";
 import { buildStdioChildEnv } from "./stdioChildEnv";
 import {
-  PLAYWRIGHT_INHERIT_ENV_FLAG,
   PLAYWRIGHT_WORK_ROOT,
   browserNavigationRefusal,
   isAbandonedPlaywrightWorkDir,
@@ -1558,7 +1557,7 @@ export class McpClientService {
       args: resolvedArgs,
       // ENG-3187: a browser server gets only the variables a headless browser needs (and its own folder); every other stdio server gets the shared allow-list. Neither is handed the backend's secrets.
       env: isPlaywrightMcp
-        ? playwrightChildEnv(process.env, resolvedEnv, { inheritFullEnv: process.env[PLAYWRIGHT_INHERIT_ENV_FLAG] === 'true' })
+        ? playwrightChildEnv(process.env, resolvedEnv)
         : buildStdioChildEnv(process.env, resolvedEnv),
       ...(playwrightWorkDir ? { cwd: playwrightWorkDir } : {}),
     });
