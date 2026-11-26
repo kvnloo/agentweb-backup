@@ -24,6 +24,11 @@ it.each([
   expect(mockFetch).not.toHaveBeenCalled();
 });
 
+it('an admin cross-account add with status_note is refused too (before its own early path)', async () => {
+  await expect(call({ action: 'add', list_id: 'list-1', client_id: 'client@example.com', status_note: 'why', leads: [{ email: 'a@example.com' }] })).rejects.toThrow(/status_note goes only with action "update"/);
+  expect(mockFetch).not.toHaveBeenCalled();
+});
+
 it('a null status_note on another action is ignored as before', async () => {
   mockFetch.mockResolvedValueOnce({ leads: [], total: 0 });
   await expect(call({ action: 'list', list_id: 'list-1', status_note: null })).resolves.toBeDefined();
