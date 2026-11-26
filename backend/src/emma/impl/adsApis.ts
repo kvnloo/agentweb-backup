@@ -2392,6 +2392,10 @@ function audienceRowKey(hashedRow: string[]): string {
  * `resolveOrCreateSeedAudience` (confirmed by whole-backend grep) — moved
  * alongside it as a plain, non-exported module function.
  */
+/** Largest seed-audience CSV fetched from a caller's URL, and how long the fetch may take. */
+const SEED_CSV_MAX_BYTES = 50 * 1024 * 1024;
+const SEED_CSV_TIMEOUT_MS = 60_000;
+
 async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
   // Greptile finding: this is a server-side fetch of a caller-supplied URL
   // with no destination restriction — a classic SSRF vector (cloud metadata
@@ -2411,13 +2415,31 @@ async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
   // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
   // maxRedirects:0 makes axios surface a redirect as an error instead —
   // same defense already used by routes/crm.ts's load-from-url path.
-  const response = await axios.get(csvUrl, {
-    maxRedirects: 0,
-    lookup: (_hostname: string, options: any, callback: any) => {
-      if (typeof options === 'function') callback = options;
-      callback(null, address, family);
-    },
-  } as any);
+  // ENG-2840: bounded too. With no size cap and no timeout, an endless or very slow body was held in memory without limit.
+  let response: any;
+  try {
+    response = await axios.get(csvUrl, {
+      maxRedirects: 0,
+      timeout: SEED_CSV_TIMEOUT_MS,
+      // axios's timeout only fires when the connection goes quiet; the signal makes 60 s a limit on the whole download (a body sent
+      // one byte at a time would otherwise be held in memory for as long as the sender likes).
+      signal: AbortSignal.timeout(SEED_CSV_TIMEOUT_MS),
+      maxContentLength: SEED_CSV_MAX_BYTES,
+      maxBodyLength: SEED_CSV_MAX_BYTES,
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        callback(null, address, family);
+      },
+    } as any);
+  } catch (err: any) {
+    if (/maxContentLength|maxBodyLength|too large/i.test(String(err?.message || ''))) {
+      throw new Error(`csv_url: the file is larger than ${SEED_CSV_MAX_BYTES / (1024 * 1024)} MB, the most a seed audience CSV may be`);
+    }
+    if (err?.code === 'ERR_CANCELED' || err?.code === 'ECONNABORTED' || err?.name === 'CanceledError' || err?.name === 'TimeoutError') {
+      throw new Error(`csv_url: the file did not download within ${SEED_CSV_TIMEOUT_MS / 1000} s`);
+    }
+    throw err;
+  }
   if (Array.isArray(response.data)) {
     return response.data;
   }
@@ -3380,6 +3402,9 @@ function linkedInReadBackFailure(result: linkedInAdsService.LinkedInAdsApiResult
   return { success: false, errorType: result.errorType, errorCode: result.errorType, fields: result.fields, error: result.error };
 }
 
+/** The largest file call_linkedin_marketing_api downloads to upload to LinkedIn (LinkedIn's own limits are at or above these). */
+export const LINKEDIN_UPLOAD_MAX_BYTES = { image: 20 * 1024 * 1024, document: 100 * 1024 * 1024, video: 200 * 1024 * 1024 } as const;
+
 export async function callLinkedInMarketingApi(
   userId: string,
   entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL' | 'CONVERSATION_AD',
@@ -3569,16 +3594,34 @@ export async function callLinkedInMarketingApi(
     }
 
     case 'MEDIA': {
-      // Helper: if the URL is an S3 URL from our bucket, presign it before downloading.
-      // This handles the case where the user uploads a file to the chat (stored in S3)
-      // and Emma receives the S3 URL — direct S3 access requires a presigned URL.
-      const { presignS3Url, isS3Url } = await import('../../utils/s3Utils');
-      const resolveDownloadUrl = (url: string): string => {
+      // The file to upload, read safely (ENG-2840): a file of OUR bucket (a chat upload) only when the storage rule lets this caller read
+      // that key, read through the SDK with a byte ceiling; any other URL only through the SSRF-guarded fetch, with a byte ceiling and a
+      // time limit. Before, any key of our bucket was presigned for any caller and any URL was fetched with no guard, size cap or timeout.
+      const downloadForUpload = async (url: unknown, field: string, maxBytes: number, timeoutMs: number): Promise<{ buffer: Buffer; contentType: string }> => {
+        if (typeof url !== 'string' || !url.trim()) throw new Error(`${field} must be a URL`);
+        const tooLarge = () => new Error(`${field}: the file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB, the most that can be uploaded here`);
+        const { isS3Url, extractS3KeyFromUrl, getS3ObjectAsBuffer } = await import('../../utils/s3Utils');
         if (isS3Url(url)) {
-          const presigned = presignS3Url(url);
-          return presigned || url;
+          const key = extractS3KeyFromUrl(url);
+          const { checkOurBucketKeyRead, TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_UNAVAILABLE_MESSAGE } = await import('./toolStorageAccess');
+          const decision = key ? await checkOurBucketKeyRead('call_linkedin_marketing_api', userId, key) : 'refuse';
+          if (decision !== 'allow') throw new Error(decision === 'unavailable' ? TOOL_FILE_UNAVAILABLE_MESSAGE : TOOL_FILE_REFUSAL_MESSAGE);
+          try {
+            const { buffer, contentType } = await getS3ObjectAsBuffer(key as string, undefined, maxBytes);
+            return { buffer, contentType: contentType || '' };
+          } catch (err: any) {
+            if (/exceeds the .* limit/.test(String(err?.message || ''))) throw tooLarge();
+            throw err;
+          }
         }
-        return url;
+        const { fetchCallerUrlBuffer, CallerUrlTooLargeError } = await import('../../utils/callerUrlFetch');
+        try {
+          const fetched = await fetchCallerUrlBuffer(url, { tool: 'call_linkedin_marketing_api', userId, maxBytes, timeoutMs });
+          return { buffer: fetched.buffer, contentType: fetched.contentType || '' };
+        } catch (err: any) {
+          if (err instanceof CallerUrlTooLargeError) throw tooLarge();
+          throw err;
+        }
       };
 
       if (action === 'UPLOAD_IMAGE') {
@@ -3591,10 +3634,9 @@ export async function callLinkedInMarketingApi(
         const imageUrn: string = initResult.data?.value?.image || initResult.data?.image;
         if (!uploadUrl || !imageUrn) throw new Error('LinkedIn did not return uploadUrl or image URN');
         // Step 2: download the image (presign if S3 URL) and PUT to LinkedIn's signed URL
-        const axios = require('axios');
-        const imageResp = await axios.get(resolveDownloadUrl(params.image_url), { responseType: 'arraybuffer' });
-        const contentType = imageResp.headers['content-type'] || 'image/jpeg';
-        await linkedInAdsService.uploadImageBinary(uploadUrl, Buffer.from(imageResp.data), contentType);
+        const image = await downloadForUpload(params.image_url, 'image_url', LINKEDIN_UPLOAD_MAX_BYTES.image, 60_000);
+        const contentType = image.contentType || 'image/jpeg';
+        await linkedInAdsService.uploadImageBinary(uploadUrl, image.buffer, contentType);
         return { success: true, image_urn: imageUrn, message: 'Image uploaded to LinkedIn. Use image_urn in CREATIVE/CREATE_INLINE.' };
       }
       if (action === 'UPLOAD_VIDEO') {
@@ -3602,10 +3644,8 @@ export async function callLinkedInMarketingApi(
         // Emma never asks the user for file_size — it's derived from the downloaded buffer.
         if (!params.video_url) throw new Error('UPLOAD_VIDEO requires video_url (a public URL to the video file)');
         const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
-        const axios = require('axios');
-        // Step 1: download video (presign if S3 URL — handles user-uploaded files from chat)
-        const videoResp = await axios.get(resolveDownloadUrl(params.video_url), { responseType: 'arraybuffer' });
-        const videoBuffer = Buffer.from(videoResp.data);
+        // Step 1: download the video (a chat upload of the caller's own, or a public URL), bounded
+        const videoBuffer = (await downloadForUpload(params.video_url, 'video_url', LINKEDIN_UPLOAD_MAX_BYTES.video, 180_000)).buffer;
         const fileSizeBytes = videoBuffer.length;
         // Step 2: initialize upload — fileSizeBytes auto-calculated from buffer
         const initResult = await linkedInAdsService.initializeVideoUpload(accessToken, ownerUrn, fileSizeBytes);
@@ -3632,11 +3672,10 @@ export async function callLinkedInMarketingApi(
         // Convenience action: download document from URL and upload to LinkedIn.
         if (!params.document_url) throw new Error('UPLOAD_DOCUMENT requires document_url (a public URL to the document, e.g. PDF)');
         const ownerUrn = organizationUrn || `urn:li:sponsoredAccount:${accountId}`;
-        const axios = require('axios');
-        // Step 1: download document (presign if S3 URL — handles user-uploaded files from chat)
-        const docResp = await axios.get(resolveDownloadUrl(params.document_url), { responseType: 'arraybuffer' });
-        const docBuffer = Buffer.from(docResp.data);
-        const contentType = docResp.headers['content-type'] || 'application/pdf';
+        // Step 1: download the document (a chat upload of the caller's own, or a public URL), bounded
+        const doc = await downloadForUpload(params.document_url, 'document_url', LINKEDIN_UPLOAD_MAX_BYTES.document, 120_000);
+        const docBuffer = doc.buffer;
+        const contentType = doc.contentType || 'application/pdf';
         // Step 2: initialize upload
         const initResult = await linkedInAdsService.initializeDocumentUpload(accessToken, ownerUrn);
         if (!initResult.success) throw new Error(initResult.error || 'Failed to initialize document upload');
