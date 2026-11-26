@@ -20,8 +20,9 @@
   it (`/metrics`, `/debug`, `fetchSearchConsoleMetrics`). `?domain=` adds the platform property only for a host where the caller has a page.
   A caller with no own location gets an impossible filter (an empty answer of the usual shape), never the whole property. Customer-owned
   properties and domains are untouched.
-- Own locations: the domains the caller and the members of the caller's organization own in AW-CustomDomains (managed subdomains and
-  custom domains: whole host), plus each own non-archived landing page's URL: a project's own `*.vercel.app` host whole; on a platform
+- Own locations: the ACTIVE domains the caller and the members of the caller's organization own in AW-CustomDomains (managed subdomains
+  and verified custom domains: whole host; a pending custom-domain row can be written for any host nobody has attached yet, even one of
+  AgentWeb's own, so it is not ownership), plus each own non-archived landing page's URL: a project's own `*.vercel.app` host whole; on a platform
   domain host not owned in AW-CustomDomains, only that host AND the page path (`/acme` and below, never `/acme-2`); the root of such a
   host is never claimed. A read failure of these lists fails closed (no location) and is not cached. Cached 5 minutes per caller; at most
   100 locations. GA4 ids are compared without `properties/`, padding or leading zeros (a padded id saved in a config is the same property).
@@ -32,6 +33,9 @@
   GA4 properties and Search Console domains are read exactly as before. GA4 key-event configuration of a platform property (event names,
   no traffic) is not filtered. Not changed: the GA4 probe `POST /api/seo/config/ga/test` (it reports only whether the service account can
   open a property).
+- Changed for AgentWeb's own accounts: `?domain=audit.agentweb.pro` (or another host of the unscoped `agentweb.pro` mapping) no longer adds
+  the audit property unless the account owns that host (a domain row or a page path there); the founders' normal reads of their own
+  config are unchanged.
 - Residual risks, known: a managed subdomain released by one customer and later taken by another gives the new owner the old owner's
   history for that host (ownership has no start date); a page on a managed host with no domain row ("rowless" pages) gets no root-page
   traffic, since the root of a host the caller does not own is never claimed; more than 100 own locations are cut (fewer of the caller's
