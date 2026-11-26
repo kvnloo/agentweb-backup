@@ -194,6 +194,7 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
   // major version. This does not decide a migration; it makes the mix a review item.
   const feedVersion = object(payload)?.intelligence_index_version;
   const feedMajor = typeof feedVersion === 'number' || typeof feedVersion === 'string' ? /^\d+/.exec(String(feedVersion))?.[0] : undefined;
+  const feedLabel = feedMajor && /^[\d.]+$/.test(String(feedVersion)) ? ` v${feedVersion}` : '';
   if (feedMajor) {
     const other = Object.entries(registry).filter(([, config]) => {
       const labelled = /Intelligence Index v(\d+)/.exec(config.qualityScoreSource ?? '')?.[1];
@@ -226,7 +227,8 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
     const match = matches[0];
     if (config.qualityScore === match.score) continue;
     changes[id] = { qualityScore: match.score, qualityScoreSource:
-      `Artificial Analysis Intelligence Index, API v2, snapshot ${date}, ${match.slug} (https://artificialanalysis.ai/)` };
+      // Record the feed's index version so the version-mix warning above can see this score.
+      `Artificial Analysis Intelligence Index${feedLabel}, API v2, snapshot ${date}, ${match.slug} (https://artificialanalysis.ai/)` };
   }
   return { changes, reports };
 }
