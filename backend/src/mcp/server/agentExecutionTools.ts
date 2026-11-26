@@ -58,6 +58,13 @@ export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
   'create_blog_article',
   // Records one custom event on a lead through Emma's handler (leadEngagementTool.ts); it never runs the agent.
   'add_lead_engagement',
+  // Content tools (contentTools.ts): HTML files and templates, image description, sandboxed data analysis. Model calls, never the agent.
+  'create_html_file',
+  'create_html_from_template',
+  'describe_image',
+  'list_html_templates',
+  'perform_data_analysis',
+  'update_html_file',
   'create_knowledge_base_file',
   'create_lead_list',
   'create_schedule_from_template',
