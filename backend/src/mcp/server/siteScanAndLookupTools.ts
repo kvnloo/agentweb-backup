@@ -63,6 +63,8 @@ export const SCAN_MAX_LINKS = 500;
 export const SCAN_DEADLINE_MS = 60_000;
 /** Entries kept in each list of the answer (broken and unverifiable links), and "found on" pages kept per entry. */
 export const SCAN_MAX_LIST_ENTRIES = 100;
+/** The most the answer may weigh; lists are cut further until it fits. */
+export const SCAN_MAX_ANSWER_BYTES = 60_000;
 const SCAN_MAX_FOUND_ON = 5;
 const SCAN_MAX_URL_CHARS = 2_048;
 
@@ -133,32 +135,50 @@ mcpToolRegistry.register({
     const broken = Array.isArray(result!.brokenLinks) ? result!.brokenLinks : [];
     const unverifiable = Array.isArray(result!.unverifiableLinks) ? result!.unverifiableLinks : [];
     const robots = Array.isArray(result!.robotsSkipped) ? result!.robotsSkipped : [];
-    return jsonResult({
-      success: result!.success === true,
-      start_url: cut(result!.startUrl, SCAN_MAX_URL_CHARS),
-      pages_scanned: result!.pagesScanned,
-      links_checked: result!.linksChecked,
-      broken_link_count: result!.brokenLinkCount,
-      broken_links: broken.slice(0, SCAN_MAX_LIST_ENTRIES).map((b) => ({
-        url: cut(b.url, SCAN_MAX_URL_CHARS),
-        kind: b.kind,
-        ...(typeof b.status === 'number' ? { status: b.status } : {}),
-        ...(b.error ? { error: cut(b.error, 200) } : {}),
-        found_on: (Array.isArray(b.foundOn) ? b.foundOn : []).slice(0, SCAN_MAX_FOUND_ON).map((p) => cut(p, SCAN_MAX_URL_CHARS)),
-      })),
-      unverifiable_link_count: result!.unverifiableLinkCount,
-      unverifiable_links: unverifiable.slice(0, SCAN_MAX_LIST_ENTRIES).map((u) => ({
-        url: cut(u.url, SCAN_MAX_URL_CHARS),
-        ...(typeof u.status === 'number' ? { status: u.status } : {}),
-        ...(u.error ? { error: cut(u.error, 200) } : {}),
-      })),
-      robots_skipped: robots.slice(0, SCAN_MAX_LIST_ENTRIES).map((r) => cut(r, SCAN_MAX_URL_CHARS)),
-      lists_cut: broken.length > SCAN_MAX_LIST_ENTRIES || unverifiable.length > SCAN_MAX_LIST_ENTRIES || robots.length > SCAN_MAX_LIST_ENTRIES,
-      truncated: result!.truncated === true,
-      deadline_exceeded: result!.deadlineExceeded === true,
-    });
+    // At most SCAN_MAX_LIST_ENTRIES per list, then fewer until the answer fits SCAN_MAX_ANSWER_BYTES (long URLs can make 100 entries large).
+    let keep = SCAN_MAX_LIST_ENTRIES;
+    let answer = scanAnswer(result!, broken, unverifiable, robots, keep);
+    while (Buffer.byteLength(JSON.stringify(answer)) > SCAN_MAX_ANSWER_BYTES && keep > 0) {
+      keep = Math.floor(keep / 2);
+      answer = scanAnswer(result!, broken, unverifiable, robots, keep);
+    }
+    return jsonResult(answer);
   },
 });
+
+/** The answer, with each list cut to `keep` entries (the counts stay whole). */
+function scanAnswer(
+  result: Awaited<ReturnType<typeof crawlWebsiteLinks>>,
+  broken: Awaited<ReturnType<typeof crawlWebsiteLinks>>['brokenLinks'],
+  unverifiable: Awaited<ReturnType<typeof crawlWebsiteLinks>>['unverifiableLinks'],
+  robots: string[],
+  keep: number,
+): Record<string, unknown> {
+  return {
+    success: result.success === true,
+    start_url: cut(result.startUrl, SCAN_MAX_URL_CHARS),
+    pages_scanned: result.pagesScanned,
+    links_checked: result.linksChecked,
+    broken_link_count: result.brokenLinkCount,
+    broken_links: broken.slice(0, keep).map((b) => ({
+      url: cut(b.url, SCAN_MAX_URL_CHARS),
+      kind: b.kind,
+      ...(typeof b.status === 'number' ? { status: b.status } : {}),
+      ...(b.error ? { error: cut(b.error, 200) } : {}),
+      found_on: (Array.isArray(b.foundOn) ? b.foundOn : []).slice(0, SCAN_MAX_FOUND_ON).map((p) => cut(p, SCAN_MAX_URL_CHARS)),
+    })),
+    unverifiable_link_count: result.unverifiableLinkCount,
+    unverifiable_links: unverifiable.slice(0, keep).map((u) => ({
+      url: cut(u.url, SCAN_MAX_URL_CHARS),
+      ...(typeof u.status === 'number' ? { status: u.status } : {}),
+      ...(u.error ? { error: cut(u.error, 200) } : {}),
+    })),
+    robots_skipped: robots.slice(0, keep).map((r) => cut(r, SCAN_MAX_URL_CHARS)),
+    lists_cut: broken.length > keep || unverifiable.length > keep || robots.length > keep,
+    truncated: result.truncated === true,
+    deadline_exceeded: result.deadlineExceeded === true,
+  };
+}
 
 // --------------------------------------------------------------------------------------------------------------- find_or_lookup_email
 

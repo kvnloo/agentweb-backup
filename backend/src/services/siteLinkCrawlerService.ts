@@ -73,6 +73,9 @@ async function defaultRequest(url: string, pinned: Pinned, method: Method, timeo
     method,
     responseType: method === 'GET' ? 'text' : undefined,
     timeout: timeoutMs,
+    // axios's timeout only fires after that long with no data; the signal ends the whole request at timeoutMs, so a site that sends a
+    // byte every few seconds cannot keep a socket (and up to maxBytes) open after the scan has given up on it (ENG-2840).
+    signal: AbortSignal.timeout(timeoutMs),
     maxContentLength: maxBytes,
     maxBodyLength: maxBytes,
     maxRedirects: 0,
