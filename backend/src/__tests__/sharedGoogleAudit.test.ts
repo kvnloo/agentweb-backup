@@ -44,6 +44,11 @@ describe('auditSharedGoogleRead', () => {
     expect(JSON.stringify(info.mock.calls)).not.toContain('111111111');
   });
 
+  it('a Search Console property hashes the same whatever its case, scheme, trailing slash or domain-property prefix', () => {
+    auditSharedGoogleRead({ kind: 'gsc', userId: 'u', ids: ['Example.com', 'https://example.com/', 'sc-domain:example.com', 'example.com'], source: 's' });
+    expect(new Set(lines().map((l) => l.idHash)).size).toBe(1);
+  });
+
   it('the same resource read by two accounts hashes to the same value (the cross-tenant signal)', () => {
     auditSharedGoogleRead({ kind: 'gsc', userId: 'user-a', ids: ['example.com'], source: 's' });
     auditSharedGoogleRead({ kind: 'gsc', userId: 'user-b', ids: ['example.com'], source: 's' });
@@ -102,11 +107,54 @@ describe('the platform\'s own landing-page analytics ids are marked', () => {
     expect(lines()[0].platform).toBeUndefined();
   });
 
-  it('a config that cannot be loaded leaves the mark off (unknown, not "no"), and the read is not affected', async () => {
+  it('a config that cannot be read (getLandingPagesConfig answers null, it never throws) leaves the mark off: unknown, not "no"', async () => {
+    mockLandingConfig.mockResolvedValue(null);
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['1'], source: 's' });
+    await settle();
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['1'], source: 's' });
+    auditSharedGoogleRead({ kind: 'gsc', userId: 'u', ids: ['agentwebforms.com'], source: 's' });
+    expect(lines().map((l) => l.platform)).toEqual([undefined, undefined, undefined]);
+  });
+
+  it('a failing load is not retried on every read: at most one per 10 minutes', async () => {
+    mockLandingConfig.mockResolvedValue(null);
+    for (let i = 0; i < 5; i++) {
+      auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['1'], source: 's' });
+      await settle();
+    }
+    expect(mockLandingConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('a later failed refresh keeps the last known set', async () => {
+    const realNow = Date.now;
+    let now = realNow();
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    mockLandingConfig.mockResolvedValueOnce({ ga4PropertyId: '999000111', gscDomain: 'agentwebforms.com' }).mockResolvedValueOnce(null);
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['999000111'], source: 's' });
+    await settle();
+    now += 11 * 60_000;
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['999000111'], source: 's' });
+    await settle();
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['999000111'], source: 's' });
+    expect(mockLandingConfig).toHaveBeenCalledTimes(2);
+    expect(lines().map((l) => l.platform)).toEqual([undefined, true, true]);
+    (Date.now as jest.Mock).mockRestore();
+  });
+
+  it('a rejected load (should it ever reject) is also unknown, and never reaches the read', async () => {
     mockLandingConfig.mockRejectedValue(new Error('secrets down'));
     expect(() => auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['1'], source: 's' })).not.toThrow();
     await settle();
     auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['1'], source: 's' });
     expect(lines().map((l) => l.platform)).toEqual([undefined, undefined]);
+  });
+
+  it('platform ids are matched in their normal form (a numeric GA4 id in the config, a Search Console URL form in a user config)', async () => {
+    mockLandingConfig.mockResolvedValue({ ga4PropertyId: 999000111, gscDomain: 'AgentWebForms.com' });
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['x'], source: 's' });
+    await settle();
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['999000111'], source: 's' });
+    auditSharedGoogleRead({ kind: 'gsc', userId: 'u', ids: ['https://agentwebforms.com/', 'sc-domain:agentwebforms.com'], source: 's' });
+    expect(lines().slice(1).map((l) => l.platform)).toEqual([true, true, true]);
   });
 });
