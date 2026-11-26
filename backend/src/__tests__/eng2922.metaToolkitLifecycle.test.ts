@@ -193,6 +193,22 @@ describe('ENG-2922 Meta ARCHIVE / DELETE / COPY', () => {
     expect(await previewThenConfirm(deps, args('ARCHIVE'))).toMatchObject({ status: 'FAILED', success: false });
   });
 
+  it('AD_SET COPY takes a top-level campaign_id as the destination campaign instead of dropping it (Zoma/Haven)', async () => {
+    const { deps, mock } = makeDeps();
+    const a = { entity_type: 'AD_SET', action: 'COPY', account_id: '111', ad_set_id: '900', campaign_id: '700', params: { deep_copy: true } };
+    const preview: any = await executeMetaToolkitLifecycle('u1', a, deps);
+    expect(preview.preview).toMatch(/into campaign "Other campaign" \(id 700\)/);
+    await executeMetaToolkitLifecycle('u1', { ...a, confirm: true, preview_token: preview.preview_token }, deps);
+    expect(mock.copy).toHaveBeenCalledWith('u1', '111', 'AD_SET', '900', expect.objectContaining({ campaign_id: '700', deep_copy: true }));
+  });
+
+  it('a Meta refusal of a COPY is reported with Meta\'s reason', async () => {
+    const refused = makeDeps({ copy: jest.fn().mockRejectedValue(Object.assign(new Error('Invalid parameter — Ad set budget not allowed (code 100, subcode 1885621)'), { response: { status: 400 } })) });
+    const r: any = await previewThenConfirm(refused.deps, { entity_type: 'AD_SET', action: 'COPY', account_id: '111', ad_set_id: '900', params: { campaign_id: '700' } });
+    expect(r).toMatchObject({ status: 'FAILED', success: false });
+    expect(r.message).toContain('subcode 1885621');
+  });
+
   it('COPY refuses status_option other than PAUSED and a destination outside the ad account', async () => {
     const { deps, mock } = makeDeps();
     await expect(executeMetaToolkitLifecycle('u1', args('COPY', { params: { status_option: 'ACTIVE' } }), deps)).rejects.toThrow(/always created PAUSED/);
@@ -262,6 +278,25 @@ describe('ENG-2922 Graph seam', () => {
     const adPost = jest.fn().mockResolvedValue({ data: { copied_ad_id: '8' } });
     await copyMetaNode(ctx(jest.fn(), adPost), 'AD', '9', { adset_id: '44', deep_copy: true });
     expect(adPost.mock.calls[0][2].params).toEqual({ status_option: 'PAUSED', adset_id: '44', access_token: 'tok' });
+  });
+
+  it('copyMetaNode surfaces Meta\'s error detail on a 400, not axios\'s bare "status code 400" (Zoma/Haven)', async () => {
+    const axios400: any = Object.assign(new Error('Request failed with status code 400'), {
+      response: {
+        status: 400,
+        data: { error: { message: 'Invalid parameter', code: 100, error_subcode: 1885621, error_user_title: 'Ad set budget not allowed', error_user_msg: 'This campaign uses a campaign budget.', fbtrace_id: 'TR1' } },
+        config: { params: { access_token: 'tok' } },
+      },
+    });
+    const post = jest.fn().mockRejectedValue(axios400);
+    const err: any = await copyMetaNode(ctx(jest.fn(), post), 'AD_SET', '9', { campaign_id: '44', deep_copy: true }).catch((e: any) => e);
+    for (const part of ['Invalid parameter', 'Ad set budget not allowed', 'campaign budget', 'code 100', 'subcode 1885621', 'fbtrace_id TR1']) {
+      expect(err.message).toContain(part);
+    }
+    expect(err.message).not.toContain('status code 400');
+    expect(err.response.status).toBe(400);
+    expect(JSON.stringify(err.response)).not.toContain('tok');
+    expect(post.mock.calls[0][2].params).toMatchObject({ status_option: 'PAUSED', campaign_id: '44', deep_copy: true });
   });
 });
 

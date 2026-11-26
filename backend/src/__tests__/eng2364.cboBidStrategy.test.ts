@@ -53,4 +53,12 @@ describe('MetaService.createCampaign CBO bid strategy (ENG-2364)', () => {
     expect(sent()).not.toHaveProperty('bid_strategy');
     expect(sent()).not.toHaveProperty('daily_budget');
   });
+
+  it('sends is_adset_budget_sharing_enabled only without a campaign budget (it describes ad-set budgets)', async () => {
+    await service.createCampaign('123', 't', { name: 'ABO', objective: 'OUTCOME_LEADS' } as any);
+    expect(sent()).toMatchObject({ is_adset_budget_sharing_enabled: false });
+    createCampaign.mockClear();
+    await service.createCampaign('123', 't', { name: 'ACB', objective: 'OUTCOME_LEADS', daily_budget: 5000 } as any);
+    expect(sent()).not.toHaveProperty('is_adset_budget_sharing_enabled');
+  });
 });
