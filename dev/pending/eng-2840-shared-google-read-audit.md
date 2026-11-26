@@ -1,22 +1,37 @@
 ## ENG-2840: Log-only audit of reads through the shared Google service account (2026-11-26)
 
-- Two places let a caller name a Google resource that nothing proves they own, then read it with AgentWeb's OWN Google service account:
+- Where a caller names a Google resource that nothing proves they own, and AgentWeb's OWN Google service account then reads it:
   `readGoogleFileById` (a `gdoc:<id>` / `gsheet:<id>` knowledge-base identifier, the `read_knowledge_base_files` MCP tool, Emma's Google file
   reader) falls back to the service account when the caller has no Google Drive login or their own login is refused (401/403), with no check
-  that the caller owns or registered the file; and the analytics readers read the GA4 property ids and Search Console domains SAVED in a user's
-  or organization's analytics config, which `analyticsConfigValidator.ts` checks for format only (GA4 property ids are plain numbers).
-- This change is step 1 of a two-step fix and changes nothing a customer can do: it writes one structured `shared_google_read` line per resource
-  to the application log (`services/sharedGoogleAudit.ts`): `kind` (`drive-file`, `ga4`, `gsc`), `userId`, `idHash` (12 hex characters of a
-  SHA-256 of the id: the raw id is never logged), `source` (the function or route), and for Drive `reason` (`no_oauth`: no Google login;
-  `oauth_denied`: the caller's own login was refused) and `outcome` (`ok`, `failed`). Hooked in `readGoogleFileById`, the three `seoService`
-  readers (`fetchGa4KeyEvents`, `fetchGoogleAnalyticsMetrics`, `fetchSearchConsoleMetrics`) and the portal's `GET /api/seo/metrics` and
-  `GET /api/seo/product-metrics` (which read inline). It never throws and never changes what a read returns.
-- Reading the numbers (CloudWatch Logs Insights, log group `/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log`):
-  `filter audit = "shared_google_read" | stats count_distinct(userId) as users, count(*) as reads by kind, idHash | sort users desc` shows any
-  resource read by more than one account (the cross-tenant signal); `filter audit = "shared_google_read" and kind = "drive-file" | stats
-  count(*) as reads, count_distinct(userId) as users by reason, outcome` shows how many Drive reads rely on the fallback at all and for how many
-  accounts. Step 2 (enforcement: only ids the caller registered or can open with their own Google login; a property or domain is saved only
-  when the customer's own Google login can see it) waits for those numbers, and its refusal text is customer-facing copy for Harsha to review.
-- Known limits of the log: it records the id the caller used, not who owns the resource (that needs an extra Drive call per read, left out so
-  the existing Drive tests and behaviour stay byte-identical); the same account reading its own shared file is indistinguishable from a
-  cross-account read except by the "same hash, several accounts" query above.
+  that the caller owns or registered the file; the analytics readers read the GA4 property ids and Search Console domains SAVED in a user's or
+  organization's analytics config, which `analyticsConfigValidator.ts` checks for format only (GA4 property ids are plain numbers); and
+  registered Google Drive folders (`POST /api/settings/google-drive/folders` checks only that the service account can see the folder) are read
+  with the service account by the knowledge-base search, listing, reading and materializing code and by the folder-files route.
+- This change is step 1 of a two-step fix and changes nothing a customer can do: it writes one structured `shared_google_read` line per
+  configured resource per call to the application log (`services/sharedGoogleAudit.ts`): `kind` (`drive-file`, `ga4`, `gsc`), `userId`, `idHash`
+  (12 hex characters of a SHA-256 of the id), `source` (the function or route), then when known `orgId`, `configSource` (`self`: the caller's
+  own config; `org`: the organization's, shared with a member), `platform` (true when the id is one of the platform's own landing-page GA4
+  properties or Search Console domains from `getLandingPagesConfig`, which deploying a landing page adds to the deployer's config; the list is
+  loaded in the background at most every 10 minutes, so the first lines after a start carry no `platform`), for Drive `reason` (`no_oauth`,
+  `oauth_denied`) and `outcome` (`ok`, `failed`), and `ofIds` when one call read several. Hooked in `readGoogleFileById`, the three `seoService`
+  readers, and the portal's `GET /api/seo/metrics` (including the platform landing-page property it adds for a host named in `?domain=`) and
+  `GET /api/seo/product-metrics`. It never throws and never changes what a read returns or asks Google.
+- Reading the numbers: CloudWatch Logs Insights on `/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log`. The lines carry
+  a syslog prefix, so fields are parsed from `@message` (a plain `filter audit = ...` matches nothing). Resources read by several accounts,
+  the platform's own ids left out:
+  `fields @message | filter @message like /"audit":"shared_google_read"/ and @message not like /"platform":true/ | parse @message /"kind":"(?<kind>[^"]+)","userId":"(?<userId>[^"]+)","idHash":"(?<idHash>[0-9a-f]+)"/ | stats count_distinct(userId) as users, count(*) as lines by kind, idHash | sort users desc`.
+  A hash with several users is legitimate when they are all members of one organization: list them with
+  `fields @message | filter @message like /"idHash":"<hash>"/ | parse @message /"userId":"(?<userId>[^"]+)"/ | parse @message /"orgId":"(?<orgId>[^"]+)"/ | stats count(*) by userId, orgId`.
+  Drive fallback use:
+  `fields @message | filter @message like /"audit":"shared_google_read"/ and @message like /"kind":"drive-file"/ | parse @message /"userId":"(?<userId>[^"]+)"/ | parse @message /"reason":"(?<reason>[^"]+)","outcome":"(?<outcome>[^"]+)"/ | stats count(*) as reads, count_distinct(userId) as users by reason, outcome`.
+  Registered Drive folders are counted from the stored registrations (user and organization `googleDriveFolders`), not from this log.
+- Known limits: a line is written per CONFIGURED id per call, also when a filter narrows the read to one id, when the read then fails, and
+  for a portal request answered 400, so `users` counts are right and `lines` overstate reads; `no_oauth` also covers a failure to build the
+  caller's Drive client, and `oauth_denied`/`failed` also covers a failure to build the service-account client; the hash keeps raw Drive file
+  ids out of the log but is not secret for GA4 property ids and domains (raw domains are already logged by the Search Console reader); the
+  line records the id used, not who owns the resource. Step 2 (enforcement: only ids the caller registered or can open with their own Google
+  login; a property or domain saved only when the customer's own Google login can see it; folders likewise) waits for these numbers, and its
+  refusal text is customer-facing copy for Harsha to review.
+- Found while auditing, pre-existing and reported separately (not changed here): the platform landing-page GA4 property and Search Console
+  domain are read without a limit to the caller's own landing-page hosts (for a host named in `?domain=`, and for every user whose config
+  received them on deploy).
