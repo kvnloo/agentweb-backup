@@ -4,8 +4,8 @@
   - `call_hubspot_api`: an explicit list of 30 (entity, action) read pairs (`utils/hubspotReadArgs.ts`, shared by the tool and its route).
   - `fathom_get_meetings` and `fathom_get_transcript`: the caller's own Fathom only.
   - `luma_list_events` and `luma_get_guests`.
-  - `call_linkedin_ads_insights_api`.
-  - `call_linkedin_marketing_api`: AD_ACCOUNT LIST, CAMPAIGN_GROUP LIST, CAMPAIGN LIST, CREATIVE LIST, POST GET, and TARGETING LIST_FACETS / SEARCH / ESTIMATE_REACH.
+  - `call_linkedin_ads_insights_api`: the whole ad account, broken down by `pivot` (campaign group, campaign, ad, ...).
+  - `call_linkedin_marketing_api`: AD_ACCOUNT LIST, CAMPAIGN_GROUP LIST, CAMPAIGN LIST, CREATIVE LIST, and TARGETING LIST_FACETS / SEARCH / ESTIMATE_REACH.
   - `scan_website_links`: in-process, Emma's crawler.
   - `find_or_lookup_email`: one email to a profile only, through the portal's own `POST /api/crm/leads/lookup-by-email` and its 50-a-day quota.
 - Same pattern as the other wave-2 tools:
@@ -18,16 +18,22 @@
 - Annotations: every provider read is a `write`, because it can refresh and store the owner's OAuth token or write a reconnect flag; `find_or_lookup_email` records quota use. `scan_website_links` is a `read`. None runs the agent. These tools are not exempt from the outside-content sanitizer: HubSpot records, transcripts and guest answers are third-party content.
 - No new opt-in key scopes. A `tools:execute` key can already have Emma call every one of these tools, writes included, through `emma_send_message`, so direct reads add nothing that key could not reach.
 - Bounds Emma does not have:
-  - Over MCP, HubSpot deal contacts are capped at 100.
+  - Over MCP, HubSpot deal contacts stop at 100 (paging stops there too, `contacts_cut`), and the route applies Emma's sandbox check.
   - LinkedIn reads are limited to 30 s per request, 5 pages, 500 elements and 10 referenced posts expanded.
-  - AD_ACCOUNT LIST over MCP returns only ad accounts the caller has connected or shared. The token alone can see every account its owner manages, including an agency's clients.
+  - AD_ACCOUNT LIST over MCP returns only ad accounts the caller has connected or shared. The token alone can see every account its owner manages, including an agency's clients. When the 500-element bound cut that list, the answer says `truncated`.
+  - Over MCP the insights tool takes no campaign, creative or campaign-group filter, and there is no POST GET. On an org-shared connection
+    the owner's token can read accounts and posts that were never shared, and LinkedIn does not document that such a filter is intersected
+    with the account, so a filter id from another account could have returned that account's numbers. Breakdowns come from `pivot`.
   - The link scan is capped at 100 pages, 500 links and 60 s, 10 an hour per caller.
   - `include_phone` is not an input of `luma_get_guests`.
 - Shared services take new optional arguments. The default keeps Emma exactly as before:
   - `handleHubspotApi(userId, args, options?)`.
   - `HubSpotService.ownerUserId`.
   - `linkedInAdsService` reads take `bounds?` (timeout, page and element caps); `callLinkedInMarketingApi` / `callLinkedInAdsInsightsApi` take a last `bounds?`.
-- Changed for Emma too: Fathom requests and the Fathom token refresh time out after 30 s (they had no timeout).
+- Changed for Emma too:
+  - Fathom requests and the Fathom token refresh time out after 30 s with no data (they had no timeout).
+  - The link crawler's requests end at their time limit even while data still trickles in (an abort signal). Before, a slow site kept the
+    socket, and up to 1 MB, open after the scan had given up on it.
 - Not exposed:
   - `fathom_get_onboarding_context`: AgentWeb's internal sales notes about the customer.
   - `fathom_route_action_items`.
