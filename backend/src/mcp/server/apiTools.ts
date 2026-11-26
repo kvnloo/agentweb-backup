@@ -4711,7 +4711,23 @@ export function extractRegistrationStatusEmails(raw: unknown): { emails: string[
       // Split list separators first so a piece with no address
       // ("a@x.com, not-an-email") is reported in `skipped`, not dropped.
       const pieces: string[] = [];
-      const rawPieces = trimmed.split(/[,;\n]+/);
+      // Quote-aware: separators inside a quoted display name ("Doe, Jane"
+      // <jane@acme.com>) belong to that contact, not the list.
+      const rawPieces: string[] = [];
+      let buf = '';
+      let inQuote = false;
+      for (const ch of trimmed) {
+        if (ch === '"') inQuote = !inQuote;
+        if (!inQuote && (ch === ',' || ch === ';' || ch === '\n')) {
+          rawPieces.push(buf);
+          buf = '';
+        } else {
+          buf += ch;
+        }
+      }
+      rawPieces.push(buf);
+      // An unbalanced quote would swallow the rest of the list; split plainly.
+      if (inQuote) rawPieces.splice(0, rawPieces.length, ...trimmed.split(/[,;\n]+/));
       // "Last, First <addr>": a bare name before a display-name contact is part
       // of that contact, not a separate entry with no address.
       for (let i = 0; i < rawPieces.length - 1; i++) {

@@ -210,6 +210,15 @@ describe('ENG-3189 extractor edge cases', () => {
     expect(r.emails).toEqual(['jane@acme.com', 'bob@acme.com']);
     expect(r.skipped).toEqual([]);
   });
+  it('keeps a quoted "Last, First" contact as one entry (Opslane run 2493 #6)', () => {
+    const r = extractRegistrationStatusEmails('"Doe, Jane" <jane@acme.com>, bob@acme.com');
+    expect(r.emails).toEqual(['jane@acme.com', 'bob@acme.com']);
+    expect(r.skipped).toEqual([]);
+  });
+  it('an unbalanced quote does not swallow the rest of the list', () => {
+    const r = extractRegistrationStatusEmails('"Doe <jane@acme.com>, bob@acme.com');
+    expect(r.emails).toEqual(['jane@acme.com', 'bob@acme.com']);
+  });
   it('bounds total pieces scanned', () => {
     const many = Array.from({ length: 5000 }, () => 'x'.repeat(500)).join(',');
     const r = extractRegistrationStatusEmails(many);
