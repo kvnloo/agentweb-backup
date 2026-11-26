@@ -9,7 +9,7 @@
   SSRF-guarded caller-URL fetch with a byte ceiling and a time limit (`LINKEDIN_UPLOAD_MAX_BYTES`: image 20 MB, document 100 MB, video
   200 MB; 60 s, 120 s, 180 s).
 - The Meta seed-audience CSV fetch (`fetchAndParseCsvRows`, used when a targeted campaign is launched from a `csv_url`) had the SSRF guard
-  but no size cap and no timeout: an endless or very slow body was held in memory. It is now bounded at 50 MB and 60 s.
+  but no size cap and no timeout: an endless or very slow body was held in memory. It is now bounded at 50 MB and 60 s for the whole download (an abort signal, not only an idle timeout).
 - Emma's tool gateway (`services/agentToolGatewayService.ts`) labelled `call_hubspot_api` SUBMIT, ENABLE, UNPUBLISH, DISABLE, ADD_ASSET and
   REMOVE_ASSET as reads (safe to repeat, no confirmation flag). They are now writes (ENABLE external_publish, SUBMIT external_send,
   UNPUBLISH destructive, the others internal_write), only the known reads are reads, and an unknown action is a write.
