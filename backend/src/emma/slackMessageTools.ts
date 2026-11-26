@@ -12,6 +12,7 @@ import { userDb } from '../services/db';
 
 const NO_SLACK_CHANNEL_ERROR = 'No Slack channel is configured for your account. Ask your admin to set one up.';
 const NO_CHANNEL_SPECIFIED_ERROR = 'You have multiple Slack channels configured. Specify which channel to use via channel_id or channel_name.';
+const NO_USER_ERROR = 'Slack is not available for this call: no user account is attached to it.';
 
 // Returns the channel ID to use for a tool call.
 // Regular users are scoped to their configured slackChannels; admins can target any channel.
@@ -19,7 +20,9 @@ async function resolveChannelForUser(
   args: { channel_id?: string; channel_name?: string },
   context: { userId?: string }
 ): Promise<{ id: string } | { error: string }> {
-  if (context.userId) {
+  // No user, no channel: the bot is in every client's channel, so a call nobody is attached to reads nothing.
+  if (!context.userId) return { error: NO_USER_ERROR };
+  {
     const user = await userDb.getUserById(context.userId);
     if (!user?.isAdmin) {
       const allowed = await getEffectiveAllowedChannels(user);
@@ -44,7 +47,7 @@ async function resolveChannelForUser(
     }
   }
 
-  // Admin (or no userId context): resolve from args as before
+  // Admin: resolve from args as before
   return resolveChannelId(args.channel_id, args.channel_name);
 }
 
@@ -80,7 +83,8 @@ emmaToolRegistry.register({
     },
   },
   execute: async (args: any, context: any = {}) => {
-    if (context.userId) {
+    if (!context.userId) return { success: false, error: NO_USER_ERROR };
+    {
       const user = await userDb.getUserById(context.userId);
       if (!user?.isAdmin) {
         const allowed = await getEffectiveAllowedChannels(user);

@@ -27,8 +27,11 @@ import { extractS3KeyFromUrl } from '../../utils/s3Utils';
 
 const MAX_MESSAGE_CHARS = 300;
 const HOUR_MS = 60 * 60_000;
-// Control characters other than tab, line feed and carriage return, plus zero-width and bidirectional formatting characters.
-const BAD_TEXT_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
+// Control characters other than tab, line feed and carriage return: refused in every text field.
+const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
+// Zero-width and bidirectional formatting characters: refused only in single-line fields (titles, ids, URLs), where they can disguise a
+// value. Content fields keep them: they are part of ordinary text (joined emoji, Persian, Hebrew and Arabic).
+const INVISIBLE_RE = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
 
 function refuse(tool: string, message: string): never {
   throw new Error(`${tool}: ${message}`);
@@ -69,21 +72,25 @@ export class CallGuard {
   }
 }
 
+// Per process: each caller holds at most one slot, so a slot count is how many different callers can run the tool at once.
 export const GUARDS = {
-  create_html_file: new CallGuard('create_html_file', 3, 20),
-  create_html_from_template: new CallGuard('create_html_from_template', 3, 20),
-  update_html_file: new CallGuard('update_html_file', 4, 60),
-  describe_image: new CallGuard('describe_image', 4, 30),
-  perform_data_analysis: new CallGuard('perform_data_analysis', 2, 10),
+  create_html_file: new CallGuard('create_html_file', 8, 20),
+  create_html_from_template: new CallGuard('create_html_from_template', 8, 20),
+  update_html_file: new CallGuard('update_html_file', 8, 60),
+  describe_image: new CallGuard('describe_image', 8, 30),
+  perform_data_analysis: new CallGuard('perform_data_analysis', 4, 10),
 } as const;
 
-/** How long a self-call may wait: as long as the route's own work can take. */
+/**
+ * How long a self-call waits. The outside request is cut at 600 s by the load balancer and nginx, so no answer can arrive later than that:
+ * each wait ends before it, and a longer run answers "did not answer in time" (the description says a file may still appear).
+ */
 export const TIMEOUTS_MS = {
-  create_html_file: 16 * 60_000,
-  create_html_from_template: 10 * 60_000,
+  create_html_file: 9 * 60_000,
+  create_html_from_template: 9 * 60_000,
   update_html_file: 2 * 60_000,
   describe_image: 3 * 60_000,
-  perform_data_analysis: 21 * 60_000,
+  perform_data_analysis: 9 * 60_000,
 } as const;
 
 function callerOf(context: any): string {
@@ -100,7 +107,7 @@ function text(tool: string, field: string, value: unknown, opts: { min?: number;
   const s = value as string;
   if (s.trim().length < (opts.min ?? 1)) refuse(tool, `${field} must not be empty. Nothing was changed.`);
   if (s.length > opts.max) refuse(tool, `${field} is ${s.length} characters; at most ${opts.max}. Nothing was changed.`);
-  if (BAD_TEXT_RE.test(s) || (!opts.multiline && /[\r\n]/.test(s))) refuse(tool, `${field} holds control or invisible characters. Nothing was changed.`);
+  if (CONTROL_RE.test(s) || (!opts.multiline && (/[\r\n]/.test(s) || INVISIBLE_RE.test(s)))) refuse(tool, `${field} holds control or invisible characters. Nothing was changed.`);
   return s;
 }
 
@@ -111,6 +118,18 @@ export function ownStorageUrl(tool: string, field: string, value: unknown): stri
     refuse(tool, `${field} must be the https URL of a file in your own AgentWeb storage, as AgentWeb returned it. Other sites are not fetched. Nothing was changed.`);
   }
   return url;
+}
+
+/** `s3://<our bucket>/<key>` for a URL of our bucket, the key decoded once (as the object's real name). */
+export function ownStorageS3Uri(tool: string, field: string, url: string): string {
+  const raw = extractS3KeyFromUrl(url) as string;
+  let key: string;
+  try {
+    key = decodeURIComponent(raw);
+  } catch {
+    refuse(tool, `${field} is not a valid storage URL. Nothing was changed.`);
+  }
+  return `s3://${process.env.AWS_S3_BUCKET || 'agentweb-user-files'}/${key!}`;
 }
 
 /** The route's `{ success: true }` answer, or an error carrying only its short message. */
@@ -200,7 +219,7 @@ mcpToolRegistry.register({
   definition: {
     name: 'create_html_file',
     description: 'Turn a draft (Markdown or plain text, or a complete HTML document) into a styled HTML document or email and save it; answers its s3_url. '
-      + `content_draft is at most ${MAX_DRAFT_CHARS} characters. A complete HTML document is saved as it is; anything else is rendered by a model (this can take several minutes and is counted against your account's monthly usage). `
+      + `content_draft is at most ${MAX_DRAFT_CHARS} characters. A complete HTML document is saved as it is; anything else is rendered by a model (this can take several minutes and is counted against your account's monthly usage; if no answer comes within 9 minutes the call reports that, and the file may still appear in your storage). `
       + 'document_type "email" makes email-safe HTML; default "document". '
       + `One call of yours at a time, ${GUARDS.create_html_file.perHour} an hour. ${LINK_NOTE} Read it back with read_file_content. Any other argument is refused by name.`,
     inputSchema: {
@@ -384,7 +403,7 @@ mcpToolRegistry.register({
     name: 'perform_data_analysis',
     description: 'Analyse data with code: a model writes and runs Python in Google\'s isolated sandbox (no network, no access to your account) on the files you give and the instruction. '
       + `file_urls: up to ${MAX_ANALYSIS_FILES} storage URLs of files in your own AgentWeb storage (CSV, JSON, text, spreadsheets saved as CSV; not PDF or Office). analysis_instruction: what to compute, with any small inline data (at most ${MAX_ANALYSIS_INSTRUCTION_CHARS} characters). `
-      + 'Answers the analysis (Markdown), the code that ran, and links to any charts or files it produced. Can take many minutes; counted against your account\'s monthly usage. '
+      + 'Answers the analysis (Markdown), whether code ran (codeExecuted), and links to any charts or files it produced. A file of another account is refused. Can take many minutes: an answer that does not come within 9 minutes is reported as not answered in time, and charts may still appear in your storage. Counted against your account\'s monthly usage. '
       + `One call of yours at a time, ${GUARDS.perform_data_analysis.perHour} an hour. Charts and files it saves go to your own storage; ${LINK_NOTE.charAt(0).toLowerCase()}${LINK_NOTE.slice(1)} Any other argument is refused by name.`,
     inputSchema: {
       type: 'object',
@@ -400,7 +419,9 @@ mcpToolRegistry.register({
     const a = exactArgs(tool, args, ['file_urls', 'analysis_instruction']);
     const files = a.file_urls === undefined || a.file_urls === null ? [] : a.file_urls;
     if (!Array.isArray(files) || files.length > MAX_ANALYSIS_FILES) refuse(tool, `file_urls must be a list of at most ${MAX_ANALYSIS_FILES} storage URLs. Nothing was changed.`);
-    const fileUrls = (files as unknown[]).map((u, i) => ownStorageUrl(tool, `file_urls[${i}]`, u));
+    // Sent as s3://<bucket>/<key>: that is the path where Emma's analysis asks the storage rule whether this caller may read the key
+    // (an https URL of the bucket is fetched over the internet with no owner check).
+    const fileUrls = (files as unknown[]).map((u, i) => ownStorageS3Uri(tool, `file_urls[${i}]`, ownStorageUrl(tool, `file_urls[${i}]`, u)));
     const instruction = text(tool, 'analysis_instruction', a.analysis_instruction, { max: MAX_ANALYSIS_INSTRUCTION_CHARS, multiline: true });
     const result = await call(tool, context, { method: 'POST', path: '/api/emma/data-analysis', body: { file_urls: fileUrls, analysis_instruction: instruction } }, true, true);
     return jsonResult(pick(result, ['analysis', 'codeExecuted', 'fileUrls']));
