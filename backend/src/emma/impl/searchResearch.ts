@@ -558,6 +558,10 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     // 50MB in bytes. A value that is not a number must not switch the cap off (a NaN limit compares false with everything).
     const configuredMaxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800');
     const maxTotalSize = Number.isFinite(configuredMaxTotalSize) && configuredMaxTotalSize >= 0 ? configuredMaxTotalSize : 52428800;
+    const totalSizeExceeded = () => ({
+      success: false,
+      message: `Total file size exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`,
+    });
 
     // Prepare file data for analysis.
     // IMPORTANT: Gemini code_execution only writes a file part to the sandbox
@@ -606,8 +610,10 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           { const kind = binaryKindFromName(s3Key); if (kind) return binaryFileRefusal(fileUrl, kind); }
           let s3Content: string;
           try {
-            s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
+            // Read at most what is left of the total allowance: an object larger than that is refused without loading it.
+            s3Content = await getS3ObjectAsString(s3Key, s3Bucket, { maxBytes: Math.max(maxTotalSize - totalSize, 0) });
           } catch (s3Err) {
+            if ((s3Err as any)?.name === 'S3ObjectTooLargeError') return totalSizeExceeded();
             const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
             return {
               success: false,
@@ -645,8 +651,9 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           { const kind = binaryKindFromName(fileUrl); if (kind) return binaryFileRefusal(fileUrl, kind); }
           let s3Content: string;
           try {
-            s3Content = await getS3ObjectAsString(toolResponseKey);
+            s3Content = await getS3ObjectAsString(toolResponseKey, undefined, { maxBytes: Math.max(maxTotalSize - totalSize, 0) });
           } catch (s3Err) {
+            if ((s3Err as any)?.name === 'S3ObjectTooLargeError') return totalSizeExceeded();
             const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
             return {
               success: false,
