@@ -152,7 +152,8 @@ function captureFirstPage(body: unknown, apiKey: string): void {
 
 /**
  * Reads every page and returns them as one payload, keeping the feed's
- * `intelligence_index_version`. Throws on any failed or malformed page: the list ends
+ * `intelligence_index_version`. Throws on any failed or malformed page, or a page whose
+ * index version differs from page 1: the list ends
  * only on an explicit `has_more: false`, never on a missing pagination block.
  */
 export async function fetchArtificialAnalysisModels(apiKey: string, request: typeof fetch = fetch): Promise<{ data: unknown[]; intelligence_index_version?: unknown }> {
@@ -164,7 +165,9 @@ export async function fetchArtificialAnalysisModels(apiKey: string, request: typ
     const body = await response.json() as unknown;
     if (page === 1) captureFirstPage(body, apiKey);
     data.push(...rows(body));
-    if (page === 1) version = object(body)?.intelligence_index_version;
+    const pageVersion = object(body)?.intelligence_index_version;
+    if (page === 1) version = pageVersion;
+    else if (pageVersion !== version) throw new Error(`artificialanalysis.ai: page ${page} intelligence_index_version ${String(pageVersion)} differs from page 1 (${String(version)})`);
     const hasMore = object(object(body)?.pagination)?.has_more;
     if (typeof hasMore !== 'boolean') throw new Error('artificialanalysis.ai: page without pagination.has_more');
     if (!hasMore) return { data, ...(version === undefined ? {} : { intelligence_index_version: version }) };
