@@ -4,7 +4,9 @@
  * (ZOMA_REQUIRE_PAYMENT_METHOD unset), payment readiness is true without a card, so:
  *  1. zoma_status leaves the payment line out of the checklist and marks `payment.required: false`;
  *  2. with the card requirement on, the line and the structured payment state are as before;
- *  3. writes are unchanged in both modes (the write gate never reads the new field).
+ *  3. writes are unchanged in both modes (the write gate never reads the new field);
+ *  4. the zoma_status tool description no longer tells the client a card is always checked, so the
+ *     client's own paraphrase ("Payment: on file") is not primed by it.
  */
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
 jest.mock('../services/stripeService', () => ({ stripeService: {} }));
@@ -12,6 +14,7 @@ jest.mock('../services/metaConnectUrl', () => ({ buildMetaConnectUrl: jest.fn() 
 jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
 
 import { assertZomaWriteReady, runZomaTool, type ZomaOnboardingDeps } from '../mcp/zomaOnboarding';
+import { zomaToolDefinitions } from '../mcp/zomaToolDefinitions';
 
 const NOW = 1_800_000_000_000;
 const metaAccount = () => ({
@@ -91,5 +94,13 @@ describe('ENG-3195 zoma_status payment line', () => {
       expect(r.next_step).toContain('Add a payment method');
       await expect(assertZomaWriteReady('u1', d)).rejects.toThrow(/No payment method on file/);
     });
+  });
+
+  it('the zoma_status description only asks about a payment method when one is required', () => {
+    const d = zomaToolDefinitions(false).find((t) => t.name === 'zoma_status')!.description;
+    expect(d).not.toMatch(/payment method on file\)/);
+    expect(d).not.toMatch(/need both a payment method/);
+    expect(d).toContain('a payment method only when one is required at setup');
+    expect(d).toContain('never tell the user a payment method is on file unless the checklist says so');
   });
 });
