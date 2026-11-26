@@ -34,6 +34,7 @@ import { isZomaAdsReportTool, ZOMA_ADS_REPORT_DEFINITION } from './zomaAdsReport
 import { isZomaIndustryBenchmarkTool } from './zomaIndustryBenchmark';
 import { measurementReportsEnabled, ZOMA_MEASUREMENT_REPORT_DEFINITION } from './zomaMeasurementReport';
 import { ZOMA_REPORT_SCHEDULE_DEFINITION } from './zomaReportSchedule';
+import { withUseWhen } from './zomaUseWhen';
 
 export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
@@ -127,7 +128,8 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
   });
   // ENG-2303: toolkit-local Zoma onboarding tools (handled by the gateway, not the registry).
   // ENG-2916: read-only account health + learning-phase tools (handled by the gateway).
-  return [
+  // Every description leads with a plain-language "Use when the user …" sentence (zomaUseWhen.ts).
+  return withUseWhen([
     ...metaTools,
     ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
@@ -153,7 +155,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...((opts.measurementReports ?? measurementReportsEnabled())
       ? [ZOMA_MEASUREMENT_REPORT_DEFINITION, ZOMA_REPORT_SCHEDULE_DEFINITION].map((d) => JSON.parse(JSON.stringify(d)))
       : []),
-  ];
+  ]);
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */

@@ -190,6 +190,9 @@ export function zomaMcpInstructions(google: boolean = googleToolkitEnabled(), li
   const others = [google ? 'Google' : '', linkedin ? 'LinkedIn' : ''].filter(Boolean);
   return [
     `${ZOMA_WELCOME} Zoma lets you run the user's ${others.length ? `Meta (and ${others.join(' and ')})` : 'Meta'} ads safely from this chat.`,
+    `Use Zoma whenever the user talks about their Facebook or Instagram${others.length ? `, ${others.join(' or ')}` : ''} ads in their own words: ` +
+      'how the ads are doing or what they spent, why ads aren\'t spending, delivering or got rejected, pausing or changing ads, budgets or targeting, ' +
+      'audiences and retargeting, or seeing competitor ads.',
     `On first connect, greet the user with exactly "${ZOMA_WELCOME}" and ask one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}". ` +
       'Call zoma_status to get the answer options, then call zoma_status again with ads_experience set to their answer; it returns the next step (usually the Meta connect link). Relay it as given.',
     'Once an ad account is connected, zoma_ads_report answers spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for any date range. ' +
