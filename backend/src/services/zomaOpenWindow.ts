@@ -18,6 +18,9 @@ export const zomaDatabricksLaunchEnabled = (env: NodeJS.ProcessEnv = process.env
 /** Fails closed: an unparseable end date means the window is not open. */
 export function zomaOpenTesterWindowActive(now: number = Date.now(), env: NodeJS.ProcessEnv = process.env): boolean {
   if (!zomaDatabricksLaunchEnabled(env)) return false;
-  const until = Date.parse(env.ZOMA_OPEN_TESTER_UNTIL || DEFAULT_ZOMA_OPEN_TESTER_UNTIL);
+  const raw = env.ZOMA_OPEN_TESTER_UNTIL || DEFAULT_ZOMA_OPEN_TESTER_UNTIL;
+  // An explicit offset is required: a date-only or local value would close the window hours off.
+  if (!/T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(raw)) return false;
+  const until = Date.parse(raw);
   return Number.isFinite(until) && now < until;
 }

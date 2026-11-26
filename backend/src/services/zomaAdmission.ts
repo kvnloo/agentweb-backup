@@ -194,9 +194,21 @@ export async function recordOpenWindowAdmission(emailInput: string): Promise<str
     return 'approved';
   } catch (err: any) {
     if (err.code !== 'ConditionalCheckFailedException') throw err;
-    // An existing decision wins, except a waitlisted applicant is let in during the window.
+  }
+  // A waitlisted applicant is let in during the window, durably, so the next authorization after
+  // the window still sees 'approved'. Conditional on still being waitlisted: a Reject that lands
+  // first wins, and an existing approval is left as it is.
+  try {
+    await db.update({ TableName: table(), Key: { email },
+      UpdateExpression: 'SET zomaStatus = :approved, approvedAt = :now, approvedBy = :actor, seatExempt = :exempt',
+      ConditionExpression: 'zomaStatus = :pending',
+      ExpressionAttributeValues: { ':approved': 'approved', ':pending': 'waitlisted', ':now': now, ':actor': 'system:open-window', ':exempt': 'open_window' },
+    }).promise();
+    return 'approved';
+  } catch (err: any) {
+    if (err.code !== 'ConditionalCheckFailedException') throw err;
     const status = (await entry(email))?.zomaStatus;
-    return status === 'rejected' ? 'rejected' : 'approved';
+    return status === 'approved' ? 'approved' : (status ?? 'not_found');
   }
 }
 

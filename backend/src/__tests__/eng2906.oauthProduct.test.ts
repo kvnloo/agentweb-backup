@@ -245,6 +245,16 @@ describe('ENG-2781 Databricks-origin OAuth clients and the Zoma seat cap', () =>
       expect(mockZomaAuthorizationAdmission).toHaveBeenCalledWith('user-9', { databricks: true, clientId: 'c1' });
     });
 
+    it('production today (launch flag off): a Databricks client gets the unchanged one-argument admission call', async () => {
+      delete process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED;
+      try {
+        mockSvc.getClient.mockResolvedValue(databricksClient());
+        const res = await decide(DATABRICKS_REDIRECT);
+        expect(res.status).toBe(202);
+        expect(mockZomaAuthorizationAdmission.mock.calls).toEqual([['user-9']]);
+      } finally { process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED = 'true'; }
+    });
+
     it('still waitlists a client that is not Databricks-origin, with the admission call unchanged', async () => {
       const res = await decide();
       expect(res.status).toBe(202);
@@ -342,6 +352,17 @@ describe('ENG-2781 Databricks-origin OAuth clients and the Zoma seat cap', () =>
       const intent = intentFrom(await authorize({ ...zoma, redirect_uri: DATABRICKS_REDIRECT }));
       expect(isZomaSignup({ signupIntent: intent })).toBe(true);
       expect(isDatabricksSignupIntent(intent)).toBe(true);
+    });
+
+    it('production today (launch flag off): a Databricks client gets the ordinary intent', async () => {
+      delete process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED;
+      try {
+        mockSvc.getClient.mockResolvedValue(databricksClient());
+        const intent = intentFrom(await authorize({ ...zoma, redirect_uri: DATABRICKS_REDIRECT }));
+        expect(isZomaSignup({ signupIntent: intent })).toBe(true);
+        expect(isDatabricksSignupIntent(intent)).toBe(false);
+        expect(intent!.split('.')).toHaveLength(2);
+      } finally { process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED = 'true'; }
     });
 
     it('mints the ordinary intent for any other client', async () => {

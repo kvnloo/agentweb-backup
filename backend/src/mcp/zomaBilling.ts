@@ -519,6 +519,8 @@ export interface ZomaPlanSummary {
 export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps = defaultZomaBillingDeps): Promise<ZomaPlanSummary | undefined> {
   const cfg = deps.config();
   if (!cfg.enabled) return undefined;
+  // ENG-2781 option (a): nothing is billed during the flagged open window, so no trial checkout either.
+  if (zomaOpenTesterWindowActive(deps.now())) return { status: 'none', publish_enabled: true };
   try {
     const state = await getZomaPlanState(userId, deps);
     const summary: ZomaPlanSummary = {
@@ -632,6 +634,8 @@ export async function reportZomaBillableCall(
   const cfg = deps.config();
   if (!cfg.enabled) return false;
   const now = deps.now();
+  // ENG-2781 option (a): no usage is metered to Stripe during the flagged open window.
+  if (zomaOpenTesterWindowActive(now)) return false;
   let cached = customerCache.get(userId);
   if (!cached || (cached.id === null && now - cached.checkedAt > NO_CUSTOMER_TTL_MS)) {
     cached = { id: await deps.findCustomerId(userId), checkedAt: now };
