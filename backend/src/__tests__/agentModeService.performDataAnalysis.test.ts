@@ -417,7 +417,7 @@ describe('AgentModeService.performDataAnalysis', () => {
 
     const result = await (service as any).performDataAnalysis([s3Url], 'Summarize the data.', 'user-1');
 
-    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith('users/user-1/files/1234/abc/data.csv', 'agentweb-user-files');
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith('users/user-1/files/1234/abc/data.csv', 'agentweb-user-files', { maxBytes: 52428800 });
     expect(mockedAxiosGet).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
   });
