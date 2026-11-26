@@ -1652,12 +1652,25 @@ export function hubspotDateFilters(args: any):
   return { filters };
 }
 
-export async function handleHubspotApi(userId: string, args: any): Promise<any> {
+/**
+ * ENG-2840 (W2-9): options for the MCP read route (`POST /api/emma/hubspot-read`). Emma's own tool passes none, and every option left
+ * out keeps the old behaviour exactly.
+ */
+export interface HubspotApiOptions {
+  /** Told which connection will serve the call, once it is resolved (the route says in its answer whose account answered). */
+  onResolved?: (svc: HubSpotService) => void;
+  /** DEALS GET_CONTACTS: read at most this many of the deal's contacts, and stop paging associations once more than this many ids are
+   * held (the answer then has `contacts_cut: true`). Default: every page and every contact, as before. */
+  maxDealContacts?: number;
+}
+
+export async function handleHubspotApi(userId: string, args: any, options: HubspotApiOptions = {}): Promise<any> {
   args = normalizeHubSpotArgs(args);
   const entityType: string = (args?.entity_type ?? '').toUpperCase();
   const action: string = (args?.action ?? '').toUpperCase();
   try {
     const svc = await resolveHubSpotService(userId, args?.account_id);
+    options.onResolved?.(svc);
 
     // Refuse a call the connection provably cannot serve, BEFORE spending a round trip
     // on a guaranteed 403 whose message does not name the real problem.
@@ -1738,10 +1751,17 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
         case 'GET_CONTACTS': {
           const dealId = args?.deal_id ?? args?.id;
           if (!dealId) return { success: false, error: 'deal_id is required for DEALS GET_CONTACTS.' };
-          const ids = await svc.getDealContactAssociations(String(dealId));
+          // Emma's call (no maxDealContacts) reads every association page, exactly as before. The MCP route's bound stops paging once
+          // more than `max` ids are held, so how many the deal has in all is not known then: the answer only says the list was cut.
+          const max = options.maxDealContacts;
+          const allIds = max !== undefined
+            ? await svc.getDealContactAssociations(String(dealId), { stopAfter: Math.max(0, max) })
+            : await svc.getDealContactAssociations(String(dealId));
+          const ids = max !== undefined && allIds.length > max ? allIds.slice(0, Math.max(0, max)) : allIds;
           const contacts = ids.length
             ? await svc.batchReadContacts(ids, mergeProps(HUBSPOT_CONTACT_ATTRIBUTION_PROPS, args?.properties))
             : [];
+          if (ids.length < allIds.length) return { success: true, deal_id: String(dealId), contacts, contacts_cut: true };
           return { success: true, deal_id: String(dealId), contacts };
         }
         default:
