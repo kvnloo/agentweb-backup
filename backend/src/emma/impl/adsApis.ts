@@ -2392,6 +2392,10 @@ function audienceRowKey(hashedRow: string[]): string {
  * `resolveOrCreateSeedAudience` (confirmed by whole-backend grep) — moved
  * alongside it as a plain, non-exported module function.
  */
+/** Largest seed-audience CSV fetched from a caller's URL, and how long the fetch may take. */
+const SEED_CSV_MAX_BYTES = 50 * 1024 * 1024;
+const SEED_CSV_TIMEOUT_MS = 60_000;
+
 async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
   // Greptile finding: this is a server-side fetch of a caller-supplied URL
   // with no destination restriction — a classic SSRF vector (cloud metadata
@@ -2411,13 +2415,25 @@ async function fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
   // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
   // maxRedirects:0 makes axios surface a redirect as an error instead —
   // same defense already used by routes/crm.ts's load-from-url path.
-  const response = await axios.get(csvUrl, {
-    maxRedirects: 0,
-    lookup: (_hostname: string, options: any, callback: any) => {
-      if (typeof options === 'function') callback = options;
-      callback(null, address, family);
-    },
-  } as any);
+  // ENG-2840: bounded too. With no size cap and no timeout, an endless or very slow body was held in memory without limit.
+  let response: any;
+  try {
+    response = await axios.get(csvUrl, {
+      maxRedirects: 0,
+      timeout: SEED_CSV_TIMEOUT_MS,
+      maxContentLength: SEED_CSV_MAX_BYTES,
+      maxBodyLength: SEED_CSV_MAX_BYTES,
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        callback(null, address, family);
+      },
+    } as any);
+  } catch (err: any) {
+    if (/maxContentLength|maxBodyLength|too large/i.test(String(err?.message || ''))) {
+      throw new Error(`csv_url: the file is larger than ${SEED_CSV_MAX_BYTES / (1024 * 1024)} MB, the most a seed audience CSV may be`);
+    }
+    throw err;
+  }
   if (Array.isArray(response.data)) {
     return response.data;
   }
