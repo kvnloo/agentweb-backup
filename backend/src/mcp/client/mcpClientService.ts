@@ -11,6 +11,7 @@ import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
 import { McpOAuthClientProvider, getServerConfig } from "./mcpOAuthClientProvider";
 import { buildMcpToolTelemetry } from "./mcpToolTelemetry";
+import { buildStdioChildEnv } from "./stdioChildEnv";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -1435,7 +1436,8 @@ export class McpClientService {
     return new StdioClientTransport({
       command: resolvedCommand,
       args: resolvedArgs,
-      env: { ...process.env, ...resolvedEnv } as Record<string, string>
+      // ENG-3187: never hand a child the backend's secrets; only an allowlist plus its own config env.
+      env: buildStdioChildEnv(process.env, resolvedEnv),
     });
   }
 
