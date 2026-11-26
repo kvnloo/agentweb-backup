@@ -1712,6 +1712,10 @@ mcpToolRegistry.register({
     // Only update/delete remain blanket-rejected — add graduated out under
     // ENG-1557 v1. Still reject ANY present client_id (not just non-empty
     // strings — CodeRabbit, PR #2651) rather than silently falling through.
+    // status_note belongs to update only: anywhere else it would be dropped silently and an agent would think the note was kept.
+    if (args.status_note !== undefined && args.status_note !== null && args.action !== 'update') {
+      throw new Error(`manage_leads ${args.action}: status_note goes only with action "update" and a status change. Nothing was changed.`);
+    }
     const isRejectedWrite = (args.action === 'update' || args.action === 'delete') && hasClientId;
     if (isRejectedWrite) {
       throw new Error(
@@ -1720,10 +1724,6 @@ mcpToolRegistry.register({
     }
     if (args.action === 'add' && hasClientId) {
       return executeCrossAccountLeadAdd(args, context);
-    }
-    // status_note belongs to update only: anywhere else it would be dropped silently and an agent would think the note was kept.
-    if (args.status_note !== undefined && args.status_note !== null && args.action !== 'update') {
-      throw new Error(`manage_leads ${args.action}: status_note goes only with action "update" and a status change. Nothing was changed.`);
     }
     const isWriteAction = args.action === 'add' || args.action === 'update' || args.action === 'delete';
     const c = isWriteAction ? ctx(context) : await resolveClientScopedContext(context, args.client_id, 'manage_leads');
