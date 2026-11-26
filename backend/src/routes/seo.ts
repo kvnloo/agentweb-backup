@@ -152,8 +152,8 @@ router.get("/metrics", async (req, res) => {
     // Resolve the effective analytics config (org owner's when org sharing is on).
     const resolved = await resolveAnalyticsConfig(user);
     // Log-only (sharedGoogleAudit.ts): these ids were saved with a format check only and are read through the shared service account.
-    auditSharedGoogleRead({ kind: 'ga4', userId, ids: resolved.properties.map((p) => p.propertyId), source: 'GET /api/seo/metrics' });
-    auditSharedGoogleRead({ kind: 'gsc', userId, ids: resolved.seoDomains, source: 'GET /api/seo/metrics' });
+    auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user.orgId, configSource: resolved?.source, ids: (resolved?.properties ?? []).map((p: any) => p?.propertyId), source: 'GET /api/seo/metrics' });
+    auditSharedGoogleRead({ kind: 'gsc', userId, orgId: user.orgId, configSource: resolved?.source, ids: resolved?.seoDomains ?? [], source: 'GET /api/seo/metrics' });
 
     // Check if effective config has SEO domains or a GA property configured.
     // When ?domain= is passed (e.g. from a landing page link) we still proceed so the
@@ -476,6 +476,8 @@ router.get("/metrics", async (req, res) => {
         const alreadyHas = gaProperties.some((p: any) => p.propertyId === mapping.ga4PropertyId);
         if (!alreadyHas) {
           gaProperties = [...gaProperties, { propertyId: mapping.ga4PropertyId, label: mapping.gscDomain }];
+          // Log-only (sharedGoogleAudit.ts): the platform's own landing-page property, read for the host named in ?domain=.
+          auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user.orgId, ids: [mapping.ga4PropertyId], source: 'GET /api/seo/metrics ?domain (landing page property)' });
         }
       }
     }
@@ -1127,7 +1129,7 @@ router.get("/product-metrics", async (req, res) => {
 
     // Resolve the effective analytics config (org owner's when org sharing is on).
     const resolved = await resolveAnalyticsConfig(user);
-    if (resolved.primaryPropertyId) auditSharedGoogleRead({ kind: 'ga4', userId, ids: [resolved.primaryPropertyId], source: 'GET /api/seo/product-metrics' });
+    if (resolved.primaryPropertyId) auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user?.orgId, configSource: resolved.source, ids: [resolved.primaryPropertyId], source: 'GET /api/seo/product-metrics' });
 
     // Check if effective config has a product domain and GA property configured
     if (!resolved.productDomain || !resolved.primaryPropertyId) {
