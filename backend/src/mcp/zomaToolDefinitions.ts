@@ -86,7 +86,7 @@ export function zomaToolDefinitions(google: boolean = googleToolkitEnabled()) {
     {
       name: 'zoma_status',
       description:
-        "Start here. Checks the user's Zoma setup (AgentWeb login, how familiar they are with ads, connected Meta ad account, payment method on file) and returns the next step with a direct link. The first step is a question: ask the user \"How familiar are you with ads?\" and call again with ads_experience set to their answer. Reads work without a payment method; changes to ads need both a payment method and a connected Meta ad account. Call this when the user asks to set up Zoma, and again after they say they finished a step.",
+        "Start here. Checks the user's Zoma setup (AgentWeb login, how familiar they are with ads, connected Meta ad account, and a payment method only when one is required at setup) and returns the next step with a direct link. The first step is a question: ask the user \"How familiar are you with ads?\" and call again with ads_experience set to their answer. Reads work without a payment method; changes to ads need a connected Meta ad account, plus a payment method only when the checklist lists one. payment.required false means no card is needed at this step: never tell the user a payment method is on file unless the checklist says so. Call this when the user asks to set up Zoma, and again after they say they finished a step.",
       inputSchema: {
         type: 'object',
         properties: {
