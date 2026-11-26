@@ -13,6 +13,7 @@ import {
   testGaProperty,
 } from "../services/seoService";
 import { resolveAnalyticsConfig, resolveConfigTarget } from "../services/analyticsConfigResolver";
+import { auditSharedGoogleRead } from "../services/sharedGoogleAudit";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 
@@ -150,6 +151,9 @@ router.get("/metrics", async (req, res) => {
 
     // Resolve the effective analytics config (org owner's when org sharing is on).
     const resolved = await resolveAnalyticsConfig(user);
+    // Log-only (sharedGoogleAudit.ts): these ids were saved with a format check only and are read through the shared service account.
+    auditSharedGoogleRead({ kind: 'ga4', userId, ids: resolved.properties.map((p) => p.propertyId), source: 'GET /api/seo/metrics' });
+    auditSharedGoogleRead({ kind: 'gsc', userId, ids: resolved.seoDomains, source: 'GET /api/seo/metrics' });
 
     // Check if effective config has SEO domains or a GA property configured.
     // When ?domain= is passed (e.g. from a landing page link) we still proceed so the
@@ -1123,6 +1127,7 @@ router.get("/product-metrics", async (req, res) => {
 
     // Resolve the effective analytics config (org owner's when org sharing is on).
     const resolved = await resolveAnalyticsConfig(user);
+    if (resolved.primaryPropertyId) auditSharedGoogleRead({ kind: 'ga4', userId, ids: [resolved.primaryPropertyId], source: 'GET /api/seo/product-metrics' });
 
     // Check if effective config has a product domain and GA property configured
     if (!resolved.productDomain || !resolved.primaryPropertyId) {
