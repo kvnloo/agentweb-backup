@@ -25,6 +25,8 @@ export async function getFathomAccessToken(userId: string): Promise<string | nul
         client_secret: fathomConfig.clientSecret,
       }).toString(), {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        // ENG-2840 (W2-9): a refresh that never answers must not hold the caller open; on a timeout the catch below keeps the stored token.
+        timeout: 30_000,
       });
 
       const { access_token, refresh_token, expires_in } = response.data as {

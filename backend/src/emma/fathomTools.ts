@@ -23,6 +23,12 @@ const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
  */
 const FATHOM_MAX_PAGES = 20;
 
+/**
+ * ENG-2840 (W2-9): each Fathom request gives up after 30 s. Without it a request that never answers held the call (and the
+ * MCP route that runs this tool) open with no bound. With it, fathom_get_meetings takes at most 20 pages x 30 s.
+ */
+export const FATHOM_REQUEST_TIMEOUT_MS = 30_000;
+
 // ── fathom_get_meetings ──────────────────────────────────────────────────────
 
 emmaToolRegistry.register({
@@ -84,6 +90,7 @@ emmaToolRegistry.register({
         const url = `${FATHOM_API_BASE}/meetings?${params.toString()}`;
         const response = await axios.get(url, {
           headers: { 'Authorization': `Bearer ${accessToken}` },
+          timeout: FATHOM_REQUEST_TIMEOUT_MS,
         });
 
         // Fathom API returns { items: [...], limit, next_cursor }
@@ -240,6 +247,7 @@ emmaToolRegistry.register({
       const url = `${FATHOM_API_BASE}/recordings/${args.recording_id}/transcript`;
       const response = await axios.get(url, {
         headers: { 'Authorization': `Bearer ${accessToken}` },
+        timeout: FATHOM_REQUEST_TIMEOUT_MS,
       });
 
       const data = response.data as any;
