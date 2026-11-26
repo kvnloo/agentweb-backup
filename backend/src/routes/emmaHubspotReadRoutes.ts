@@ -10,17 +10,37 @@
  * Answers:
  *  - `{ success: true, account, entity_type, action, result }`: `account` says which connection answered (`own`, `org_shared` or
  *    `lead_list_token`); `result` is the handler's answer without `success`.
- *  - `{ success: false, message }` (HTTP 200) when the handler refused or HubSpot answered an error: a short text built here from the
- *    HubSpot status, or the handler's own message (already redacted by the handler; control characters and token-shaped runs are removed
- *    again here, and it is cut to 300 characters). HubSpot's raw error body is never passed on.
+ *  - `{ success: false, message }` (HTTP 200) when the handler refused or HubSpot answered an error: a fixed text chosen here from the
+ *    HubSpot status, or (no status: Emma's own account, sign-in and timeout errors) from the kind of error; the handler's raw `err.message`
+ *    is never passed on. The one free text kept is HubSpot's own `message` on a 400 (redacted by the handler, cleaned again and cut here).
+ *  - HTTP 403 with LinkedIn's fixed text when the caller is an evaluation sandbox whose denied tool classes cover this tool: Emma refuses
+ *    that through her registry, and this route calls her implementation directly, so it applies the check itself.
  *  - HTTP 500 with a fixed text on anything unexpected.
  */
 import type { Router, Request, Response } from 'express';
 import type { AuthenticatedRequest } from '../middleware/auth';
 import { HubspotReadArgsError, HUBSPOT_DEAL_CONTACTS_MAX, validateHubspotReadArgs } from '../utils/hubspotReadArgs';
+import { EvaluationDenied, enforceEvaluationTool } from '../services/evaluationPolicy';
 
 const MAX_MESSAGE_CHARS = 300;
 const FAILED_TEXT = 'The HubSpot read failed. Try again later.';
+const SANDBOX_TEXT = 'This tool is not available in this sandbox workspace';
+const RECONNECT = 'Reconnect HubSpot in Settings → Connected Accounts.';
+
+/**
+ * Fixed texts for a refusal without an HTTP status (Emma's own errors: no account, several accounts, an account id not found, a sign-in
+ * that needs reconnecting, Marketing Hub missing, a timeout). Matched on the kind of error; the error's own words are never passed on.
+ */
+const NO_STATUS_TEXTS: Array<[RegExp, string]> = [
+  [/multiple hubspot accounts/i, 'Several HubSpot accounts are connected: pass account_id (from list_connected_accounts).'],
+  [/hubspot account ".*" not found/i, 'That account_id is not one of your HubSpot accounts or one shared with your organization. Use an id from list_connected_accounts.'],
+  [/no hubspot account connected|hubspot account not connected/i, `No HubSpot account is connected. Connect HubSpot in Settings → Connected Accounts.`],
+  [/needs to be reconnected|no refresh token|reconnect your hubspot/i, `The HubSpot sign-in needs to be renewed. ${RECONNECT}`],
+  [/does not have Marketing Hub/i, 'This HubSpot portal does not have Marketing Hub, so it cannot read this object. Reconnecting will not change that.'],
+  [/authorised for CRM access only/i, `This HubSpot connection was granted CRM access only, so it cannot read this Marketing Hub object. ${RECONNECT} Choose the marketing option.`],
+  [/no deal stage matches/i, 'No deal stage matches deal_stage. Use DEALS LIST_PIPELINES to see the stage ids and labels.'],
+  [/timeout|timed out|ECONNABORTED|ETIMEDOUT/i, 'HubSpot did not answer in time. Try again later.'],
+];
 
 export type HubspotAccountSource = 'own' | 'org_shared' | 'lead_list_token';
 
@@ -50,7 +70,7 @@ export function refusalMessage(result: Record<string, any>): string {
   const status = typeof result.status === 'number' && Number.isInteger(result.status) ? result.status : null;
   const said = cleanHubspotText(result.error);
   if (status === 403) return said || 'HubSpot denied access. Check the connection\'s permissions and the portal\'s HubSpot plan.';
-  if (status === 401) return 'HubSpot did not accept the connection\'s sign-in (HTTP 401). Reconnect HubSpot in Settings → Connected Accounts.';
+  if (status === 401) return `HubSpot did not accept the connection's sign-in (HTTP 401). ${RECONNECT}`;
   if (status === 404) return 'HubSpot found nothing at that id (HTTP 404). Check the id: use one HubSpot returned in a LIST.';
   if (status === 429) return 'HubSpot\'s rate limit for this portal was reached (HTTP 429); it is shared by everyone using the portal. Try again in a minute.';
   if (status !== null && status >= 500) return `HubSpot could not answer (HTTP ${status}). Try again later.`;
@@ -58,7 +78,8 @@ export function refusalMessage(result: Record<string, any>): string {
     const hubspot = cleanHubspotText(result.hubspotError && typeof result.hubspotError === 'object' ? (result.hubspotError as any).message : undefined);
     return `HubSpot refused the request (HTTP ${status})${hubspot ? `: ${hubspot}` : '.'}`;
   }
-  return said || 'The HubSpot read was refused.';
+  const raw = typeof result.error === 'string' ? result.error : '';
+  return NO_STATUS_TEXTS.find(([re]) => re.test(raw))?.[1] ?? FAILED_TEXT;
 }
 
 export function registerHubspotReadRoutes(router: Router): void {
@@ -75,6 +96,7 @@ export function registerHubspotReadRoutes(router: Router): void {
     }
 
     try {
+      await enforceEvaluationTool(callerId, 'call_hubspot_api');
       const { handleHubspotApi } = await import('../emma/impl/adsCrmApis');
       let served: ReturnType<typeof describeServingAccount> = null;
       const result = await handleHubspotApi(callerId, args, {
@@ -87,6 +109,7 @@ export function registerHubspotReadRoutes(router: Router): void {
       void _success;
       return res.json({ success: true, account: served, entity_type: args.entity_type, action: args.action, result: rest });
     } catch (err: any) {
+      if (err instanceof EvaluationDenied) return res.status(403).json({ message: SANDBOX_TEXT });
       console.error('[emma hubspot-read] failed:', cleanHubspotText(err?.message));
       return res.status(500).json({ message: FAILED_TEXT });
     }
