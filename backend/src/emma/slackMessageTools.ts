@@ -34,11 +34,12 @@ async function resolveChannelForUser(
       if (!args.channel_id && !args.channel_name) {
         return { error: NO_CHANNEL_SPECIFIED_ERROR };
       }
+      // One answer for "no such channel" and "not yours": a channel name is resolved against every channel the bot is in, so a
+      // different answer would tell the caller which other clients' channels exist.
+      const notAllowed = { error: `Channel is not in your configured Slack channels. Allowed channels: ${allowed.join(', ')}.` };
       const resolved = await resolveChannelId(args.channel_id, args.channel_name);
-      if ('error' in resolved) return resolved;
-      if (!allowed.includes(resolved.id)) {
-        return { error: `Channel is not in your configured Slack channels. Allowed channels: ${allowed.join(', ')}.` };
-      }
+      if ('error' in resolved) return notAllowed;
+      if (!allowed.includes(resolved.id)) return notAllowed;
       return resolved;
     }
   }
@@ -248,12 +249,13 @@ emmaToolRegistry.register({
       required: ['thread_ts'],
     },
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context: any = {}) => {
     if (!args.thread_ts) {
       return { success: false, error: 'thread_ts is required.' };
     }
 
-    const resolved = await resolveChannelId(args.channel_id, args.channel_name);
+    // Scoped exactly like slack_get_recent_messages: before, any session could read any thread in any channel the bot is in.
+    const resolved = await resolveChannelForUser(args, context);
     if ('error' in resolved) return { success: false, error: resolved.error };
 
     const allReplies = await getThreadReplies(resolved.id, args.thread_ts);
