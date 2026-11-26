@@ -67,7 +67,7 @@ describe('scan_website_links', () => {
     const many = Array.from({ length: SCAN_MAX_LIST_ENTRIES }, (_, i) => ({ url: longUrl(i), kind: 'internal', status: 404, foundOn: Array(5).fill(longUrl(0)) }));
     mockCrawl.mockResolvedValueOnce(scanResult({ brokenLinks: many, brokenLinkCount: many.length }));
     const r = await call('scan_website_links', { url: 'https://example.com/' });
-    expect(Buffer.byteLength(r.content[0].text)).toBeLessThanOrEqual(SCAN_MAX_ANSWER_BYTES + 1000);
+    expect(Buffer.byteLength(r.content[0].text)).toBeLessThanOrEqual(SCAN_MAX_ANSWER_BYTES);
     const out = JSON.parse(r.content[0].text);
     expect(out.broken_links.length).toBeGreaterThan(0);
     expect(out.broken_links.length).toBeLessThan(SCAN_MAX_LIST_ENTRIES);
