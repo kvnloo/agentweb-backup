@@ -1,10 +1,12 @@
 /**
  * Keeps each customer's view of the PLATFORM's own landing-page analytics to the customer's own landing pages.
  *
- * Landing pages deploy onto platform domains (managed `*.agentwebforms.com` subdomains, audit pages on agentweb.pro). Their traffic is
- * tracked in the platform's own GA4 properties and Search Console domain properties (`getLandingPagesConfig`), and deploying a page adds
- * those properties to the deployer's analytics config so their traffic shows up. Those properties hold EVERY customer's landing-page
- * traffic, so any read of them through the shared service account must be limited to the caller's own pages:
+ * Customers' landing pages deploy onto managed `*.agentwebforms.com` subdomains (MANAGED_LANDING_BASE). Their traffic is tracked in the
+ * platform's own GA4 property and Search Console domain property for that base (`getLandingPagesConfig`), and deploying a page adds them to
+ * the deployer's analytics config so their traffic shows up. Those hold EVERY customer's landing-page traffic, so any read of them through
+ * the shared service account must be limited to the caller's own pages. Only the mappings for the managed base (and its subdomains) are
+ * scoped: other entries of the config (the audit pages on agentweb.pro, AgentWeb's own domain) hold AgentWeb's own pages, which customers
+ * cannot deploy to, and scoping them would cut AgentWeb's own site analytics:
  *  - GA4: `scopeGaClient` wraps the Data API client; a report on a platform property gets an extra dimension filter (AND) that keeps only
  *    the caller's own locations (a host, or a host and a path prefix);
  *  - Search Console: `gscScopeFilter` gives the extra `page` filter (includingRegex) for a platform domain property;
@@ -15,8 +17,10 @@
  * subdomains and custom domains: the whole host), plus each own non-archived landing page's live URL (customDomainUrl, else deployedUrl):
  * its host when that host is owned, or is a project's own `*.vercel.app` host; otherwise, on a platform domain, only its host AND path
  * prefix (a shared platform host is never claimed whole). A read failure of these lists fails closed (no own location). Cached 5 minutes
- * per caller. The platform ids are cached 10 minutes; when they have never loaded, platform properties cannot be recognised (the reads
- * behave as before) - getLandingPagesConfig answers null rather than throwing, and the last known list is kept.
+ * per caller (a failed read is not cached). The platform ids are cached 10 minutes; the managed base's Search Console domain is always
+ * recognised, but its GA4 property id comes only from the config: when the config has never loaded (getLandingPagesConfig answers null
+ * rather than throwing) that property cannot be recognised and an error is logged on every attempt (one a minute) so the gap is visible.
+ * GA4 ids are compared without a `properties/` prefix or leading zeros.
  */
 import { BetaAnalyticsDataClient } from "@google-analytics/data";
 
@@ -34,10 +38,12 @@ const LOCATIONS_CACHE_MAX = 2000;
 /** More locations than this are cut (the caller sees fewer of their own pages; never another customer's). */
 export const MAX_LOCATIONS = 100;
 const NO_LOCATION_HOST = "no-own-landing-page.invalid";
+/** The managed landing-page base (customDomainService SUBDOMAIN_BASE; a test keeps the two equal). */
+export const MANAGED_LANDING_BASE = "agentwebforms.com";
 
 const platform: { ga4: Set<string>; gsc: Set<string>; at: number; loading: Promise<void> | null } = {
   ga4: new Set(),
-  gsc: new Set(),
+  gsc: new Set([MANAGED_LANDING_BASE]),
   at: 0,
   loading: null,
 };
@@ -47,7 +53,7 @@ const locationsCache = new Map<string, { at: number; locations: OwnLocation[] }>
 /** Tests only. */
 export function resetLandingAnalyticsScopeForTest(): void {
   platform.ga4 = new Set();
-  platform.gsc = new Set();
+  platform.gsc = new Set([MANAGED_LANDING_BASE]);
   platform.at = 0;
   platform.loading = null;
   platformKnown = false;
@@ -62,6 +68,11 @@ function hostMatchesDomain(host: string, domain: string): boolean {
   return !!host && !!domain && (host === domain || host.endsWith(`.${domain}`));
 }
 
+/** A GA4 property id as GA4 resolves it: no `properties/` prefix, no padding, no leading zeros ("0999" and "999" are one property). */
+export function normaliseGa4PropertyId(value: unknown): string {
+  return String(value ?? "").trim().replace(/^properties\//, "").trim().replace(/^0+(?=\d)/, "");
+}
+
 async function loadPlatformIds(): Promise<void> {
   if (platform.loading) return platform.loading;
   if (platform.at !== 0 && Date.now() - platform.at < (platformKnown ? PLATFORM_TTL_MS : PLATFORM_RETRY_MS)) return;
@@ -69,19 +80,29 @@ async function loadPlatformIds(): Promise<void> {
     try {
       const { getLandingPagesConfig } = await import("../utils/secretsManager");
       const config: any = await getLandingPagesConfig();
-      if (!config || typeof config !== "object") return;
       const ga4 = new Set<string>();
-      const gsc = new Set<string>();
-      for (const m of [config, ...(Array.isArray(config.additionalDomains) ? config.additionalDomains : [])]) {
-        if ((typeof m?.ga4PropertyId === "string" && m.ga4PropertyId.trim()) || typeof m?.ga4PropertyId === "number") ga4.add(String(m.ga4PropertyId).trim());
-        if (typeof m?.gscDomain === "string" && m.gscDomain.trim()) gsc.add(bareDomain(m.gscDomain));
+      const gsc = new Set<string>([MANAGED_LANDING_BASE]);
+      if (config && typeof config === "object") {
+        for (const m of [config, ...(Array.isArray(config.additionalDomains) ? config.additionalDomains : [])]) {
+          const domain = typeof m?.gscDomain === "string" ? bareDomain(m.gscDomain) : "";
+          // Only the mappings for customer landing pages (the managed base and its subdomains); see the header.
+          if (!hostMatchesDomain(domain, MANAGED_LANDING_BASE)) continue;
+          gsc.add(domain);
+          const id = normaliseGa4PropertyId(m?.ga4PropertyId);
+          if (/^\d+$/.test(id)) ga4.add(id);
+        }
       }
-      if (ga4.size === 0 && gsc.size === 0) return;
+      if (ga4.size === 0) {
+        if (!platformKnown) {
+          console.error("[landingAnalyticsScope] the platform landing-page GA4 property could not be loaded (LandingPages config); reads of it are not limited to the caller's own pages until it loads");
+        }
+        return;
+      }
       platform.ga4 = ga4;
       platform.gsc = gsc;
       platformKnown = true;
-    } catch {
-      // unknown: keep the last known ids
+    } catch (err: any) {
+      if (!platformKnown) console.error("[landingAnalyticsScope] could not load the platform landing-page ids:", err?.message || err);
     } finally {
       platform.at = Date.now();
       platform.loading = null;
@@ -140,8 +161,9 @@ async function loadOwnLocations(userId: string, orgId: string | undefined): Prom
     }
     locations = [...[...hosts].map((host) => ({ host })), ...[...paths.values()].filter((p) => !hosts.has(p.host))].slice(0, MAX_LOCATIONS);
   } catch (err: any) {
+    // Fail closed for this read, and do not remember the failure (one throttled read must not blank the next five minutes).
     console.error("[landingAnalyticsScope] could not read the caller's landing pages; platform analytics read as empty:", err?.message || err);
-    locations = [];
+    return [];
   }
   if (locationsCache.size >= LOCATIONS_CACHE_MAX) locationsCache.clear();
   locationsCache.set(cacheKey, { at: Date.now(), locations });
@@ -170,7 +192,7 @@ export function createLandingAnalyticsScope(user: { userId?: unknown; orgId?: un
   return {
     async isPlatformGa4(propertyId) {
       await loadPlatformIds();
-      return platform.ga4.has(String(propertyId ?? "").replace(/^properties\//, "").trim());
+      return platform.ga4.has(normaliseGa4PropertyId(propertyId));
     },
     async isPlatformGscSite(siteUrl) {
       // A property for a subdomain of a platform domain is the platform's too (its verification can come from the domain property).
