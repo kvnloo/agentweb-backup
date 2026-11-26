@@ -1,0 +1,3 @@
+## ENG-3195: zoma_status no longer claims a card is on file when none is required (2026-11-26)
+
+`ZOMA_REQUIRE_PAYMENT_METHOD` is unset in prod by design (ENG-3131 asks for the card at first publish), and while unset `hasPaymentMethod` returns true without looking for a card. `formatZomaStatus` therefore ticked "[x] Payment method on file" for brand-new accounts with no card (seen in the Nov 26 prod signup test, relayed by Claude as "Payment: on file"). The checklist now omits the line while no card is required, and readiness carries `payment.required: false`. Card-required mode and the write gate are unchanged. Note for test runs: jest path patterns match the absolute path, so a worktree named after the ticket matches every suite; anchor patterns on `__tests__/(...)`.

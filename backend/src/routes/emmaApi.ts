@@ -6,6 +6,9 @@
 
 import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { registerMeetingEventRoutes } from './emmaMeetingEventRoutes';
+import { registerHubspotReadRoutes } from './emmaHubspotReadRoutes';
+import { registerLinkedInAdsReadRoutes } from './emmaLinkedInAdsReadRoutes';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { MCP_ENGAGEMENTS_PER_LEAD, MCP_ENGAGEMENT_MAX_LEAD_BYTES } from '../utils/agentEngagementLimits';
 import { chatbotDb } from '../services/chatbotService';
@@ -47,6 +50,12 @@ router.use(authenticateToken);
 // Classification lives in EMMA_ROUTE_BUDGET; a route with no entry is treated as
 // metered, and a contract test fails if a registered route is left unclassified.
 router.use(requireEmmaTokenBudget);
+
+// ENG-2840 (W2-9): provider reads for the MCP tools of the same names. Each route re-checks its arguments and calls Emma's own code as
+// req.user only (routes/emma*Routes.ts).
+registerMeetingEventRoutes(router);
+registerHubspotReadRoutes(router);
+registerLinkedInAdsReadRoutes(router);
 
 // ─── Lazy service imports ───────────────────────────────────────────────────
 
