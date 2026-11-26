@@ -519,9 +519,9 @@ describe('a memory whose text looks like JSON is read back exactly as it was sav
     expect(listed.json.memories[0].content).toBe(jsonText);
   });
 
-  it('the sanitizer still removes internal ids from the tools it covers (this exemption is only for the memory tools)', async () => {
+  it('the sanitizer still removes internal ids from the tools it covers (the exemption is only for the memory tools and the own-file read)', async () => {
     const { shouldSanitizePublicResponse, OWN_CONTENT_TOOL_NAMES } = await import('../mcp/server/publicResponseSanitizer');
-    expect([...OWN_CONTENT_TOOL_NAMES].sort()).toEqual(['delete_memory', 'delete_org_memory', 'list_memories', 'save_memory', 'save_org_memory']);
+    expect([...OWN_CONTENT_TOOL_NAMES].sort()).toEqual(['delete_memory', 'delete_org_memory', 'list_memories', 'read_file_content', 'save_memory', 'save_org_memory']);
     expect(shouldSanitizePublicResponse('manage_leads', {}, { externalMcp: true })).toBe(true);
     expect(shouldSanitizePublicResponse('list_memories', {}, { externalMcp: true })).toBe(false);
   });

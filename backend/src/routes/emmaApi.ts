@@ -7,6 +7,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
+import { MCP_ENGAGEMENTS_PER_LEAD, MCP_ENGAGEMENT_MAX_LEAD_BYTES } from '../utils/agentEngagementLimits';
 import { chatbotDb } from '../services/chatbotService';
 import { publishRevalidationForForwardedRun, publishWithdrawnMidFlight, SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
 import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
@@ -635,10 +636,37 @@ router.post('/data-analysis', async (req: Request, res: Response) => {
 
 // ─── File Operations ────────────────────────────────────────────────────────
 
+/**
+ * ENG-2840 (W2-7): a caller may narrow a file read (the MCP tool always does): `own_storage_only: true` refuses any URL that is not a file in
+ * the caller's own AgentWeb storage before anything is fetched, and `max_bytes` (a whole number from 1 to 50 MB) refuses a larger stored file.
+ * Absent (or null), the read is Emma's, as before. Any other value is a 400, never a silent "no limit".
+ */
+const READ_FILE_MAX_BYTES_CEILING = 50 * 1024 * 1024;
+function readFileLimits(body: any): { ownStorageOnly?: true; maxBytes?: number } | string {
+  const limits: { ownStorageOnly?: true; maxBytes?: number } = {};
+  const own = body?.own_storage_only;
+  if (own !== undefined && own !== null) {
+    if (typeof own !== 'boolean') return 'own_storage_only must be true or false';
+    if (own) limits.ownStorageOnly = true;
+  }
+  const max = body?.max_bytes;
+  if (max !== undefined && max !== null) {
+    if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > READ_FILE_MAX_BYTES_CEILING) {
+      return `max_bytes must be a whole number from 1 to ${READ_FILE_MAX_BYTES_CEILING}`;
+    }
+    // The limit is enforced on stored files only (web fetches have their own path), so it is accepted only with own_storage_only.
+    if (!limits.ownStorageOnly) return 'max_bytes applies only together with own_storage_only: true';
+    limits.maxBytes = max;
+  }
+  return limits;
+}
+
 router.post('/read-file', async (req: Request, res: Response) => {
   try {
+    const limits = readFileLimits(req.body);
+    if (typeof limits === 'string') return res.status(400).json({ message: limits });
     const svc = await getAgentModeService();
-    const result = await svc.readFileContent(req.body.file_url, { userId: userId(req) });
+    const result = await svc.readFileContent(req.body.file_url, { userId: userId(req), ...limits });
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -1063,6 +1091,39 @@ router.post('/lead-engagements', async (req: Request, res: Response) => {
     const options = contentFetchOptions(body.max_content_fetches);
     if (options === 'invalid') return res.status(400).json({ message: INVALID_CONTENT_FETCHES });
     res.json(options ? await svc.getLeadEngagements(body.list_id, body.lead_id, userId(req), limit, options) : await svc.getLeadEngagements(body.list_id, body.lead_id, userId(req), limit));
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ENG-2840 (W2-7): record one event on a lead, for the MCP tool `add_lead_engagement`. Emma's own handler (list access checked inside it, a
+// refusal is HTTP 200 `{ success: false, message }`), always with the outside-agent limits: the event is stamped `channel: 'mcp'`, a lead holds
+// at most MCP_ENGAGEMENTS_PER_LEAD of them, a lead whose record is nearly full takes none, and an `idempotency_key` already on the lead
+// records nothing. No owner alert is sent (the CRM route's alert is not called). The shape of `event_data` is checked by the MCP tool.
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_-]{8,64}$/;
+// The key is stored in the event's data, which the "engaged" rule scans for these words.
+const ENGAGED_WORDS_RE = /clicked|replied|received/i;
+router.post('/add-lead-engagement', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  if (!isId(body.list_id) || !isId(body.lead_id)) return res.status(400).json({ message: 'list_id and lead_id are required' });
+  if (typeof body.event_type !== 'string' || body.event_type.trim() === '') return res.status(400).json({ message: 'event_type is required' });
+  if (body.event_data !== undefined && body.event_data !== null && (typeof body.event_data !== 'object' || Array.isArray(body.event_data))) {
+    return res.status(400).json({ message: 'event_data must be an object' });
+  }
+  if (body.event_date !== undefined && body.event_date !== null && typeof body.event_date !== 'string') {
+    return res.status(400).json({ message: 'event_date must be an ISO 8601 date-time' });
+  }
+  if (body.idempotency_key !== undefined && body.idempotency_key !== null && (typeof body.idempotency_key !== 'string' || !IDEMPOTENCY_KEY_RE.test(body.idempotency_key) || ENGAGED_WORDS_RE.test(body.idempotency_key))) {
+    return res.status(400).json({ message: 'idempotency_key must be 8 to 64 letters, digits, - or _, without the words clicked, replied or received' });
+  }
+  try {
+    const svc = await getAgentModeService();
+    res.json(await svc.addLeadEngagement(body.list_id, body.lead_id, body.event_type, userId(req), body.event_data ?? undefined, body.event_date ?? undefined, {
+      channel: 'mcp',
+      maxChannelEvents: MCP_ENGAGEMENTS_PER_LEAD,
+      maxLeadBytes: MCP_ENGAGEMENT_MAX_LEAD_BYTES,
+      ...(typeof body.idempotency_key === 'string' ? { idempotencyKey: body.idempotency_key } : {}),
+    }));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
