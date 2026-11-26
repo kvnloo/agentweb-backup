@@ -11146,9 +11146,12 @@ export class AgentModeService {
 
   public async addLeadEngagement(
     listId: string, leadId: string, eventType: string,
-    userId: string, eventData?: any, eventDate?: string
+    userId: string, eventData?: any, eventDate?: string,
+    agentLimits?: leadsImpl.AgentEngagementLimits,
   ): Promise<any> {
-    return leadsImpl.addLeadEngagement(listId, leadId, eventType, userId, eventData, eventDate);
+    return agentLimits
+      ? leadsImpl.addLeadEngagement(listId, leadId, eventType, userId, eventData, eventDate, agentLimits)
+      : leadsImpl.addLeadEngagement(listId, leadId, eventType, userId, eventData, eventDate);
   }
 
   public async sendEmailToLead(listId: string, leadId: string, userId: string): Promise<any> {

@@ -56,9 +56,19 @@ jest.mock('axios', () => {
   };
 });
 
+// ENG-2840 (W2-8): describeImage now calls isS3Url twice for one URL (the bucket access check, then the download), so the default
+// answers from the URL rather than a fixed `true`; a test's mockReturnValueOnce(false) is taken by the first call and the second
+// call still answers false for a non-S3 URL. The access check itself is covered in mediaVideo.describeImageBucketAccess.test.ts;
+// here it allows, so these tests keep pinning the Gemini download path.
 jest.mock('../utils/s3Utils', () => ({
-  isS3Url: jest.fn().mockReturnValue(true),
+  isS3Url: jest.fn((u: string) => /\.amazonaws\.com\//.test(u)),
+  extractS3KeyFromUrl: jest.fn((u: string) => (/\.amazonaws\.com\//.test(u) ? new URL(u).pathname.slice(1) : null)),
   presignS3Url: jest.fn((u: string) => `${u}?presigned=1`),
+}));
+jest.mock('../emma/impl/toolStorageAccess', () => ({
+  checkOurBucketKeyRead: jest.fn().mockResolvedValue('allow'),
+  TOOL_FILE_REFUSAL_MESSAGE: 'File not found or you do not have access to it.',
+  TOOL_FILE_UNAVAILABLE_MESSAGE: 'Could not check access to the file right now. Please try again in a moment.',
 }));
 
 // describe_image is agent-callable and fed URLs from untrusted content, so the

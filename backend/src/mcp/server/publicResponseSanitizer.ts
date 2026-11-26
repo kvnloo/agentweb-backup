@@ -106,6 +106,8 @@ export function stripInternalIds(value: any, depth = 0, toolName = ''): any {
  */
 export const OWN_CONTENT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'save_memory', 'delete_memory', 'list_memories', 'save_org_memory', 'delete_org_memory',
+  // ENG-2840 (W2-7): the text of the caller's own stored file, in an answer built from fixed fields (fileReadTool.ts).
+  'read_file_content',
 ]);
 
 export function shouldSanitizePublicResponse(
