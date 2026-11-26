@@ -14,10 +14,16 @@
  * and the dateRange numbers, the campaign `status` list), so `impressions&accounts=urn:li:sponsoredAccount:1` would add a RestLI parameter.
  * Every value here is an enum, a whole number in range, digits, or a URN of one exact shape.
  *
+ * Scoped to the checked account only. An org-shared connection lends the owner's token, and that token can see ad accounts that were never
+ * shared (an agency owner's token sees its clients' accounts). So nothing here names an entity outside the checked account:
+ *  - insights take no campaign_groups / campaigns / creatives filters (it is not verified that LinkedIn ANDs those with `accounts=`, so a
+ *    filter id of an unshared account might be answered); the rows are scoped by `accounts=` alone, and a per-campaign or per-ad breakdown
+ *    comes from `pivot` (CAMPAIGN_GROUP, CAMPAIGN, CREATIVE);
+ *  - Emma's POST GET (any post URN the token can read) is not offered; CREATIVE LIST's referenced posts are the checked account's own ads';
+ *  - AD_ACCOUNT LIST answers only the ad accounts the caller has connected or that are shared with them.
+ *
  * Bounds (Emma has none of them): each LinkedIn request gives up after 30 s (the token refresh too); a list reads at most 5 pages and 500
- * elements; CREATIVE LIST expands at most 10 referenced posts (Emma expands every one, all at once). AD_ACCOUNT LIST answers only the ad
- * accounts the caller has connected or that are shared with them: LinkedIn lists every account the token can see, and an org-shared
- * connection lends the owner's token (an agency owner's token sees its clients' accounts).
+ * elements; CREATIVE LIST expands at most 10 referenced posts (Emma expands every one, all at once).
  *
  * Answers are fixed fields, each list cut to about 55 KB of JSON with `truncated: true`. A bad body is a 400; an account that is not the
  * caller's a 404; a LinkedIn 4xx passes with its status and short words (a 401 becomes a 403 that says to reconnect); a LinkedIn 5xx, a
@@ -38,7 +44,8 @@ function bad(message: string): never {
   throw new LinkedInReadArgError(message);
 }
 
-export const LINKEDIN_INSIGHTS_INPUTS = ['account_id', 'pivot', 'dateRange', 'timeGranularity', 'fields', 'campaign_groups', 'campaigns', 'creatives'] as const;
+/** No campaign_groups / campaigns / creatives filters (see the header): they are refused by name. */
+export const LINKEDIN_INSIGHTS_INPUTS = ['account_id', 'pivot', 'dateRange', 'timeGranularity', 'fields'] as const;
 export const LINKEDIN_READ_INPUTS = ['entity_type', 'action', 'account_id', 'params'] as const;
 
 /** Emma's pivot list (emma/tools.ts, call_linkedin_ads_insights_api) plus MEMBER_JOB_TITLE (the service's own example and Zoma's list). */
@@ -53,7 +60,6 @@ export const LINKEDIN_LIST_STATUSES = ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 
 /** Emma's default metrics plus the two fields that say which row is which (dateRange, pivotValues). */
 export const LINKEDIN_DEFAULT_FIELDS = ['impressions', 'clicks', 'costInLocalCurrency', 'dateRange', 'pivotValues'] as const;
 export const LINKEDIN_MAX_FIELDS = 20;
-export const LINKEDIN_MAX_FILTER_IDS = 20;
 /** About three years (one leap day included). */
 export const LINKEDIN_MAX_RANGE_DAYS = 1096;
 export const LINKEDIN_MAX_TARGETING_FACETS = 10;
@@ -61,13 +67,15 @@ export const LINKEDIN_MAX_TARGETING_FACETS = 10;
 export const LINKEDIN_MAX_TARGETING_VALUES = 50;
 export const LINKEDIN_MAX_QUERY_CHARS = 100;
 
-/** The read actions (`ENTITY ACTION`) and the params each takes, by name. Every other pair, every write among them, is refused. */
+/**
+ * The read actions (`ENTITY ACTION`) and the params each takes, by name. Every other pair, every write among them, is refused; so is Emma's
+ * POST GET (see the header).
+ */
 export const LINKEDIN_READ_ACTIONS: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([
   ['AD_ACCOUNT LIST', []],
   ['CAMPAIGN_GROUP LIST', ['status']],
   ['CAMPAIGN LIST', ['status', 'campaign_group_id']],
   ['CREATIVE LIST', ['campaign_id']],
-  ['POST GET', ['post_urn']],
   ['TARGETING LIST_FACETS', []],
   ['TARGETING SEARCH', ['facet', 'query']],
   ['TARGETING ESTIMATE_REACH', ['targeting_include', 'targeting_exclude']],
@@ -75,18 +83,12 @@ export const LINKEDIN_READ_ACTIONS: ReadonlyMap<string, readonly string[]> = new
 
 const DIGITS_RE = /^\d{1,20}$/;
 const FIELD_RE = /^[A-Za-z0-9]{1,64}$/;
-export const LINKEDIN_POST_URN_RE = /^urn:li:(share|ugcPost):\d{1,30}$/;
 export const LINKEDIN_FACET_RE = /^urn:li:adTargetingFacet:[A-Za-z]{1,60}$/;
 /** A targeting value URN (urn:li:geo:103644278, urn:li:staffCountRange:(11,50)); the service percent-encodes it as well. */
 const VALUE_URN_RE = /^urn:li:[A-Za-z]{1,40}:[A-Za-z0-9_(),.:-]{1,120}$/;
 // Control, line-separator, zero-width and bidirectional characters: never part of a search an agent means.
 const UNSAFE_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
 const ACCOUNT_URN = 'urn:li:sponsoredAccount:';
-const FILTER_URNS = {
-  campaign_groups: 'urn:li:sponsoredCampaignGroup:',
-  campaigns: 'urn:li:sponsoredCampaign:',
-  creatives: 'urn:li:sponsoredCreative:',
-} as const;
 
 const absent = (value: unknown) => value === undefined || value === null;
 
@@ -147,24 +149,12 @@ function datePart(field: string, value: unknown): LinkedInDate & { ms: number } 
   return { year, month, day, ms };
 }
 
-function filterIds(field: keyof typeof FILTER_URNS, value: unknown): string[] | undefined {
-  if (absent(value)) return undefined;
-  if (!Array.isArray(value) || value.length > LINKEDIN_MAX_FILTER_IDS) bad(`${field} must be a list of at most ${LINKEDIN_MAX_FILTER_IDS} ids`);
-  if (value.length === 0) return undefined;
-  const ids = value.map((v, i) => idValue(`${field}[${i}]`, v, `a numeric LinkedIn id or ${FILTER_URNS[field]}<id>`, FILTER_URNS[field]));
-  if (new Set(ids).size !== ids.length) bad(`${field} has the same id twice`);
-  return ids;
-}
-
 export interface LinkedInInsightsRequest {
   account_id: string;
   pivot: string;
   timeGranularity: string;
   dateRange: { start: LinkedInDate; end: LinkedInDate };
   fields: string[];
-  campaign_groups?: string[];
-  campaigns?: string[];
-  creatives?: string[];
 }
 
 /** The insights arguments, checked; what the route sends Emma. Checking the result again gives the same result. */
@@ -195,20 +185,13 @@ export function checkInsightsArgs(args: unknown): LinkedInInsightsRequest {
     });
     if (new Set(fields).size !== fields.length) bad('fields has the same name twice');
   }
-  const request: LinkedInInsightsRequest = {
+  return {
     account_id,
     pivot,
     timeGranularity,
     dateRange: { start: { year: start.year, month: start.month, day: start.day }, end: { year: end.year, month: end.month, day: end.day } },
     fields,
   };
-  const campaignGroups = filterIds('campaign_groups', a.campaign_groups);
-  const campaigns = filterIds('campaigns', a.campaigns);
-  const creatives = filterIds('creatives', a.creatives);
-  if (campaignGroups) request.campaign_groups = campaignGroups;
-  if (campaigns) request.campaigns = campaigns;
-  if (creatives) request.creatives = creatives;
-  return request;
 }
 
 export interface LinkedInTargetingClause { facet_urn: string; values: string[] }
@@ -293,12 +276,6 @@ export function checkReadArgs(args: unknown): LinkedInReadRequest {
       if (absent(p.campaign_id)) bad('params.campaign_id is required for CREATIVE LIST');
       params.campaign_id = idValue('params.campaign_id', p.campaign_id, 'a numeric campaign id (digits)');
       break;
-    case 'POST GET': {
-      const urn = p.post_urn;
-      if (typeof urn !== 'string' || !LINKEDIN_POST_URN_RE.test(urn)) bad('params.post_urn is required: urn:li:share:<id> or urn:li:ugcPost:<id>');
-      params.post_urn = urn;
-      break;
-    }
     case 'TARGETING SEARCH': {
       const facet = p.facet;
       if (typeof facet !== 'string' || !LINKEDIN_FACET_RE.test(facet)) bad('params.facet is required: a facet URN such as urn:li:adTargetingFacet:locations');
@@ -351,6 +328,8 @@ export function fitList(items: readonly unknown[], maxBytes = LINKEDIN_MAX_LIST_
 
 /** The fields of an ad account that are answered. */
 const AD_ACCOUNT_FIELDS = ['id', 'name', 'currency', 'status', 'type', 'reference', 'test'] as const;
+export const AD_ACCOUNT_CUT_NOTE = 'The list of ad accounts this LinkedIn sign-in can see was too long to read in full, so some of your accounts may be missing here. '
+  + 'list_connected_accounts lists all of them.';
 /** Where each read action's list is answered (Emma's own keys). */
 export const LINKEDIN_READ_LIST_KEYS: Readonly<Record<string, string>> = {
   'AD_ACCOUNT LIST': 'adAccounts',
@@ -394,8 +373,9 @@ export function readAnswer(request: LinkedInReadRequest, result: any, visibleAcc
       const accounts = (Array.isArray(result?.adAccounts) ? result.adAccounts : [])
         .filter((account: any) => visibleAccountIds.has(normalizeLinkedInAccountId(account?.id)))
         .map((account: any) => pick(account, AD_ACCOUNT_FIELDS));
-      // LinkedIn's own page cut is not passed on: it would tell how many other accounts the token can see.
-      return list(accounts, false);
+      // When the 500-element bound cut the token's list, some of the caller's own accounts may be missing: say so, with no page or count.
+      const cutShort = result?.truncated === true;
+      return list(accounts, cutShort, cutShort ? { note: AD_ACCOUNT_CUT_NOTE } : {});
     }
     case 'CAMPAIGN_GROUP LIST':
       return list(result?.campaignGroups, result?.truncated === true);
@@ -403,10 +383,6 @@ export function readAnswer(request: LinkedInReadRequest, result: any, visibleAcc
       return list(result?.campaigns, result?.truncated === true);
     case 'CREATIVE LIST':
       return list(result?.creatives, result?.truncated === true, { referenced_posts_not_expanded: countOrNull(result?.referencedPostsNotExpanded) ?? 0 });
-    case 'POST GET': {
-      const fit = fitList(plainObject(result?.post) ? [result.post] : []);
-      return { ...head, post: fit.items[0] ?? null, truncated: fit.truncated };
-    }
     case 'TARGETING LIST_FACETS':
       return list(result?.facets, false);
     case 'TARGETING SEARCH':
@@ -522,9 +498,6 @@ export function registerLinkedInAdsReadRoutes(router: Router): void {
         dateRange: request.dateRange,
         timeGranularity: request.timeGranularity,
         fields: request.fields,
-        campaign_groups: request.campaign_groups,
-        campaigns: request.campaigns,
-        creatives: request.creatives,
       }, LINKEDIN_INSIGHTS_ROUTE_BOUNDS);
       res.json({ success: true, ...insightsAnswer(request, result) });
     } catch (err) {
