@@ -1,5 +1,6 @@
 import AWS from 'aws-sdk';
 import { accountFlag } from './journeyProductBackfill';
+import { zomaOpenTesterWindowActive } from './zomaOpenWindow';
 
 const db = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
 const table = () => `${process.env.NODE_ENV === 'development' ? 'Dev-' : ''}AW-Waitlist`;
@@ -136,6 +137,8 @@ export async function zomaSeatExemption(emailInput: string, deps: ZomaSignupDeps
 
 /** Registration-time admission (password + Google): exemptions first, then the capped seat. */
 export async function admitZomaSignup(email: string, deps: ZomaSignupDeps = defaultSignupDeps): Promise<string> {
+  // ENG-2781 option (a): during the open tester window nobody takes a capped seat.
+  if (zomaOpenTesterWindowActive()) return 'approved';
   return (await zomaSeatExemption(email, deps)) ? 'approved' : admitZoma(email);
 }
 

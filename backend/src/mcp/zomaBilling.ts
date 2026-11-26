@@ -30,6 +30,7 @@ import {
 } from '../services/mcpUsageEventsService';
 import { getBackendUrl } from './oauth/authChallenge';
 import { ZomaNotReadyError } from './zomaErrors';
+import { zomaOpenTesterWindowActive } from '../services/zomaOpenWindow';
 
 export const ZOMA_PLAN_PRODUCT_TAG = 'zoma_plan';
 /** Stripe ends a trial that has no payment method a little after trial_end, not at the same second. */
@@ -469,6 +470,8 @@ export async function assertZomaPublishAllowed(
 ): Promise<void> {
   const cfg = deps.config();
   if (!cfg.enabled) return;
+  // ENG-2781 option (a): no billing during the flagged open tester window.
+  if (zomaOpenTesterWindowActive(deps.now())) return;
   let state: ZomaPlanState;
   try {
     state = await getZomaPlanState(userId, deps);
