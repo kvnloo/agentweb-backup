@@ -3301,7 +3301,23 @@ export async function launchRetargetingCampaign(userId: string, args: any, deps:
 //    / callLinkedInAdsInsightsApi
 // ============================================================================
 
-async function getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
+/**
+ * ENG-2840 (W2-9): optional bounds for the read actions, given only by the outside-agent read routes
+ * (routes/emmaLinkedInAdsReadRoutes.ts): the service's page and element caps and per-request timeout, and at most
+ * `maxReferencedPosts` referenced posts expanded by CREATIVE LIST. Emma passes none, and then every call is exactly what it was.
+ */
+export type LinkedInReadBounds = linkedInAdsService.LinkedInRequestBounds & { maxReferencedPosts?: number };
+
+/** A failed LinkedIn read, thrown with the same message as before, carrying LinkedIn's HTTP status for the read routes. */
+function linkedInReadError(result: linkedInAdsService.LinkedInAdsApiResult, fallback: string): Error & { linkedInStatus?: number } {
+  return Object.assign(new Error(result.error || fallback), { linkedInStatus: result.status });
+}
+
+async function getLinkedInAdsCredentials(
+  userId: string,
+  accountId?: string,
+  li: linkedInAdsService.LinkedInAdsReadCalls = linkedInAdsService,
+): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
   const { getAccountsWithOwnerIncludingOrgShared } = await import('../../services/connectedAccountsDb');
   // Include org-shared accounts so a teammate's LinkedIn Ads account that was
   // shared with the org (sharedWithOrg=true) is usable, not just visible. Each
@@ -3348,7 +3364,7 @@ async function getLinkedInAdsCredentials(userId: string, accountId?: string): Pr
   const { getLinkedInAdsConfig } = await import('../../config/integrations');
   const oauthConfig = await getLinkedInAdsConfig();
 
-  const newTokens = await linkedInAdsService.refreshAccessToken(
+  const newTokens = await li.refreshAccessToken(
     cfg.refresh_token,
     oauthConfig.clientId,
     oauthConfig.clientSecret
@@ -3385,27 +3401,31 @@ export async function callLinkedInMarketingApi(
   entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL' | 'CONVERSATION_AD',
   action: string,
   account_id: string,
-  params: any = {}
+  params: any = {},
+  bounds?: LinkedInReadBounds
 ): Promise<any> {
   console.log(`AgentMode: callLinkedInMarketingApi -> ${entity_type} / ${action}`);
 
-  const { accountId, accessToken, organizationUrn, personUrn } = await getLinkedInAdsCredentials(userId, account_id);
+  // The read actions call LinkedIn through `li`: this service itself for Emma (no bounds), the bounded calls for the read routes.
+  const li: linkedInAdsService.LinkedInAdsReadCalls = bounds ? linkedInAdsService.boundedReadCalls(bounds) : linkedInAdsService;
+  const { accountId, accessToken, organizationUrn, personUrn } = await getLinkedInAdsCredentials(userId, account_id, li);
+  const cut = (data: any) => (data?.truncated ? { truncated: true } : {});
 
   switch (entity_type) {
     case 'AD_ACCOUNT': {
       if (action === 'LIST') {
-        const result = await linkedInAdsService.listAdAccounts(accessToken);
-        if (!result.success) throw new Error(result.error || 'Failed to list ad accounts');
-        return { success: true, adAccounts: result.data?.elements || [] };
+        const result = await li.listAdAccounts(accessToken);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list ad accounts');
+        return { success: true, adAccounts: result.data?.elements || [], ...cut(result.data) };
       }
       throw new Error(`Unknown action "${action}" for AD_ACCOUNT`);
     }
 
     case 'CAMPAIGN_GROUP': {
       if (action === 'LIST') {
-        const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId, params);
-        if (!result.success) throw new Error(result.error || 'Failed to list campaign groups');
-        return { success: true, campaignGroups: result.data?.elements || [] };
+        const result = await li.listCampaignGroups(accessToken, accountId, params);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list campaign groups');
+        return { success: true, campaignGroups: result.data?.elements || [], ...cut(result.data) };
       }
       if (action === 'CREATE') {
         const result = await linkedInAdsService.createCampaignGroup(accessToken, accountId, params);
@@ -3425,9 +3445,9 @@ export async function callLinkedInMarketingApi(
 
     case 'CAMPAIGN': {
       if (action === 'LIST') {
-        const result = await linkedInAdsService.listCampaigns(accessToken, accountId, params);
-        if (!result.success) throw new Error(result.error || 'Failed to list campaigns');
-        return { success: true, campaigns: result.data?.elements || [] };
+        const result = await li.listCampaigns(accessToken, accountId, params);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list campaigns');
+        return { success: true, campaigns: result.data?.elements || [], ...cut(result.data) };
       }
       if (action === 'CREATE') {
         const result = await linkedInAdsService.createCampaign(accessToken, accountId, params);
@@ -3448,8 +3468,8 @@ export async function callLinkedInMarketingApi(
     case 'CREATIVE': {
       if (action === 'LIST') {
         if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
-        const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
-        if (!result.success) throw new Error(result.error || 'Failed to list creatives');
+        const result = await li.listCreatives(accessToken, accountId, params.campaign_id);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list creatives');
         const rawCreatives: any[] = result.data?.elements || [];
         // ENG-239: a content.reference creative only carries a bare post URN
         // pointer -- expand it with the referenced post's own fields
@@ -3457,13 +3477,22 @@ export async function callLinkedInMarketingApi(
         // without a manual follow-up POST/GET per creative. A failed read
         // (e.g. deleted post) degrades to the bare creative rather than
         // failing the whole LIST.
+        // ENG-2840: with bounds, only the first `maxReferencedPosts` are expanded (one LinkedIn call each); Emma expands every one.
+        const expandLimit = bounds?.maxReferencedPosts ?? Infinity;
+        let expanded = 0;
+        let notExpanded = 0;
         const creatives = await Promise.all(rawCreatives.map(async (creative) => {
           const postUrn = creative?.content?.reference;
           if (!postUrn) return creative;
-          const postResult = await linkedInAdsService.getPost(accessToken, postUrn);
+          if (expanded >= expandLimit) {
+            notExpanded++;
+            return creative;
+          }
+          expanded++;
+          const postResult = await li.getPost(accessToken, postUrn);
           return postResult.success ? { ...creative, referencedPost: postResult.data } : creative;
         }));
-        return { success: true, creatives };
+        return { success: true, creatives, ...cut(result.data), ...(notExpanded > 0 ? { referencedPostsNotExpanded: notExpanded } : {}) };
       }
       if (action === 'CREATE') {
         if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
@@ -3535,8 +3564,8 @@ export async function callLinkedInMarketingApi(
       }
       if (action === 'GET') {
         if (!params.post_urn) throw new Error('POST GET requires params.post_urn');
-        const result = await linkedInAdsService.getPost(accessToken, params.post_urn);
-        if (!result.success) throw new Error(result.error || 'Failed to get post');
+        const result = await li.getPost(accessToken, params.post_urn);
+        if (!result.success) throw linkedInReadError(result, 'Failed to get post');
         return { success: true, post: result.data };
       }
       throw new Error(`Unknown action "${action}" for POST`);
@@ -3544,14 +3573,14 @@ export async function callLinkedInMarketingApi(
 
     case 'TARGETING': {
       if (action === 'LIST_FACETS') {
-        const result = await linkedInAdsService.listTargetingFacets(accessToken);
-        if (!result.success) throw new Error(result.error || 'Failed to list targeting facets');
+        const result = await li.listTargetingFacets(accessToken);
+        if (!result.success) throw linkedInReadError(result, 'Failed to list targeting facets');
         return { success: true, facets: result.data?.elements || [] };
       }
       if (action === 'SEARCH') {
         if (!params.facet) throw new Error('SEARCH requires facet');
-        const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
-        if (!result.success) throw new Error(result.error || 'Failed to search targeting entities');
+        const result = await li.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
+        if (!result.success) throw linkedInReadError(result, 'Failed to search targeting entities');
         return { success: true, entities: result.data?.elements || [] };
       }
       if (action === 'ESTIMATE_REACH') {
@@ -3561,8 +3590,8 @@ export async function callLinkedInMarketingApi(
         if (!targetingCriteria) {
           throw new Error('ESTIMATE_REACH requires targeting: pass targeting_include (array of { facet_urn, values }) or targeting_criteria.');
         }
-        const result = await linkedInAdsService.getAudienceCount(accessToken, targetingCriteria);
-        if (!result.success) throw new Error(result.error || 'Failed to estimate audience reach');
+        const result = await li.getAudienceCount(accessToken, targetingCriteria);
+        if (!result.success) throw linkedInReadError(result, 'Failed to estimate audience reach');
         return { success: true, audienceCount: result.data };
       }
       throw new Error(`Unknown action "${action}" for TARGETING`);
@@ -3735,13 +3764,16 @@ export async function callLinkedInAdsInsightsApi(
     campaigns?: string[];
     adGroups?: string[];
     creatives?: string[];
-  }
+  },
+  bounds?: LinkedInReadBounds
 ): Promise<any> {
   console.log(`AgentMode: callLinkedInAdsInsightsApi -> pivot=${params.pivot}`);
 
-  const { accountId: resolvedAccountId, accessToken } = await getLinkedInAdsCredentials(userId, account_id);
+  // Same rule as callLinkedInMarketingApi: Emma (no bounds) calls this service exactly as before; the read route passes a timeout.
+  const li: linkedInAdsService.LinkedInAdsReadCalls = bounds ? linkedInAdsService.boundedReadCalls(bounds) : linkedInAdsService;
+  const { accountId: resolvedAccountId, accessToken } = await getLinkedInAdsCredentials(userId, account_id, li);
 
-  const result = await linkedInAdsService.getAdAnalytics(
+  const result = await li.getAdAnalytics(
     accessToken,
     resolvedAccountId,
     params.pivot,
@@ -3751,7 +3783,7 @@ export async function callLinkedInAdsInsightsApi(
     { campaign_group_ids: params.campaign_groups, campaign_ids: params.campaigns, creative_ids: params.creatives }
   );
   if (!result.success) {
-    throw new Error(result.error || 'LinkedIn Ads API request failed');
+    throw linkedInReadError(result, 'LinkedIn Ads API request failed');
   }
   return { success: true, analytics: result.data?.elements || result.data };
 }
