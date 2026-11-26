@@ -18,7 +18,7 @@ export const STDIO_CHILD_ENV_ALLOWLIST: readonly string[] = [
   // Windows equivalents, for local dev.
   'SystemRoot', 'ComSpec', 'PATHEXT', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
 ];
-const ALLOWED_PREFIXES = ['LC_', 'XDG_'];
+export const ALLOWED_PREFIXES: readonly string[] = ['LC_', 'XDG_'];
 
 export function buildStdioChildEnv(
   parentEnv: NodeJS.ProcessEnv,
