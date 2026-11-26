@@ -14,6 +14,7 @@ import {
   processIsAlive,
   withoutBrowserClientMeta,
 } from '../mcp/client/playwrightContainment';
+import { STDIO_CHILD_ENV_ALLOWLIST } from '../mcp/client/stdioChildEnv';
 import { SsrfBlockedError } from '../utils/ssrfGuard';
 
 // The NAMES (never values) the production backend environment held on 2026-11-25, read from Elastic Beanstalk, plus the ones a host adds itself.
@@ -43,6 +44,10 @@ describe('playwrightChildEnv', () => {
     for (const name of PLAYWRIGHT_ENV_ALLOWED_NAMES) {
       expect(playwrightChildEnv({ [name]: `v-${name}`, JWT_SECRET: 'x' })).toEqual({ [name]: `v-${name}` });
     }
+  });
+
+  it('allows at least every name the shared stdio allow-list allows (the two lists must not drift apart)', () => {
+    for (const name of STDIO_CHILD_ENV_ALLOWLIST) expect(PLAYWRIGHT_ENV_ALLOWED_NAMES.has(name)).toBe(true);
   });
 
   it('has nothing on the allow-list that looks like a secret', () => {

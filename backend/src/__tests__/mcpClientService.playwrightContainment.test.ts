@@ -180,10 +180,11 @@ describe('Playwright MCP containment (ENG-3187)', () => {
       expect(cwd).toBeTruthy();
     });
 
-    it('leaves every other stdio server exactly as it was: the whole environment and no working folder', () => {
+    it('gives every other stdio server the shared allow-list environment plus its own, and no working folder of ours', () => {
       makeTransport('other-server', { transport: 'stdio', command: 'node', args: ['server.js'], env: { EXTRA: '1' } });
       const options = transportOptions();
-      expect(options.env.JWT_SECRET).toBe('jwt-value');
+      expect(options.env).not.toHaveProperty('JWT_SECRET');
+      expect(options.env.PATH).toBe(process.env.PATH);
       expect(options.env.EXTRA).toBe('1');
       expect(options).not.toHaveProperty('cwd');
       expect(options.args).toEqual(['server.js']);
@@ -511,7 +512,7 @@ describe('Playwright MCP containment (ENG-3187)', () => {
     });
 
     it('starts the browser server from the contained environment, in its own folder, and remembers the folder by transport', () => {
-      expect(source).toMatch(/env: isPlaywrightMcp\n\s*\? playwrightChildEnv\(process\.env, resolvedEnv, \{ inheritFullEnv: process\.env\[PLAYWRIGHT_INHERIT_ENV_FLAG\] === 'true' \}\)\n\s*: \{ \.\.\.process\.env, \.\.\.resolvedEnv \} as Record<string, string>,\n\s*\.\.\.\(playwrightWorkDir \? \{ cwd: playwrightWorkDir \} : \{\}\),/);
+      expect(source).toMatch(/env: isPlaywrightMcp\n\s*\? playwrightChildEnv\(process\.env, resolvedEnv, \{ inheritFullEnv: process\.env\[PLAYWRIGHT_INHERIT_ENV_FLAG\] === 'true' \}\)\n\s*: buildStdioChildEnv\(process\.env, resolvedEnv\),\n\s*\.\.\.\(playwrightWorkDir \? \{ cwd: playwrightWorkDir \} : \{\}\),/);
       expect(source).toMatch(/if \(playwrightWorkDir\) this\.playwrightTransportDirs\.set\(transport, playwrightWorkDir\);\n\s*return transport;/);
     });
 

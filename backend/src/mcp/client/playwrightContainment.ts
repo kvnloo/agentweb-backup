@@ -27,6 +27,8 @@ export const PLAYWRIGHT_ENV_ALLOWED_NAMES: ReadonlySet<string> = new Set([
   // passed on only because the browser cannot reach the web without it.
   'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
   'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+  // Windows equivalents, for local development (the shared list in stdioChildEnv.ts carries the same ones).
+  'SystemRoot', 'ComSpec', 'PATHEXT', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
 ]);
 const ENV_ALLOWED_PREFIXES = ['LC_', 'XDG_'];
 
