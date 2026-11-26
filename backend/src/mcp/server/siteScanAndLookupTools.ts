@@ -138,7 +138,8 @@ mcpToolRegistry.register({
     // At most SCAN_MAX_LIST_ENTRIES per list, then fewer until the answer fits SCAN_MAX_ANSWER_BYTES (long URLs can make 100 entries large).
     let keep = SCAN_MAX_LIST_ENTRIES;
     let answer = scanAnswer(result!, broken, unverifiable, robots, keep);
-    while (Buffer.byteLength(JSON.stringify(answer)) > SCAN_MAX_ANSWER_BYTES && keep > 0) {
+    // Measured as it is sent (jsonResult pretty-prints).
+    while (Buffer.byteLength(JSON.stringify(answer, null, 2)) > SCAN_MAX_ANSWER_BYTES && keep > 0) {
       keep = Math.floor(keep / 2);
       answer = scanAnswer(result!, broken, unverifiable, robots, keep);
     }
