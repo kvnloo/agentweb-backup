@@ -1226,13 +1226,22 @@ export function validateAndRepairToolArgs(
   // ENG-3189: get_registration_status declares `emails: array`, but models send a
   // comma-separated or quoted-list string ("a@x.com, b@y.com" / "\"a@x.com\", \"b@y.com\"").
   // The type check below rejected those before the tool's own coercion ran.
-  // Extract the addresses into an array; a string with no address is left as-is
-  // so it still surfaces as type_mismatch.
-  if (input.toolName === 'get_registration_status' && typeof repairedArgs.emails === 'string') {
-    const found = repairedArgs.emails.match(/[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g);
-    if (found && found.length > 0) {
-      repairedArgs.emails = found;
-      repairs.push('emails:string_split');
+  // Hand the raw value to the tool's own parser (extractRegistrationStatusEmails
+  // in apiTools.ts) as a string array instead of re-parsing it here, so address
+  // extraction (IDN/punycode domains, display names, {email} objects) and the
+  // `skipped` report for entries with no address live in one place.
+  if (input.toolName === 'get_registration_status') {
+    const raw = repairedArgs.emails;
+    if (typeof raw === 'string' && raw.trim().length > 0) {
+      repairedArgs.emails = [raw];
+      repairs.push('emails:string_wrap');
+    } else if (Array.isArray(raw) && raw.some((entry) => typeof entry !== 'string')) {
+      repairedArgs.emails = raw.map((entry) => {
+        if (typeof entry === 'string') return entry;
+        if (entry && typeof entry === 'object' && typeof (entry as any).email === 'string') return (entry as any).email;
+        return JSON.stringify(entry) ?? String(entry);
+      });
+      repairs.push('emails:entry_stringify');
     }
   }
 

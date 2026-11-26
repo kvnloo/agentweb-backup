@@ -4671,7 +4671,7 @@ Typical prompts this answers:
  * a JSON-encoded array string, or a comma/semicolon/whitespace-separated
  * string — and return trimmed, non-empty strings.
  */
-const REGISTRATION_EMAIL_PATTERN = /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+const REGISTRATION_EMAIL_PATTERN = /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.(?:xn--[A-Za-z0-9-]+|[A-Za-z]{2,})/g;
 
 /**
  * ENG-3189: models pass `emails` as an array, a comma/space-separated string,
@@ -4700,9 +4700,15 @@ export function extractRegistrationStatusEmails(raw: unknown): { emails: string[
           // fall through to address extraction
         }
       }
-      const found = trimmed.match(REGISTRATION_EMAIL_PATTERN);
-      if (found && found.length > 0) emails.push(...found);
-      else if (trimmed.length > 0) skipped.push(value);
+      // Split list separators first so a piece with no address
+      // ("a@x.com, not-an-email") is reported in `skipped`, not dropped.
+      for (const piece of trimmed.split(/[,;\n]+/)) {
+        const part = piece.trim();
+        if (!part) continue;
+        const found = part.match(REGISTRATION_EMAIL_PATTERN);
+        if (found && found.length > 0) emails.push(...found);
+        else skipped.push(part);
+      }
       return;
     }
     if (value && typeof value === 'object' && typeof (value as any).email === 'string') {

@@ -167,6 +167,14 @@ describe('get_registration_status', () => {
     });
   });
 
+  it('keeps punycode (IDN) top-level domains whole', () => {
+    expect(extractRegistrationStatusEmails(['a@domain.xn--p1ai']).emails).toEqual(['a@domain.xn--p1ai']);
+  });
+
+  it('reports a comma-list piece with no address in skipped', () => {
+    expect(extractRegistrationStatusEmails(['a@example.com,not-an-email'])).toEqual({ emails: ['a@example.com'], skipped: ['not-an-email'] });
+  });
+
   it('keeps full addresses with RFC 5322 atext characters (no suffix match)', () => {
     expect(extractRegistrationStatusEmails(['a!b@example.com', 'x=y/z@acme.io']).emails).toEqual([
       'a!b@example.com',
