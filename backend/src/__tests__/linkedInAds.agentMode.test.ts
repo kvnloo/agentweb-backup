@@ -962,8 +962,9 @@ describe('callLinkedInMarketingApi — MEDIA downloads', () => {
 
   it('a blocked address (the guard refuses) uploads nothing', async () => {
     mockFetchCallerUrlBuffer.mockRejectedValueOnce(new Error('That URL cannot be fetched.'));
+    (linkedInAdsService.uploadImageBinary as jest.Mock).mockClear();
     await expect(service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, { image_url: 'http://169.254.169.254/latest/meta-data' })).rejects.toThrow();
-    expect(linkedInAdsService.uploadImageBinary).not.toHaveBeenCalledWith(expect.anything(), Buffer.from('never'), expect.anything());
+    expect(linkedInAdsService.uploadImageBinary).not.toHaveBeenCalled();
   });
 
   it('a file of our bucket that the caller may not read is refused before any read; one they may read is read with a ceiling', async () => {
@@ -976,6 +977,12 @@ describe('callLinkedInMarketingApi — MEDIA downloads', () => {
     mockGetS3ObjectAsBuffer.mockResolvedValueOnce({ buffer: Buffer.from('%PDF'), contentType: 'application/pdf' });
     await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_DOCUMENT', ACCOUNT_ID, { document_url: OUR });
     expect(mockGetS3ObjectAsBuffer).toHaveBeenCalledWith('users/other-user/files/1/abc/secret.png', undefined, 100 * 1024 * 1024);
+  });
+
+  it('a file of our bucket over the ceiling is refused in plain words', async () => {
+    mockCheckKey.mockResolvedValueOnce('allow');
+    mockGetS3ObjectAsBuffer.mockRejectedValueOnce(new Error('decoded image exceeds the 20 MB limit'));
+    await expect(service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, { image_url: OUR })).rejects.toThrow(/larger than 20 MB/);
   });
 
   it('a file over the ceiling is refused in plain words', async () => {

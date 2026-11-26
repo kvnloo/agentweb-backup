@@ -246,6 +246,27 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       }));
     });
 
+    // ENG-2840: the CSV fetch is bounded (an endless or very slow body was held in memory without limit).
+    it('bounds the CSV fetch by size and time, and says so in plain words when the file is too large', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_x', name: 'RankAI Warm List' } } as any); // CREATE
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+      (axios.get as jest.Mock).mockResolvedValueOnce({ data: 'test@example.com,1234567890' });
+      await callResolveOrCreateSeedAudience(USER_ID, ACCOUNT_ID, 'RankAI Warm List', { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' }, { dryRun: false });
+      expect(axios.get).toHaveBeenCalledWith('https://s3.example.com/audience.csv', expect.objectContaining({
+        timeout: 60_000,
+        maxContentLength: 50 * 1024 * 1024,
+        maxBodyLength: 50 * 1024 * 1024,
+      }));
+
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any);
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_y', name: 'Big' } } as any);
+      (axios.get as jest.Mock).mockRejectedValueOnce(new Error('maxContentLength size of 52428800 exceeded'));
+      await expect(callResolveOrCreateSeedAudience(USER_ID, ACCOUNT_ID, 'Big', { type: 'csv', csvUrl: 'https://s3.example.com/big.csv' }, { dryRun: false }))
+        .rejects.toThrow(/larger than 50 MB/);
+    });
+
     // Greptile finding: resolvePinnedPublicAddress validates one DNS answer,
     // but a caller that does its own SEPARATE lookup afterward (axios.get's
     // default behavior) is vulnerable to DNS rebinding — an attacker DNS
