@@ -78,6 +78,14 @@ describe('readGoogleFileById: the shared service account is audited', () => {
     expect(audits()).toEqual([expect.objectContaining({ reason: 'oauth_denied', outcome: 'failed' })]);
   });
 
+  it('the caller\'s own login answers 404 (not a refusal): no fallback and no audit line', async () => {
+    mockOAuth.mockResolvedValue({ __drive: driveReturning('notfound') });
+    const result = await readGoogleFileById(FILE, 'user-3');
+    expect(result).toMatchObject({ success: false, code: 404 });
+    expect(mockServiceAccount).not.toHaveBeenCalled();
+    expect(audits()).toEqual([]);
+  });
+
   it('an audit that cannot be written never changes the read', async () => {
     mockOAuth.mockRejectedValue(new Error('not connected'));
     mockServiceAccount.mockResolvedValue(driveReturning('ok'));

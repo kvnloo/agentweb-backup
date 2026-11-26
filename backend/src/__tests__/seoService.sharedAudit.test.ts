@@ -7,6 +7,7 @@ jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn(async () => 
 jest.mock('../utils/secretsManager', () => ({ getSecret: jest.fn(async () => { throw new Error('no secret in tests'); }) }));
 
 import { fetchGa4KeyEvents, fetchGoogleAnalyticsMetrics, fetchSearchConsoleMetrics } from '../services/seoService';
+import { userDb } from '../services/db';
 
 const resolved = (properties: string[], seoDomains: string[]): any => ({
   properties: properties.map((propertyId) => ({ propertyId, label: propertyId })),
@@ -39,5 +40,18 @@ describe('the analytics readers audit what they read through the shared account'
     const answer = await fetchGa4KeyEvents('user-1', undefined, undefined, resolved([], []));
     expect(answer.message).toMatch(/not configured/i);
     expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ ids: [] }));
+  });
+
+  it('an organization member reading the organization\'s shared config is audited with the organization and the config source', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'member-1', email: 'm@x.test', orgId: 'org-7' });
+    await fetchGoogleAnalyticsMetrics('member-1', '30d', undefined, { ...resolved(['444444444'], []), source: 'org' }).catch(() => undefined);
+    expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ userId: 'member-1', orgId: 'org-7', configSource: 'org', ids: ['444444444'] }));
+  });
+
+  it('a malformed stored property (no id) is passed on as a missing id, never thrown on', async () => {
+    const config = resolved(['555555555'], []);
+    config.properties.push(null);
+    await fetchGa4KeyEvents('user-1', undefined, undefined, config).catch(() => undefined);
+    expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ ids: ['555555555', undefined] }));
   });
 });

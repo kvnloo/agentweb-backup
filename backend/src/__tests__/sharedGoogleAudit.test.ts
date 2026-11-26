@@ -2,11 +2,20 @@
  * Log-only audit of reads through the platform's shared Google service account (services/sharedGoogleAudit.ts). It must write one structured
  * line per resource, never the raw id, and never break the read it describes.
  */
-import { auditSharedGoogleRead, hashShared } from '../services/sharedGoogleAudit';
+const mockLandingConfig = jest.fn();
+jest.mock('../utils/secretsManager', () => ({ getLandingPagesConfig: (...a: any[]) => mockLandingConfig(...a) }));
+
+import { auditSharedGoogleRead, hashShared, resetPlatformIdsForTest } from '../services/sharedGoogleAudit';
 
 let info: jest.SpyInstance;
-beforeEach(() => { info = jest.spyOn(console, 'info').mockImplementation(() => undefined); });
+beforeEach(() => {
+  info = jest.spyOn(console, 'info').mockImplementation(() => undefined);
+  resetPlatformIdsForTest();
+  mockLandingConfig.mockReset();
+  mockLandingConfig.mockResolvedValue(null);
+});
 afterEach(() => info.mockRestore());
+const settle = () => new Promise((resolve) => setImmediate(resolve));
 const lines = () => info.mock.calls.map((c) => JSON.parse(String(c[0])));
 
 describe('hashShared', () => {
@@ -45,11 +54,25 @@ describe('auditSharedGoogleRead', () => {
 
   it('writes nothing for an empty or unusable list, and at most 50 lines for a long one', () => {
     auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: [], source: 's' });
-    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['', null as any, 7 as any], source: 's' });
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['', null, undefined, {}, Number.NaN], source: 's' });
     auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: undefined as any, source: 's' });
     expect(info).not.toHaveBeenCalled();
     auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: Array.from({ length: 80 }, (_, i) => `p${i}`), source: 's' });
     expect(info).toHaveBeenCalledTimes(50);
+  });
+
+  it('a GA4 property id stored as a number is audited like its text form', () => {
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: [123456789], source: 's' });
+    expect(lines()).toEqual([expect.objectContaining({ idHash: hashShared('123456789') })]);
+  });
+
+  it('carries the organization and the config the ids came from, when given', () => {
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'member-1', orgId: 'org-9', configSource: 'org', ids: ['111'], source: 's' });
+    auditSharedGoogleRead({ kind: 'drive-file', userId: 'solo', orgId: null, ids: ['f'], source: 's' });
+    const [member, solo] = lines();
+    expect(member).toMatchObject({ orgId: 'org-9', configSource: 'org' });
+    expect(solo.orgId).toBeUndefined();
+    expect(solo.configSource).toBeUndefined();
   });
 
   it('never throws, even when logging itself fails', () => {
@@ -57,5 +80,33 @@ describe('auditSharedGoogleRead', () => {
     expect(() => auditSharedGoogleRead({ kind: 'drive-file', userId: 'u', ids: ['x'], source: 's' })).not.toThrow();
     const circular: any = {}; circular.self = circular;
     expect(() => auditSharedGoogleRead({ kind: 'ga4', userId: circular, ids: ['x'], source: 's' })).not.toThrow();
+  });
+});
+
+describe('the platform\'s own landing-page analytics ids are marked', () => {
+  it('once the landing-page config has loaded, each analytics line says whether its id is a platform id; the first lines carry no mark', async () => {
+    mockLandingConfig.mockResolvedValue({ ga4PropertyId: '999000111', gscDomain: 'agentwebforms.com', additionalDomains: [{ ga4PropertyId: '999000222', gscDomain: 'agentweb.pro' }] });
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['999000111'], source: 's' });
+    expect(lines()[0].platform).toBeUndefined();
+    await settle();
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['999000222', '123456789'], source: 's' });
+    auditSharedGoogleRead({ kind: 'gsc', userId: 'u', ids: ['agentwebforms.com', 'customer.com'], source: 's' });
+    expect(lines().slice(1).map((l) => l.platform)).toEqual([true, false, true, false]);
+    expect(mockLandingConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('Drive lines never load the config and never carry the mark', async () => {
+    auditSharedGoogleRead({ kind: 'drive-file', userId: 'u', ids: ['f'], source: 's' });
+    await settle();
+    expect(mockLandingConfig).not.toHaveBeenCalled();
+    expect(lines()[0].platform).toBeUndefined();
+  });
+
+  it('a config that cannot be loaded leaves the mark off (unknown, not "no"), and the read is not affected', async () => {
+    mockLandingConfig.mockRejectedValue(new Error('secrets down'));
+    expect(() => auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['1'], source: 's' })).not.toThrow();
+    await settle();
+    auditSharedGoogleRead({ kind: 'ga4', userId: 'u', ids: ['1'], source: 's' });
+    expect(lines().map((l) => l.platform)).toEqual([undefined, undefined]);
   });
 });
