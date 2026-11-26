@@ -457,6 +457,14 @@ export class HubSpotService {
     return this._accountId;
   }
 
+  /**
+   * ENG-2840 (W2-9): the user whose connected account this instance was built from (for an org-shared account, the teammate who
+   * owns it, not the caller), or undefined on the pasted-token path. Read-only; lets the MCP read route say whose account answered.
+   */
+  get ownerUserId(): string | undefined {
+    return this._userId;
+  }
+
   get portalId(): string | undefined {
     return this._portalId;
   }
