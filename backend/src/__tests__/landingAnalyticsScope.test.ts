@@ -120,7 +120,7 @@ describe('createLandingAnalyticsScope', () => {
   });
 
   it('own locations: owned domains whole; a page on an unowned managed host by path only; never the root of a shared host; vercel hosts whole', async () => {
-    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com' }, { domain: 'www.acme.com' }]);
+    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com', status: 'active' }, { domain: 'www.acme.com', status: 'active' }]);
     mockPagesByOwner.mockResolvedValueOnce([
       { customDomainUrl: 'https://acme.agentwebforms.com/pricing', deployedUrl: 'https://acme-site.vercel.app/pricing' },
       { deployedUrl: 'https://shared.agentwebforms.com/acme' },
@@ -139,9 +139,16 @@ describe('createLandingAnalyticsScope', () => {
     expect(await scope.hasLocationOn('other.agentwebforms.com')).toBe(false);
   });
 
+  it('a pending (unverified) domain row is not ownership: it could name a host of someone else that nobody has attached yet', async () => {
+    mockListDomains.mockResolvedValueOnce([{ domain: 'audit.agentweb.pro', status: 'pending_verification' }, { domain: 'x.agentwebforms.com', status: 'error' }, { domain: 'mine.agentwebforms.com', status: 'active' }]);
+    const scope = createLandingAnalyticsScope({ userId: 'u1' });
+    expect(await scope.locations()).toEqual([{ host: 'mine.agentwebforms.com' }]);
+    expect(await scope.hasLocationOn('audit.agentweb.pro')).toBe(false);
+  });
+
   it('organization members are one tenant: their pages count, and each member is read once', async () => {
     mockOrgMembers.mockResolvedValueOnce([{ userId: 'u1' }, { userId: 'u2' }]);
-    mockListDomains.mockImplementation(async (id: string) => (id === 'u2' ? [{ domain: 'team.agentwebforms.com' }] : []));
+    mockListDomains.mockImplementation(async (id: string) => (id === 'u2' ? [{ domain: 'team.agentwebforms.com', status: 'active' }] : []));
     const scope = createLandingAnalyticsScope({ userId: 'u1', orgId: 'org-1' });
     expect(await scope.locations()).toEqual([{ host: 'team.agentwebforms.com' }]);
     expect(mockListDomains.mock.calls.map((c) => c[0]).sort()).toEqual(['u1', 'u2']);
@@ -150,7 +157,7 @@ describe('createLandingAnalyticsScope', () => {
   it('a failure reading the caller\'s pages fails closed: no own location; the failure is not remembered', async () => {
     mockListDomains.mockRejectedValueOnce(new Error('throttled'));
     expect(await createLandingAnalyticsScope({ userId: 'u1' }).locations()).toEqual([]);
-    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com' }]);
+    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com', status: 'active' }]);
     expect(await createLandingAnalyticsScope({ userId: 'u1' }).locations()).toEqual([{ host: 'acme.agentwebforms.com' }]);
   });
 
@@ -178,7 +185,7 @@ describe('scopeGaClient', () => {
   const client = () => ({ runReport: jest.fn(async (req: any) => [{ rows: [], echo: req }]), other: jest.fn(() => 'other') });
 
   it('a report on a platform property gets the caller\'s own locations ANDed in; other properties are untouched', async () => {
-    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com' }]);
+    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com', status: 'active' }]);
     const inner = client();
     const scoped = scopeGaClient(inner as any, createLandingAnalyticsScope({ userId: 'u1' })) as any;
     const existing = { notExpression: { filter: { fieldName: 'hostName' } } };
@@ -203,7 +210,7 @@ describe('scopeGaClient', () => {
 
 describe('gscScopeFilter', () => {
   it('only for platform sites', async () => {
-    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com' }]);
+    mockListDomains.mockResolvedValueOnce([{ domain: 'acme.agentwebforms.com', status: 'active' }]);
     const scope = createLandingAnalyticsScope({ userId: 'u1' });
     expect(await gscScopeFilter(scope, 'sc-domain:customer.com')).toBeNull();
     const f = await gscScopeFilter(scope, 'sc-domain:agentwebforms.com');

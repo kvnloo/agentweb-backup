@@ -45,7 +45,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   resetLandingAnalyticsScopeForTest();
   mockRunReport.mockResolvedValue([{ rows: [] }]);
-  mockListDomains.mockImplementation(async (userId: string) => (userId === 'owner-1' ? [{ domain: OWN_HOST }] : []));
+  mockListDomains.mockImplementation(async (userId: string) => (userId === 'owner-1' ? [{ domain: OWN_HOST, status: 'active' }] : []));
   fetchMock = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ rows: [] }) });
   global.fetch = fetchMock as any;
   (authenticateToken as jest.Mock).mockImplementation(async (req: any, _res: any, next: any) => {
@@ -148,8 +148,10 @@ describe('the other call sites', () => {
   it('the funnel report on a platform primary property keeps only the caller\'s own hosts', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(deployer());
     await request(app).get('/api/seo/metrics').query({ funnelId: 'f1' });
-    const funnelReports = platformReports().filter((r) => JSON.stringify(r).includes('eventName'));
-    expect(funnelReports.length).toBeGreaterThan(0);
+    // calculateFunnelMetrics' first report: sessions only, no dimensions (no /metrics report has that shape)
+    const funnelSessions = platformReports().filter((r) => !r.dimensions && Array.isArray(r.metrics) && r.metrics.length === 1 && r.metrics[0].name === 'sessions');
+    expect(funnelSessions.length).toBeGreaterThan(0);
+    for (const report of funnelSessions) expect(JSON.stringify(report.dimensionFilter)).toContain(OWN_HOST);
     for (const report of platformReports()) expect(JSON.stringify(report.dimensionFilter)).toContain(OWN_HOST);
   });
 

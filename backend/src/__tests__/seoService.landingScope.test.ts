@@ -11,7 +11,7 @@ jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn(async () => JSON.stringify({ private_key: 'k', client_email: 'sa@example.iam.gserviceaccount.com' })),
   getLandingPagesConfig: jest.fn(async () => ({ ga4PropertyId: '999000111', gscDomain: 'agentwebforms.com' })),
 }));
-jest.mock('../services/customDomainService', () => ({ listDomains: jest.fn(async (userId: string) => (userId === 'owner-1' ? [{ domain: 'mine.agentwebforms.com' }] : [])) }));
+jest.mock('../services/customDomainService', () => ({ listDomains: jest.fn(async (userId: string) => (userId === 'owner-1' ? [{ domain: 'mine.agentwebforms.com', status: 'active' }] : [])) }));
 jest.mock('../services/v0Service', () => ({ getLandingPagesByOwner: jest.fn(async () => []) }));
 jest.mock('google-auth-library', () => ({
   JWT: jest.fn().mockImplementation(() => ({ getAccessToken: jest.fn().mockResolvedValue({ token: 't' }) })),

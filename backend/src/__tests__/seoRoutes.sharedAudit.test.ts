@@ -10,7 +10,7 @@ const mockAudit = jest.fn();
 jest.mock('../services/sharedGoogleAudit', () => ({ auditSharedGoogleRead: (...a: any[]) => mockAudit(...a) }));
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgMembers: jest.fn(async () => []) } }));
 // The landing-page analytics scope (landingAnalyticsScope.ts): user-1 owns the managed host the ?domain= test names.
-jest.mock('../services/customDomainService', () => ({ listDomains: jest.fn(async (userId: string) => (userId === 'user-1' ? [{ domain: 'someone.agentwebforms.com' }] : [])) }));
+jest.mock('../services/customDomainService', () => ({ listDomains: jest.fn(async (userId: string) => (userId === 'user-1' ? [{ domain: 'someone.agentwebforms.com', status: 'active' }] : [])) }));
 jest.mock('../services/v0Service', () => ({ getLandingPagesByOwner: jest.fn(async () => []) }));
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn(async () => JSON.stringify({ private_key: 'mock-private-key', client_email: 'sa@example.iam.gserviceaccount.com' })),
@@ -58,7 +58,7 @@ describe('GET /api/seo/metrics', () => {
 
   it('the caller\'s own landing-page host in ?domain= adds the platform property, and that read is audited too', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user-1', email: 'u@example.com', seoDomains: [], googleAnalyticsPropertyId: '123456789' });
-    await request(app).get('/api/seo/metrics').query({ domain: 'someone.agentwebforms.com' });
+    await request(app).get('/api/seo/metrics').query({ domain: 'someone.agentwebforms.com', status: 'active' });
     expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ga4', userId: 'user-1', ids: ['999000111'], source: 'GET /api/seo/metrics ?domain (landing page property)' }));
   });
 });
