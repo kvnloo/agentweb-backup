@@ -932,6 +932,21 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.recentEngagements).toHaveLength(1);
     });
 
+    // ENG-2840 (W2-5a): the allowance on how many email bodies one read may fetch (set only by the MCP lead tools)
+    it('passes the fetch allowance on to the data layer, and calls it exactly as before without one', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      await service.getLeadDetails(listId, leadId, userId, { maxContentFetches: 10 });
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId, { maxContentFetches: 10 });
+
+      await service.getLeadDetails(listId, leadId, userId);
+      // exactly three arguments: Emma's own tool and the portal fetch every missing body, as before
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId);
+    });
+
     it('should truncate HTML email draft to preview', async () => {
       const leadWithDraft = {
         ...mockLead,
@@ -969,6 +984,29 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.message).toBe('Lead not found');
       // Both tiers ran, found nothing, and still landed on a clean not-found.
       expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([], leadId);
+    });
+
+    it('ENG-2840 W2-5a: recoverStaleList false skips the search of the caller\'s other lists entirely (the MCP tool sends it); the default still searches', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockClear();
+      mockCrmDb.getLeadListsForUser.mockClear();
+      mockCrmDb.getLeadByIdAcrossLists.mockClear();
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
+
+      const skipped = await service.getLeadDetails(listId, leadId, userId, { maxContentFetches: 10, recoverStaleList: false });
+      expect(skipped.success).toBe(false);
+      expect(skipped.message).toBe('Lead not found');
+      expect(mockCrmDb.getLeadListsByUserId).not.toHaveBeenCalled();
+      expect(mockCrmDb.getLeadListsForUser).not.toHaveBeenCalled();
+      expect(mockCrmDb.getLeadByIdAcrossLists).not.toHaveBeenCalled();
+
+      const searched = await service.getLeadDetails(listId, leadId, userId, { maxContentFetches: 10, recoverStaleList: true });
+      expect(searched.success).toBe(false);
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalled();
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalled();
     });
 
     it('ENG-969: corrects a stale list_id when the lead is in one of the caller\'s OWN other lists (tier 1, no org fan-out)', async () => {
@@ -1959,6 +1997,19 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.engagementSummary.total).toBe(5);
       expect(result.engagements).toHaveLength(2);
       expect(result.engagements[0].eventType).toBe('email.sent');
+    });
+
+    it('passes the fetch allowance on to the data layer, and calls it exactly as before without one (ENG-2840 W2-5a)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      await service.getLeadEngagements(listId, leadId, userId, 5, { maxContentFetches: 10 });
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId, { maxContentFetches: 10 });
+
+      await service.getLeadEngagements(listId, leadId, userId, 5);
+      expect(mockCrmDb.getLeadEngagements).toHaveBeenLastCalledWith(listId, leadId, userId);
     });
 
     it('should truncate HTML email content in engagements (legacy string format)', async () => {

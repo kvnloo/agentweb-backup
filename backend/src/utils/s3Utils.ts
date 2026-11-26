@@ -119,6 +119,25 @@ export function getS3ObjectStream(key: string, bucket: string = DEFAULT_BUCKET) 
 }
 
 /**
+ * ENG-2840 (W2-7): the same stream, whose destroy() also aborts the underlying S3 request. Destroying the plain stream leaves the download
+ * paused with its connection held (until the SDK's idle timeout); a reader that stops early on purpose (a size limit) must free it.
+ */
+export function getS3ObjectStreamAbortable(key: string, bucket: string = DEFAULT_BUCKET) {
+  const request = s3.getObject({ Bucket: bucket, Key: key });
+  const stream = request.createReadStream();
+  const destroy = stream.destroy.bind(stream);
+  (stream as any).destroy = (error?: Error) => {
+    try {
+      request.abort();
+    } catch {
+      // already finished
+    }
+    return destroy(error);
+  };
+  return stream;
+}
+
+/**
  * Get S3 object metadata (content type, size, etc.).
  */
 export async function getS3ObjectMetadata(key: string, bucket: string = DEFAULT_BUCKET) {
