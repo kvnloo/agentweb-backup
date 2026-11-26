@@ -317,8 +317,27 @@ describe('ENG-2781 Databricks-origin signup skips the Zoma seat cap', () => {
     const done = jest.fn();
     return googleCallback({ query: { state } } as any, '', '', { id: 'g-1', emails: [{ value: gmail }] } as any, done).then(() => done);
   };
-  beforeEach(() => { process.env.ZOMA_WAITLIST_ENABLED = 'true'; mockAdmitZoma.mockImplementation(capFull); });
-  afterEach(() => { delete process.env.ZOMA_WAITLIST_ENABLED; });
+  beforeEach(() => {
+    process.env.ZOMA_WAITLIST_ENABLED = 'true';
+    process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED = 'true';
+    mockAdmitZoma.mockImplementation(capFull);
+  });
+  afterEach(() => { delete process.env.ZOMA_WAITLIST_ENABLED; delete process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED; });
+
+  it('launch flag off: a .db intent is refused for a personal email, and the same email with a plain intent still registers', async () => {
+    const dbIntent = mintZomaSignupIntent({ databricks: true }); // minted while the flag was on
+    delete process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED;
+    const refused = await emailSignup({ signupIntent: dbIntent });
+    expect(refused.status).toBe(400);
+    expect(refused.body).toMatchObject({ code: 'personal_email_not_allowed' });
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+    expect(mockCreateUser).not.toHaveBeenCalled();
+    mockAdmitZoma.mockResolvedValue('approved');
+    const ok = await emailSignup({ signupIntent: mintZomaSignupIntent() });
+    expect(ok.status).toBe(201);
+    expect(mockAdmitZoma.mock.calls).toEqual([[gmail]]);
+    expect(mockCreateUser).toHaveBeenCalled();
+  });
 
   it('email signup with a Databricks-marked intent is admitted with the Databricks origin when seats are full', async () => {
     const r = await emailSignup({ signupIntent: mintZomaSignupIntent({ databricks: true }) });
