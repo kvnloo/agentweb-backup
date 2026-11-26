@@ -65,13 +65,18 @@ describe('POST /api/emma/read-file limits', () => {
     expect(lastCaller()).toStrictEqual({ userId: 'caller-1', ownStorageOnly: true, maxBytes: 10 * 1024 * 1024 });
   });
 
-  it('each field alone is passed on alone', async () => {
+  it('own_storage_only alone is passed on alone; max_bytes is accepted only with it (it limits stored files only)', async () => {
     await post({ own_storage_only: true });
     expect(lastCaller()).toStrictEqual({ userId: 'caller-1', ownStorageOnly: true });
-    await post({ max_bytes: 1 });
-    expect(lastCaller()).toStrictEqual({ userId: 'caller-1', maxBytes: 1 });
-    await post({ max_bytes: MAX });
-    expect(lastCaller()).toStrictEqual({ userId: 'caller-1', maxBytes: MAX });
+    await post({ own_storage_only: true, max_bytes: 1 });
+    expect(lastCaller()).toStrictEqual({ userId: 'caller-1', ownStorageOnly: true, maxBytes: 1 });
+    await post({ own_storage_only: true, max_bytes: MAX });
+    expect(lastCaller()).toStrictEqual({ userId: 'caller-1', ownStorageOnly: true, maxBytes: MAX });
+    for (const body of [{ max_bytes: 1 }, { own_storage_only: false, max_bytes: 1 }]) {
+      const res = await request(app).post('/api/emma/read-file').send({ file_url: FILE, ...body });
+      expect(res.status).toBe(400);
+      expect(String(res.body.message)).toMatch(/max_bytes applies only together with own_storage_only/);
+    }
   });
 
   it('an identity in the body changes nothing', async () => {
@@ -190,6 +195,8 @@ describe('POST /api/emma/add-lead-engagement', () => {
     ['idempotency_key with a dot', { ...VALID, idempotency_key: 'abc.defgh' }],
     ['idempotency_key a number', { ...VALID, idempotency_key: 123456789 }],
     ['idempotency_key empty', { ...VALID, idempotency_key: '' }],
+    ['idempotency_key containing replied (it would mark the lead engaged)', { ...VALID, idempotency_key: 'replied-12345' }],
+    ['idempotency_key containing Clicked', { ...VALID, idempotency_key: 'call-Clicked-1' }],
     ['idempotency_key with a trailing newline', { ...VALID, idempotency_key: `abcdefgh${String.fromCharCode(10)}` }],
   ])('400 when %s, and the handler is not called', async (_label, body) => {
     const res = await send(body);

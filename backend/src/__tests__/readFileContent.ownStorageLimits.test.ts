@@ -21,14 +21,19 @@ jest.mock('axios', () => {
   return { __esModule: true, default: mockAxios, ...mockAxios };
 });
 
-jest.mock('../utils/s3Utils', () => ({
-  extractS3KeyFromUrl: jest.fn((url: string) => {
-    if (url.includes('agentweb-user-files.s3')) return new URL(url).pathname.replace(/^\/+/, '');
-    return null;
-  }),
-  getS3ObjectStream: jest.fn(),
-  getS3ObjectMetadata: jest.fn(),
-}));
+jest.mock('../utils/s3Utils', () => {
+  // One double for both stream helpers: with maxBytes the reader opens the abortable one (its own test: s3Utils.abortableStream.test.ts).
+  const stream = jest.fn();
+  return {
+    extractS3KeyFromUrl: jest.fn((url: string) => {
+      if (url.includes('agentweb-user-files.s3')) return new URL(url).pathname.replace(/^\/+/, '');
+      return null;
+    }),
+    getS3ObjectStream: stream,
+    getS3ObjectStreamAbortable: stream,
+    getS3ObjectMetadata: jest.fn(),
+  };
+});
 
 jest.mock('../utils/ssrfGuard', () => {
   const actual = jest.requireActual('../utils/ssrfGuard');
@@ -254,24 +259,22 @@ describe('without the new fields (Emma\'s path) nothing changes', () => {
   });
 });
 
-describe('the truncation message', () => {
-  it('no longer offers a byte-range: it says the content was cut and the rest cannot be read with this tool', async () => {
+describe('the truncation message (Emma\'s, unchanged; the MCP tool writes its own note)', () => {
+  it('a cut read keeps Emma\'s message and reports truncated', async () => {
     mockStream.mockReturnValueOnce(chunkStream([Buffer.alloc(100_050, 'x')]).stream);
     mockMeta.mockResolvedValueOnce({ ContentType: 'text/plain' });
     const result = await readFileContent(OWN_URL, { userId: 'user-a' });
     expect(result.success).toBe(true);
     expect(result.truncated).toBe(true);
     expect(result.content_length).toBe(100_000);
-    expect(result.message).not.toMatch(/byte-range/i);
-    expect(result.message).toMatch(/cut/);
-    expect(result.message).toMatch(/cannot be read with this tool/);
+    expect(result.message).toMatch(/content was truncated/);
   });
 
-  it('an untruncated read says nothing about cutting', async () => {
+  it('an untruncated read says nothing about truncation', async () => {
     mockStream.mockReturnValueOnce(chunkStream([Buffer.from('short')]).stream);
     mockMeta.mockResolvedValueOnce({ ContentType: 'text/plain' });
     const result = await readFileContent(OWN_URL, { userId: 'user-a' });
     expect(result.truncated).toBe(false);
-    expect(result.message).not.toMatch(/cut|byte-range/);
+    expect(result.message).not.toMatch(/truncated/);
   });
 });

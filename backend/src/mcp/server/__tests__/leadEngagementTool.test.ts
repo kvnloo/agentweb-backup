@@ -106,6 +106,12 @@ describe('the request', () => {
     }
   });
 
+  it('idempotency_key must not carry the words that mark a lead engaged', () => {
+    for (const key of ['replied-12345', 'call-CLICKED-01', 'received_2026_11']) {
+      expect(() => addEngagementRequest({ ...base, idempotency_key: key }, NOW)).toThrow(/must not contain the words clicked, replied or received/);
+    }
+  });
+
   it('idempotency_key is 8 to 64 letters, digits, - or _', () => {
     for (const bad of ['short', 'a'.repeat(65), 'has space1', 'semi;colon', 12345678]) {
       expect(() => addEngagementRequest({ ...base, idempotency_key: bad }, NOW)).toThrow(/idempotency_key must be/);
