@@ -492,9 +492,11 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
       });
       for (const key of uniqueKeys) {
         try {
-          // Read at most what could still fit in the instruction (a character is at most 3 UTF-8 bytes): a larger object is refused
-          // without loading it, as the whole instruction would be refused after it anyway.
-          const allowance = Math.max(0, 3 * (MAX_INLINE_INSTRUCTION_CHARS - resolved.length));
+          // Read at most what could still fit in the instruction (a character is at most 3 UTF-8 bytes), shared by every place the key is
+          // named (each is replaced by the content): a larger object is refused without loading it or building the multiplied text, as
+          // the whole instruction would be refused after it anyway.
+          const occurrences = Math.max(1, resolved.split(key).length - 1);
+          const allowance = Math.max(0, Math.floor((3 * (MAX_INLINE_INSTRUCTION_CHARS - resolved.length)) / occurrences));
           const content = await getS3ObjectAsString(key, undefined, { maxBytes: allowance });
           if (content) {
             // Replace all occurrences of the key with the actual content inline
