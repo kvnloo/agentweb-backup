@@ -70,3 +70,34 @@ export function buildKbListQuery(args: any): Record<string, string> {
   }
   return qp;
 }
+
+/**
+ * ENG-2840 (W2-8): knowledge-base files carry Google Cloud Storage signed links minted to expire in the year 2500 and stored in task
+ * records (`knowledgeBase`, `knowledgeBaseFiles[].url`, the listing's `files[].url`). They are bearer links that cannot be revoked short
+ * of deleting the file or rotating the storage key, and the listing includes other tenants' public knowledge bases. No MCP tool needs
+ * them (`read_knowledge_base_files` reads a file by knowledge base id and file name), so every key whose value is such a signed link is
+ * removed from these answers. Everything else is kept as it is.
+ */
+const SIGNED_STORAGE_LINK = /^https:\/\/([a-z0-9.-]+\.)?storage\.googleapis\.com\/[^\s]*[?&](X-Goog-Signature|Signature)=/i;
+const MAX_DEPTH = 40;
+
+export function isSignedStorageLink(value: unknown): boolean {
+  return typeof value === 'string' && SIGNED_STORAGE_LINK.test(value.trim());
+}
+
+export function withoutSignedStorageLinks<T>(value: T): T {
+  const seen = new WeakSet<object>();
+  const visit = (v: any, depth: number): any => {
+    if (v === null || typeof v !== 'object' || depth > MAX_DEPTH) return v;
+    if (seen.has(v)) return v;
+    seen.add(v);
+    if (Array.isArray(v)) return v.filter((item) => !isSignedStorageLink(item)).map((item) => visit(item, depth + 1));
+    const out: Record<string, any> = {};
+    for (const [key, item] of Object.entries(v)) {
+      if (isSignedStorageLink(item)) continue;
+      out[key] = visit(item, depth + 1);
+    }
+    return out;
+  };
+  return visit(value, 0);
+}

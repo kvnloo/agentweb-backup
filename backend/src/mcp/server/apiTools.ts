@@ -43,7 +43,7 @@ import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
 import { executeBrandRead, executeBrandUpdate } from './manageBrandWrites';
 import { executeStrategyRead, executeStrategyUpdate } from './manageStrategyWrites';
-import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from './knowledgeBaseParams';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET, withoutSignedStorageLinks } from './knowledgeBaseParams';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -466,7 +466,7 @@ mcpToolRegistry.register({
       path: '/api/tasks',
       context: await resolveClientScopedContext(context, args?.client_id, 'list_tasks')
     });
-    return jsonResult(data);
+    return jsonResult(withoutSignedStorageLinks(data));
   }
 });
 
@@ -494,20 +494,20 @@ mcpToolRegistry.register({
     switch (args.action) {
       case 'create': {
         const data = await mcpFetch({ method: 'POST', path: '/api/tasks', context: c, body: { name: args.name, prompt: args.prompt, category: args.category, description: args.description } });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'get': {
         const data = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'update': {
         const { action, task_id, ...updates } = args;
         const data = await mcpFetch({ method: 'PUT', path: `/api/tasks/${encodeURIComponent(task_id)}`, context: c, body: updates });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'delete': {
         const data = await mcpFetch({ method: 'DELETE', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
@@ -1839,7 +1839,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context), queryParams: buildKbListQuery(args) });
-    return jsonResult(data);
+    // No year-2500 signed file links (knowledgeBaseParams.ts): read a file with read_knowledge_base_files.
+    return jsonResult(withoutSignedStorageLinks(data));
   }
 });
 
