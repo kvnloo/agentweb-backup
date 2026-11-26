@@ -5,8 +5,8 @@
  *  1. zoma_status leaves the payment line out of the checklist and marks `payment.required: false`;
  *  2. with the card requirement on, the line and the structured payment state are as before;
  *  3. writes are unchanged in both modes (the write gate never reads the new field);
- *  4. the zoma_status tool description no longer tells the client a card is always checked, so the
- *     client's own paraphrase ("Payment: on file") is not primed by it.
+ *  4. the zoma_status tool description and the served guide (docs/meta-toolkit-skill.md, linked from
+ *     "All set") no longer tell the client a card is always needed, so its own paraphrase is not primed.
  */
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
 jest.mock('../services/stripeService', () => ({ stripeService: {} }));
@@ -14,6 +14,8 @@ jest.mock('../services/metaConnectUrl', () => ({ buildMetaConnectUrl: jest.fn() 
 jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
 
 import { assertZomaWriteReady, runZomaTool, type ZomaOnboardingDeps } from '../mcp/zomaOnboarding';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { zomaToolDefinitions } from '../mcp/zomaToolDefinitions';
 
 const NOW = 1_800_000_000_000;
@@ -102,5 +104,12 @@ describe('ENG-3195 zoma_status payment line', () => {
     expect(d).not.toMatch(/need both a payment method/);
     expect(d).toContain('a payment method only when one is required at setup');
     expect(d).toContain('never tell the user a payment method is on file unless the checklist says so');
+  });
+
+  it('the served guide only asks for a payment method when zoma_status lists one', () => {
+    const guide = readFileSync(join(__dirname, '../../docs/meta-toolkit-skill.md'), 'utf8');
+    expect(guide).not.toMatch(/need a payment method on file/);
+    expect(guide).not.toMatch(/still need the payment method/);
+    expect(guide).toContain('plus a payment method only when the `zoma_status` checklist lists one');
   });
 });
