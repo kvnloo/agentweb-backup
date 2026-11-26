@@ -86,16 +86,30 @@ export function isSignedStorageLink(value: unknown): boolean {
 }
 
 export function withoutSignedStorageLinks<T>(value: T): T {
-  const seen = new WeakSet<object>();
+  // Each object is copied once (a shared or cyclic object maps to the same copy, so no original is ever handed back); anything deeper than
+  // MAX_DEPTH is dropped rather than returned unchecked.
+  const copies = new WeakMap<object, any>();
   const visit = (v: any, depth: number): any => {
-    if (v === null || typeof v !== 'object' || depth > MAX_DEPTH) return v;
-    if (seen.has(v)) return v;
-    seen.add(v);
-    if (Array.isArray(v)) return v.filter((item) => !isSignedStorageLink(item)).map((item) => visit(item, depth + 1));
+    if (v === null || typeof v !== 'object') return v;
+    if (depth > MAX_DEPTH) return undefined;
+    const done = copies.get(v);
+    if (done !== undefined) return done;
+    if (Array.isArray(v)) {
+      const out: any[] = [];
+      copies.set(v, out);
+      for (const item of v) {
+        if (isSignedStorageLink(item)) continue;
+        const copy = visit(item, depth + 1);
+        if (copy !== undefined) out.push(copy);
+      }
+      return out;
+    }
     const out: Record<string, any> = {};
+    copies.set(v, out);
     for (const [key, item] of Object.entries(v)) {
       if (isSignedStorageLink(item)) continue;
-      out[key] = visit(item, depth + 1);
+      const copy = visit(item, depth + 1);
+      if (copy !== undefined) out[key] = copy;
     }
     return out;
   };
