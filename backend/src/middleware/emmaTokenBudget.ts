@@ -78,6 +78,15 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
   'POST /meta-ads/insights': 'metered',
   'POST /meta-ads/metrics': 'metered',
   'POST /post-analytics': 'metered',
+
+  // ─── Provider reads for MCP tools (ENG-2840 W2-9) ─────────────────────────
+  'POST /fathom-meetings': 'metered',
+  'POST /fathom-transcript': 'metered',
+  'POST /luma-events': 'metered',
+  'POST /luma-guests': 'metered',
+  'POST /hubspot-read': 'metered',
+  'POST /linkedin-ads/insights': 'metered',
+  'POST /linkedin-ads/read': 'metered',
   'POST /data-analysis': 'metered',
 
   // ─── Files & HTML ─────────────────────────────────────────────────────────
