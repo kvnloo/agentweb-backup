@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { hasValidZomaSignupIntent, isZomaSignup, parseGoogleOAuthState } from '../services/zomaSignupIntent';
+import { hasValidZomaSignupIntent, isDatabricksSignupIntent, isZomaSignup, parseGoogleOAuthState } from '../services/zomaSignupIntent';
 import { admitZomaSignup, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
 import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
@@ -131,6 +131,14 @@ function attributeWebSignup(userId: string, opts: { ref?: unknown; confidence: "
   }).then(() => noteProductUse(userId, "emma_web"));
 }
 
+/**
+ * ENG-2781: a signup that began at a Databricks-origin OAuth client carries a server-signed marker
+ * in its signup intent, which is the only way registration (no OAuth client in sight) can know.
+ * Every other signup is admitted exactly as before.
+ */
+const admitZomaSignupFrom = (email: string, databricks: boolean) =>
+  databricks ? admitZomaSignup(email, undefined, { databricks }) : admitZomaSignup(email);
+
 export const register = async (req: Request, res: Response) => {
   try {
     let {
@@ -174,7 +182,7 @@ export const register = async (req: Request, res: Response) => {
     }
     if (zomaAdmissionEnabled() && isZomaSignup(req.body)) {
       try {
-        if (await admitZomaSignup(email) !== 'approved') return res.status(202).json(waitlistedResponse);
+        if (await admitZomaSignupFrom(email, isDatabricksSignupIntent(req.body.signupIntent)) !== 'approved') return res.status(202).json(waitlistedResponse);
       } catch (error) {
         console.error('Zoma admission unavailable', error);
         return res.status(503).json({ code: 'admission_unavailable', message: 'Please try again later.' });
@@ -488,7 +496,7 @@ export const googleCallback = async (
 
     // ENG-3124: state is `<portal>` or `customer~<signed Zoma intent>` (Google sign-in started
     // on the MCP consent page). A Zoma signup returns to the consent/device flow, never Emma.
-    const { portal: portalOrigin, zomaSignup } = parseGoogleOAuthState(req.query.state);
+    const { portal: portalOrigin, zomaSignup, databricksSignup } = parseGoogleOAuthState(req.query.state);
 
     // Block new registrations from personal email domains on the customer portal, unless the
     // signup carries a valid Zoma intent. Existing users are allowed through regardless of domain.
@@ -503,7 +511,7 @@ export const googleCallback = async (
     // Same Zoma capacity gate the email signup path applies.
     if (!user && zomaSignup && zomaAdmissionEnabled()) {
       try {
-        if (await admitZomaSignup(email) !== 'approved') {
+        if (await admitZomaSignupFrom(email, databricksSignup === true) !== 'approved') {
           return done({ statusCode: 202, ...waitlistedResponse }, null);
         }
       } catch (error) {

@@ -21,7 +21,3 @@ export function zomaOpenTesterWindowActive(now: number = Date.now(), env: NodeJS
   const until = Date.parse(env.ZOMA_OPEN_TESTER_UNTIL || DEFAULT_ZOMA_OPEN_TESTER_UNTIL);
   return Number.isFinite(until) && now < until;
 }
-
-/** Databricks sign-ins skip the seat cap only while the launch flag is on. */
-export const zomaDatabricksSeatExempt = (databricksClient: boolean, env: NodeJS.ProcessEnv = process.env) =>
-  databricksClient && zomaDatabricksLaunchEnabled(env);

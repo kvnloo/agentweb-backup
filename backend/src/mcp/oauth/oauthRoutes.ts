@@ -30,9 +30,10 @@ import {
   type JourneyProduct,
 } from '../../services/journeyAttribution';
 import { admitZomaAuthorizationSignup } from '../../services/zomaAuthorizationAdmission';
-import { isDatabricksRedirectUri } from '../zomaDatabricksReadOnly';
-import { waitlistedResponse } from '../../services/zomaAdmission';
+import { waitlistedResponse, zomaAdmissionEnabled } from '../../services/zomaAdmission';
 import { mintZomaSignupIntent } from '../../services/zomaSignupIntent';
+import { isDatabricksClient } from '../zomaDatabricksReadOnly';
+import { zomaDatabricksLaunchEnabled } from '../../services/zomaOpenWindow';
 import { trackJourney } from '../../services/journeyTracking';
 import { noteProductUse, noteSignup, zomaMilestone } from '../../services/journeyMilestones';
 
@@ -107,11 +108,23 @@ function attributeConsentSignup(
   );
 }
 
-async function allowZomaSignupAuthorization(product: JourneyProduct, userId: string, res: Response, redirectUri?: string): Promise<boolean> {
+async function allowZomaSignupAuthorization(
+  product: JourneyProduct,
+  userId: string,
+  client: { clientId: string; redirectUris: readonly string[] },
+  res: Response,
+): Promise<boolean> {
   if (product !== 'zoma') return true;
   try {
-    const databricksClient = !!redirectUri && isDatabricksRedirectUri(redirectUri);
-    if (await admitZomaAuthorizationSignup(userId, { databricksClient }) === 'approved') return true;
+    // ENG-2781: the same registered-redirect-URI test the Zoma gateway uses to make tokens issued to
+    // this client read-only. Read-only binds those tokens, not the account, and anyone can register a
+    // client with a Databricks redirect URI, so this is a cost bypass, not proof the caller is
+    // Databricks. Gate off: the call is the unchanged one-argument call.
+    const databricks = zomaAdmissionEnabled() && zomaDatabricksLaunchEnabled() && isDatabricksClient(client.redirectUris);
+    const admission = databricks
+      ? await admitZomaAuthorizationSignup(userId, { databricks, clientId: client.clientId })
+      : await admitZomaAuthorizationSignup(userId);
+    if (admission === 'approved') return true;
     res.status(202).json(waitlistedResponse);
   } catch (error) {
     console.error('[MCP-OAuth] Zoma admission unavailable:', error);
@@ -280,7 +293,7 @@ export function setupMcpOAuth(app: express.Express) {
     if (process.env.MCP_OAUTH_SKIP_CONSENT === 'true') {
       const { user } = await getUserFromToken(req);
       if (user) {
-        if (!await allowZomaSignupAuthorization(attribution.product, user.userId, res, actualRedirectUri)) return;
+        if (!await allowZomaSignupAuthorization(attribution.product, user.userId, client, res)) return;
         const clientType = classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri });
         const { code } = await mcpOAuthService.createAuthorizationCode({
           clientId: client_id,
@@ -318,7 +331,13 @@ export function setupMcpOAuth(app: express.Express) {
     consentUrl.searchParams.set('mcp_client_id', client_id);
     // The deployed consent page forwards this signed intent to /api/auth/register.
     // Never infer Zoma from the generic signupSource=mcp marker (Emma shares it).
-    if (attribution.product === 'zoma') consentUrl.searchParams.set('mcp_signup_intent', mintZomaSignupIntent());
+    if (attribution.product === 'zoma') {
+      // ENG-2781: a Databricks-origin client's intent carries a signed marker so registration (which
+      // never sees the OAuth client) can exempt it from the seat cap. Only while the gate is on:
+      // dark, and for every other client, the intent is exactly what it always was.
+      const databricks = zomaAdmissionEnabled() && zomaDatabricksLaunchEnabled() && isDatabricksClient(client.redirectUris);
+      consentUrl.searchParams.set('mcp_signup_intent', databricks ? mintZomaSignupIntent({ databricks }) : mintZomaSignupIntent());
+    }
 
     return res.redirect(302, consentUrl.toString());
   });
@@ -371,7 +390,7 @@ export function setupMcpOAuth(app: express.Express) {
       console.error('[MCP-OAuth] Failed to read authorization attribution (ignored):', error);
     }
     const attribution = pending ?? authorizationAttribution(client_id, undefined);
-    if (!await allowZomaSignupAuthorization(attribution.product, userId, res, redirect_uri)) return;
+    if (!await allowZomaSignupAuthorization(attribution.product, userId, client, res)) return;
     const { code } = await mcpOAuthService.createAuthorizationCode({
       clientId: client_id,
       userId,

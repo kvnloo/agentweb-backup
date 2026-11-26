@@ -1,42 +1,12 @@
+// ENG-2781: Databricks exemption is behind the launch flag; these suites test it ON, window closed.
+process.env.ZOMA_DATABRICKS_LAUNCH_ENABLED = 'true';
+process.env.ZOMA_OPEN_TESTER_UNTIL = '2000-01-01T00:00:00Z';
 /**
  * ENG-2881 launch wiring: Slack approval ping, admin Invite/Reject as the admission decision,
  * and the capacity counter never surfacing as (or being edited like) an applicant.
  */
-const rows = new Map<string, any>();
-const conditional = () => Object.assign(new Error('condition'), { code: 'ConditionalCheckFailedException' });
-const mockGet = jest.fn((p: any) => ({ promise: async () => ({ Item: rows.get(p.Key.email) }) }));
-const mockUpdate = jest.fn((p: any) => ({ promise: async () => {
-  const old = rows.get(p.Key.email) ?? {};
-  const v = p.ExpressionAttributeValues ?? {};
-  if (p.ConditionExpression === 'attribute_not_exists(zomaStatus)') {
-    if (old.zomaStatus) throw conditional();
-    rows.set(p.Key.email, { email: p.Key.email, ...old, zomaStatus: v[':pending'] });
-    return;
-  }
-  if (p.ConditionExpression === 'zomaStatus = :pending') {
-    if (old.zomaStatus !== 'waitlisted') throw conditional();
-    rows.set(p.Key.email, { ...old, zomaStatus: v[':rejected'], rejectedBy: v[':actor'] });
-    return;
-  }
-  // legacy CRUD (updateDetails / updateStatus): record the SET attribute names
-  const names = p.ExpressionAttributeNames ?? {};
-  const next = { ...old };
-  for (const [k, name] of Object.entries(names)) next[name as string] = v[(k as string).replace('#', ':')];
-  rows.set(p.Key.email, next);
-  return { Attributes: next };
-} }));
-const mockTransact = jest.fn((p: any) => ({ promise: async () => {
-  const [counter, admission] = p.TransactItems.map((x: any) => x.Update);
-  const count = rows.get(counter.Key.email);
-  const old = rows.get(admission.Key.email) ?? {};
-  if (count.approvedCount >= counter.ExpressionAttributeValues[':cap'] || (admission.ExpressionAttributeValues[':pending'] ? old.zomaStatus !== 'waitlisted' : !!old.zomaStatus)) {
-    throw Object.assign(new Error('condition'), { code: 'TransactionCanceledException', CancellationReasons: [{ Code: 'ConditionalCheckFailed' }] });
-  }
-  rows.set(counter.Key.email, { email: counter.Key.email, approvedCount: count.approvedCount + 1 });
-  rows.set(admission.Key.email, { ...old, email: admission.Key.email, zomaStatus: 'approved', approvedBy: admission.ExpressionAttributeValues[':actor'] });
-} }));
-const mockScan = jest.fn(() => ({ promise: async () => ({ Items: [...rows.values()] }) }));
-jest.mock('aws-sdk', () => ({ __esModule: true, default: { config: { update: jest.fn() }, DynamoDB: { DocumentClient: jest.fn(() => ({ get: mockGet, update: mockUpdate, transactWrite: mockTransact, scan: mockScan })) } } }));
+jest.mock('aws-sdk', () => require('./helpers/zomaWaitlistFake').awsSdkMock());
+import { mockGet, rows } from './helpers/zomaWaitlistFake';
 
 import { waitlistDb } from '../services/waitlistDb';
 import { admitZoma, admitZomaSignup, applyZomaWaitlistDecision, setZomaWaitlistSlackPoster } from '../services/zomaAdmission';
@@ -163,6 +133,127 @@ describe('signups that are not a new free seat', () => {
     expect(await applyZomaWaitlistDecision(rows.get('form@company.co'), 'form@company.co', 'rejected', 'admin-1')).toBeNull();
     expect(await admitZomaSignup('form@company.co', noInvite)).toBe('rejected');
     expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(0);
+  });
+});
+
+describe('Databricks-origin signup is not a free seat (ENG-2781)', () => {
+  const noInvite = { hasPendingOrgInvite: async () => false };
+  beforeEach(() => rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 60 }));
+
+  it('is admitted when the free seats are full, takes no seat and leaves no waitlist row', async () => {
+    expect(await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true })).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+    expect(rows.has('buyer@customer.co')).toBe(false);
+    expect(posts).toEqual([]);
+  });
+
+  it('is admitted the same way before the seats are full, without consuming one', async () => {
+    rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 3 });
+    expect(await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true })).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(3);
+    expect(rows.has('buyer@customer.co')).toBe(false);
+  });
+
+  it('exempts the signup without touching the org-invite lookup', async () => {
+    const lookup = jest.fn(async () => false);
+    expect(await admitZomaSignup('buyer@customer.co', { hasPendingOrgInvite: lookup }, { databricks: true })).toBe('approved');
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('is decided per signup: the same email through a non-Databricks path is still waitlisted', async () => {
+    expect(await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true })).toBe('approved');
+    expect(await admitZomaSignup('buyer@customer.co', noInvite)).toBe('waitlisted');
+    expect(rows.get('buyer@customer.co')).toEqual(expect.objectContaining({ zomaStatus: 'waitlisted' }));
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+  });
+
+  it.each([[undefined], [{}], [{ databricks: false }], [{ databricks: undefined }]])('an origin of %p is still capped like any other signup', async (origin) => {
+    expect(await admitZomaSignup('late@company.co', noInvite, origin)).toBe('waitlisted');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+  });
+
+  it('a signup that is not Databricks-origin still consumes a seat while seats are free', async () => {
+    rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 3 });
+    expect(await admitZomaSignup('early@company.co', noInvite, {})).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(4);
+  });
+
+  describe('an admin decision is honoured, the cap is not', () => {
+    it('a rejected applicant is still refused through a Databricks origin, takes no seat and is not re-recorded', async () => {
+      rows.set('no@customer.co', { email: 'no@customer.co', zomaStatus: 'rejected', rejectedBy: 'admin-1' });
+      expect(await admitZomaSignup('no@customer.co', noInvite, { databricks: true })).toBe('rejected');
+      expect(rows.get('no@customer.co')).toEqual({ email: 'no@customer.co', zomaStatus: 'rejected', rejectedBy: 'admin-1' });
+      expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+    });
+
+    it('a rejected applicant is refused the same way with seats free', async () => {
+      rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 3 });
+      rows.set('no@customer.co', { email: 'no@customer.co', zomaStatus: 'rejected' });
+      expect(await admitZomaSignup('no@customer.co', noInvite, { databricks: true })).toBe('rejected');
+      expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(3);
+    });
+
+    it('a waitlisted applicant is admitted through a Databricks origin without a seat, leaving the row as it was', async () => {
+      rows.set('wait@customer.co', { email: 'wait@customer.co', zomaStatus: 'waitlisted' });
+      expect(await admitZomaSignup('wait@customer.co', noInvite, { databricks: true })).toBe('approved');
+      expect(rows.get('wait@customer.co')).toEqual({ email: 'wait@customer.co', zomaStatus: 'waitlisted' });
+      expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+    });
+
+    it('an applicant with no row is admitted through a Databricks origin without creating one', async () => {
+      expect(await admitZomaSignup('fresh@customer.co', noInvite, { databricks: true })).toBe('approved');
+      expect(rows.has('fresh@customer.co')).toBe(false);
+    });
+
+    it('an unreadable waitlist row is not an exemption: the signup fails closed', async () => {
+      mockGet.mockImplementationOnce(() => ({ promise: async () => { throw new Error('ddb down'); } }) as any);
+      await expect(admitZomaSignup('buyer@customer.co', noInvite, { databricks: true })).rejects.toThrow('ddb down');
+    });
+
+    it('reads the waitlist row once on the Databricks path, and not at all for a team address', async () => {
+      const reads = (email: string) => mockGet.mock.calls.filter(([p]: any[]) => p.Key.email === email).length;
+      await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true });
+      expect(reads('buyer@customer.co')).toBe(1);
+      rows.set('no@customer.co', { email: 'no@customer.co', zomaStatus: 'rejected' });
+      mockGet.mockClear();
+      await admitZomaSignup('no@customer.co', noInvite, { databricks: true });
+      expect(reads('no@customer.co')).toBe(2); // the decision read, then admitZoma's own: no third read for the invite check
+      mockGet.mockClear();
+      await admitZomaSignup('someone@agentweb.pro', noInvite, { databricks: true });
+      expect(reads('someone@agentweb.pro')).toBe(0);
+    });
+  });
+
+  describe('attribution log', () => {
+    const logged = () => (console.log as jest.Mock).mock.calls;
+    beforeEach(() => { jest.spyOn(console, 'log').mockImplementation(() => undefined); });
+    afterEach(() => { (console.log as jest.Mock).mockRestore(); });
+
+    it('at authorization names the client and account, never the email', async () => {
+      await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true, clientId: 'client-9', userId: 'user-7' });
+      expect(logged()).toHaveLength(1);
+      expect(String(logged()[0][0])).toContain('[zoma-waitlist] Databricks-origin signup admitted without a free seat');
+      expect(logged()[0][1]).toEqual({ clientId: 'client-9', userId: 'user-7' });
+      expect(JSON.stringify(logged())).not.toContain('buyer@customer.co');
+    });
+
+    it('at registration says a signed marker was used (no client exists there), never the email', async () => {
+      await admitZomaSignup('buyer@customer.co', noInvite, { databricks: true });
+      expect(logged()).toHaveLength(1);
+      expect(String(logged()[0][0])).toContain('[zoma-waitlist] Databricks-origin signup admitted without a free seat');
+      expect(String(logged()[0][0])).toContain('signed intent marker');
+      expect(logged()[0]).toHaveLength(1);
+      expect(JSON.stringify(logged())).not.toContain('buyer@customer.co');
+    });
+
+    it('logs nothing for any other exemption, a refusal, or a rejected applicant', async () => {
+      rows.set('no@customer.co', { email: 'no@customer.co', zomaStatus: 'rejected' });
+      await admitZomaSignup('late@company.co', noInvite);
+      await admitZomaSignup('someone@agentweb.pro', noInvite, { databricks: true, clientId: 'client-9' });
+      await admitZomaSignup('mate@customer.co', { hasPendingOrgInvite: async () => true });
+      await admitZomaSignup('no@customer.co', noInvite, { databricks: true, clientId: 'client-9', userId: 'user-7' });
+      expect(logged()).toHaveLength(0);
+    });
   });
 });
 

@@ -306,3 +306,84 @@ describe('ENG-3124 Zoma signup is separate from Emma signup', () => {
     expect(mockCreateUser).not.toHaveBeenCalled();
   });
 });
+
+describe('ENG-2781 Databricks-origin signup skips the Zoma seat cap', () => {
+  const { mintZomaSignupIntent, encodeGoogleOAuthState } = require('../services/zomaSignupIntent');
+  const gmail = 'buyer@gmail.com';
+  // Seats are full: only a signup flagged Databricks-origin gets through.
+  const capFull = (_email: string, _deps?: unknown, origin?: { databricks?: boolean }) => Promise.resolve(origin?.databricks ? 'approved' : 'waitlisted');
+  const emailSignup = (extra: Record<string, unknown>) => request(app).post('/register').send({ email: gmail, password: 'ValidPass123!', signupSource: 'mcp', ...extra });
+  const google = (state: string) => {
+    const done = jest.fn();
+    return googleCallback({ query: { state } } as any, '', '', { id: 'g-1', emails: [{ value: gmail }] } as any, done).then(() => done);
+  };
+  beforeEach(() => { process.env.ZOMA_WAITLIST_ENABLED = 'true'; mockAdmitZoma.mockImplementation(capFull); });
+  afterEach(() => { delete process.env.ZOMA_WAITLIST_ENABLED; });
+
+  it('email signup with a Databricks-marked intent is admitted with the Databricks origin when seats are full', async () => {
+    const r = await emailSignup({ signupIntent: mintZomaSignupIntent({ databricks: true }) });
+    expect(r.status).toBe(201);
+    expect(mockAdmitZoma).toHaveBeenCalledWith(gmail, undefined, { databricks: true });
+    expect(mockCreateUser).toHaveBeenCalled();
+  });
+
+  it('email signup with an ordinary intent is still waitlisted, and is admitted by email alone', async () => {
+    const r = await emailSignup({ signupIntent: mintZomaSignupIntent() });
+    expect(r.status).toBe(202);
+    expect(r.body).toEqual({ code: 'waitlisted', status: 'waitlisted', message: expect.any(String) });
+    expect(mockAdmitZoma.mock.calls).toEqual([[gmail]]);
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
+
+  it('a body that merely says it is Databricks does not exempt the signup', async () => {
+    const claims = { clientName: 'Databricks', client_name: 'Databricks', databricks: true, origin: { databricks: true }, signupProduct: 'zoma' };
+    const r = await request(app).post('/register').send({ email: 'ghost@unresolvable.test', password: 'ValidPass123!', ...claims });
+    expect(r.status).toBe(202);
+    expect(mockAdmitZoma.mock.calls).toEqual([['ghost@unresolvable.test']]);
+  });
+
+  it('a Databricks marker bolted onto an ordinary intent is rejected by the invalid-intent guard, before admission', async () => {
+    // A company-domain address: a personal one would be refused by the personal-email gate before this guard runs.
+    const [expiry, mac] = mintZomaSignupIntent().split('.');
+    const r = await request(app).post('/register').send({ email: 'ghost@unresolvable.test', password: 'ValidPass123!', signupSource: 'mcp', signupIntent: `${expiry}.db.${mac}` });
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('invalid_signup_intent');
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
+
+  it('is dark: with the gate off, a Databricks intent never consults admission', async () => {
+    delete process.env.ZOMA_WAITLIST_ENABLED;
+    const r = await emailSignup({ signupIntent: mintZomaSignupIntent({ databricks: true }) });
+    expect(r.status).toBe(201);
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+  });
+
+  it('Google sign-in with a Databricks-marked state is admitted with the Databricks origin when seats are full', async () => {
+    const done = await google(encodeGoogleOAuthState('customer', mintZomaSignupIntent({ databricks: true })));
+    expect(mockAdmitZoma).toHaveBeenCalledWith(gmail, undefined, { databricks: true });
+    expect(done).toHaveBeenCalledWith(null, expect.objectContaining({ userId: 'persisted-user' }));
+  });
+
+  it('Google sign-in with an ordinary Zoma state is still waitlisted, admitted by email alone', async () => {
+    const done = await google(encodeGoogleOAuthState('customer', mintZomaSignupIntent()));
+    expect(mockAdmitZoma.mock.calls).toEqual([[gmail]]);
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({ code: 'waitlisted' }), null);
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
+
+  it('Google sign-in with a forged Databricks marker gets neither the exemption nor a personal-email account', async () => {
+    const [expiry, mac] = mintZomaSignupIntent().split('.');
+    const done = await google(`customer~${expiry}.db.${mac}`);
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({ code: 'personal_email_not_allowed' }), null);
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
+
+  it('is dark for Google too: with the gate off, a Databricks state never consults admission', async () => {
+    delete process.env.ZOMA_WAITLIST_ENABLED;
+    const done = await google(encodeGoogleOAuthState('customer', mintZomaSignupIntent({ databricks: true })));
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+    expect(done).toHaveBeenCalledWith(null, expect.objectContaining({ userId: 'persisted-user' }));
+  });
+});

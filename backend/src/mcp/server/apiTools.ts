@@ -24,6 +24,8 @@ import './gtmTools';
 import './gtmEmailTool';
 import './leadReadTools';
 import './accountReadTools';
+import './fileReadTool';
+import './leadEngagementTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -1684,6 +1686,7 @@ mcpToolRegistry.register({
         search: { type: 'string', description: 'Only leads matching this text (list action)' },
         status: { type: 'string', description: 'Only leads with this pipeline status (list action)' },
         engaged_only: { type: 'boolean', description: 'Only leads that have engaged (list action)' },
+        status_note: { type: 'string', description: 'Optional, update action with updates.status only: a note (1 to 500 characters) kept on the pipeline status change event, like a reason for the change. Recorded only when the status really changes (the answer has statusNoteRecorded); it is not the lead\'s own notes field. A note containing clicked, replied or received marks the lead as engaged.' },
         client_id: {
           type: 'string',
           description: "Admin-only. Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Supported for 'list', 'get', and 'add'. For 'add', the real write additionally requires the MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED flag; dry_run:true always works regardless of the flag. Still rejected for 'update'/'delete' (broader authorization review pending).",
@@ -1709,6 +1712,10 @@ mcpToolRegistry.register({
     // Only update/delete remain blanket-rejected — add graduated out under
     // ENG-1557 v1. Still reject ANY present client_id (not just non-empty
     // strings — CodeRabbit, PR #2651) rather than silently falling through.
+    // status_note belongs to update only: anywhere else it would be dropped silently and an agent would think the note was kept.
+    if (args.status_note !== undefined && args.status_note !== null && args.action !== 'update') {
+      throw new Error(`manage_leads ${args.action}: status_note goes only with action "update" and a status change. Nothing was changed.`);
+    }
     const isRejectedWrite = (args.action === 'update' || args.action === 'delete') && hasClientId;
     if (isRejectedWrite) {
       throw new Error(
