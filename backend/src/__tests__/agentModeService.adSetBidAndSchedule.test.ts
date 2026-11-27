@@ -349,6 +349,25 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
       expect((metaService.createAdSet as jest.Mock).mock.calls[0][2].bid_strategy).toBe('COST_CAP');
     });
 
+    it('does not require bid_amount when a COST_CAP strategy is inherited from the CBO campaign, and does not resend it', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC', daily_budget: 5000, bid_strategy: 'COST_CAP' });
+      const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams, daily_budget: undefined });
+      expect(result.success).toBe(true);
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith).not.toHaveProperty('bid_strategy');
+      expect(calledWith).not.toHaveProperty('bid_amount');
+    });
+
+    it('still requires bid_amount when the caller explicitly sets COST_CAP / BID_CAP on a CBO ad set', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC', daily_budget: 5000 });
+      for (const bid_strategy of ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP']) {
+        const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams, daily_budget: undefined, bid_strategy });
+        expect(result.success).toBe(false);
+        expect(JSON.stringify(result)).toContain(`bid_amount is required for ${bid_strategy}`);
+      }
+      expect(metaService.createAdSet).not.toHaveBeenCalled();
+    });
+
     it('keeps the ad-set default bid_strategy when the campaign has no budget (ABO, unchanged)', async () => {
       await service.createMetaAdsAdSet('user123', { ...baseAdSetParams });
       expect((metaService.createAdSet as jest.Mock).mock.calls[0][2].bid_strategy).toBe('LOWEST_COST_WITHOUT_CAP');

@@ -13216,8 +13216,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       if (strategy === 'LOWEST_COST_WITHOUT_CAP' && args.bid_amount !== undefined) {
         throw new Error('bid_amount must not be provided for LOWEST_COST_WITHOUT_CAP strategy.');
       }
-      if ((strategy === 'LOWEST_COST_WITH_BID_CAP' || strategy === 'COST_CAP') && args.bid_amount === undefined) {
-        throw new Error(`bid_amount is required for ${strategy} strategy.`);
+      // A cap inherited from a CBO campaign carries its own bid on the campaign; only a cap the
+      // caller set on this ad set needs an ad-set bid_amount.
+      if ((args.bid_strategy === 'LOWEST_COST_WITH_BID_CAP' || args.bid_strategy === 'COST_CAP') && args.bid_amount === undefined) {
+        throw new Error(`bid_amount is required for ${args.bid_strategy} strategy.`);
       }
 
       // Bid amount min/max guard

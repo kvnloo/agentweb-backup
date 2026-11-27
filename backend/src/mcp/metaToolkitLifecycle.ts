@@ -110,7 +110,7 @@ function validateShape(entity: LifecycleEntity, action: LifecycleAction, args: a
   // mean the destination campaign. It used to be dropped silently, copying the ad set back into
   // its own campaign instead of the one the user named.
   if (action === 'COPY' && entity === 'AD_SET' && params.campaign_id === undefined && args.campaign_id !== undefined) {
-    params.campaign_id = args.campaign_id;
+    params.campaign_id = typeof args.campaign_id === 'number' ? String(args.campaign_id) : args.campaign_id;
   }
   const keys = Object.keys(params).filter((k) => params[k] !== undefined);
   const allowed = action === 'COPY' ? COPY_PARAMS[entity] : [];

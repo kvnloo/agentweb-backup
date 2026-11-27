@@ -202,6 +202,15 @@ describe('ENG-2922 Meta ARCHIVE / DELETE / COPY', () => {
     expect(mock.copy).toHaveBeenCalledWith('u1', '111', 'AD_SET', '900', expect.objectContaining({ campaign_id: '700', deep_copy: true }));
   });
 
+  it('AD_SET COPY accepts a numeric top-level campaign_id (coerced to a string id, not refused)', async () => {
+    const { deps, mock } = makeDeps();
+    const a = { entity_type: 'AD_SET', action: 'COPY', account_id: '111', ad_set_id: '900', campaign_id: 700, params: { deep_copy: true } };
+    const preview: any = await executeMetaToolkitLifecycle('u1', a, deps);
+    expect(preview.preview).toMatch(/into campaign "Other campaign" \(id 700\)/);
+    await executeMetaToolkitLifecycle('u1', { ...a, confirm: true, preview_token: preview.preview_token }, deps);
+    expect(mock.copy).toHaveBeenCalledWith('u1', '111', 'AD_SET', '900', expect.objectContaining({ campaign_id: '700' }));
+  });
+
   it('a Meta refusal of a COPY is reported with Meta\'s reason', async () => {
     const refused = makeDeps({ copy: jest.fn().mockRejectedValue(Object.assign(new Error('Invalid parameter — Ad set budget not allowed (code 100, subcode 1885621)'), { response: { status: 400 } })) });
     const r: any = await previewThenConfirm(refused.deps, { entity_type: 'AD_SET', action: 'COPY', account_id: '111', ad_set_id: '900', params: { campaign_id: '700' } });
