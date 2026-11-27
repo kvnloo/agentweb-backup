@@ -1652,7 +1652,18 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
+      const setsBudget = params?.daily_budget !== undefined || params?.lifetime_budget !== undefined;
+      const current = await MetaService.verifyWriteOwnership(
+        campaign, campaignId, 'Campaign', adAccountId, setsBudget ? ['daily_budget', 'lifetime_budget'] : [],
+      );
+      // ENG-2364, mirrored from createCampaign: giving a campaign a budget without a bid strategy
+      // leaves Meta on LOWEST_COST_WITH_BID_CAP, and every ad set create/copy then fails with
+      // subcode 1815857 ("Bid amount required"). An explicit bid_strategy is never overridden, and
+      // a campaign that already has a budget keeps the strategy it is on (e.g. a deliberate COST_CAP).
+      const hadBudget = Number(current.daily_budget) > 0 || Number(current.lifetime_budget) > 0;
+      if (setsBudget && params.bid_strategy === undefined && !hadBudget) {
+        params = { ...params, bid_strategy: 'LOWEST_COST_WITHOUT_CAP' };
+      }
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
       return { success: true };
@@ -2452,10 +2463,11 @@ export class MetaService {
     nodeId: string,
     nodeLabel: string,
     adAccountId: string,
-  ): Promise<void> {
+    extraFields: string[] = [],
+  ): Promise<Record<string, any>> {
     let ownerData: Record<string, any>;
     try {
-      const owner = await node.get(MetaService.withOwnershipField([]));
+      const owner = await node.get(MetaService.withOwnershipField(extraFields));
       ownerData = { ...((owner as any)?._data ?? {}) };
     } catch (error) {
       console.error(`[MetaService] ownership check failed for ${nodeLabel} ${nodeId}:`, error);
@@ -2464,6 +2476,7 @@ export class MetaService {
       );
     }
     MetaService.assertOwnedByAccount(ownerData.account_id, nodeId, nodeLabel, adAccountId);
+    return ownerData;
   }
 
   /**
