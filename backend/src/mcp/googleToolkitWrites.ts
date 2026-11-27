@@ -19,7 +19,8 @@
  *   2. Payment method + usable Google Ads connection (assertZomaWriteReady 'google_ads').
  *   3. Read the current state the preview describes (target, budget, shared-budget usage).
  *   4. GOOGLE_TOOLKIT_SPEND_CEILING (mirrors META_TOOLKIT_SPEND_CEILING, micros) — on budget
- *      amounts, and on enabling a campaign at its current budget.
+ *      amounts, and on enabling a campaign at its current budget. Unset/empty → built-in
+ *      DEFAULT_GOOGLE_X_SPEND_CEILING ($500/day, ≤2x per change; ENG-3212), never "no ceiling".
  *   5. No confirm → PREVIEW + single-use preview_token bound to the user, the exact arguments
  *      AND the state read in step 3. Nothing is sent to Google.
  *   6. confirm=true + matching token → dispatched ONCE through the same call_google_ads_api
@@ -75,11 +76,20 @@ export interface GoogleToolkitWriteDeps {
 }
 
 /**
- * Optional global ceiling for external Google writes, in MICROS (Google's native unit):
- * {"maxDailyBudget": 100000000, "maxChangeRatio": 3}. Unset = no ceiling; malformed = fail closed.
+ * Built-in ceiling when the env var is unset or empty (ENG-3212): $500/day, at most 2x per change.
+ * Prod EB is at CloudFormation's 4096-char EnvironmentVariables limit, so the env var cannot be
+ * relied on to exist. Mirrors DEFAULT_LINKEDIN_SPEND_CEILING.
  */
-export function googleSpendCeilingPolicyFromEnv(raw = process.env.GOOGLE_TOOLKIT_SPEND_CEILING): MetaSpendCeilingPolicy | null {
-  if (!raw) return null;
+export const DEFAULT_GOOGLE_X_SPEND_CEILING: Readonly<MetaSpendCeilingPolicy> = Object.freeze({ maxDailyBudget: 500_000_000, maxChangeRatio: 2 });
+
+/**
+ * Global ceiling for external Google (and X) writes, in MICROS (Google's native unit):
+ * {"maxDailyBudget": 100000000, "maxChangeRatio": 3}. Unset/empty = DEFAULT_GOOGLE_X_SPEND_CEILING;
+ * a set value fully replaces the default; malformed = fail closed.
+ * `raw` is required so X passes its own env var and never inherits Google's.
+ */
+export function googleSpendCeilingPolicyFromEnv(raw: string | undefined): MetaSpendCeilingPolicy {
+  if (!raw) return { ...DEFAULT_GOOGLE_X_SPEND_CEILING };
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed.maxDailyBudget !== undefined || parsed.maxChangeRatio !== undefined)) return { maxDailyBudget: parsed.maxDailyBudget, maxChangeRatio: parsed.maxChangeRatio };
@@ -195,7 +205,7 @@ export function mapGoogleReadRows(kind: GoogleReadKind, rows: any[]): any {
 }
 
 // Loaded lazily: the Google service stack is not imported unless a Google write runs.
-const defaultDeps: GoogleToolkitWriteDeps = {
+export const defaultGoogleToolkitWriteDeps: GoogleToolkitWriteDeps = {
   assertReady: (userId) => assertZomaWriteReady(userId, undefined, 'google_ads'),
   read: async (userId, customerId, kind, resourceName) => {
     if (!isCustomerResource(customerId, kind, resourceName)) return null;
@@ -205,7 +215,7 @@ const defaultDeps: GoogleToolkitWriteDeps = {
     return rows.length === 1 ? mapGoogleReadRow(kind, rows[0]) : null;
   },
   dispatch: async (userId, args) => (await import('../emma/googleAdsTools')).callGoogleAdsApiTool.execute(args, { userId }),
-  spendCeilingPolicy: () => googleSpendCeilingPolicyFromEnv(),
+  spendCeilingPolicy: () => googleSpendCeilingPolicyFromEnv(process.env.GOOGLE_TOOLKIT_SPEND_CEILING),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
   consumedTokens: defaultConsumedTokenStore,
@@ -820,7 +830,7 @@ export async function executeGoogleToolkitWrite(
   userId: string,
   rawArgs: any,
   currency: string,
-  deps: GoogleToolkitWriteDeps = defaultDeps,
+  deps: GoogleToolkitWriteDeps = defaultGoogleToolkitWriteDeps,
 ) {
   const { confirm, preview_token: previewToken, ...args } = rawArgs ?? {};
   const entity = String(args.entity_type);
