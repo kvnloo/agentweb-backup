@@ -31,6 +31,10 @@ import './siteScanAndLookupTools';
 import './meetingEventReadTools';
 import './hubspotReadTool';
 import './linkedInAdsReadTools';
+import './googleCalendarReadTools';
+import './assetAndOutreachAccountTools';
+import './leadDraftTool';
+import './kbFileReadTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -1867,38 +1871,6 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/search-knowledge-base', context: ctx(context),
       body: { query: args.query, max_results: args.max_results || 5 }
-    });
-    return jsonResult(data);
-  }
-});
-
-mcpToolRegistry.register({
-  name: 'read_knowledge_base_files',
-  definition: {
-    name: 'read_knowledge_base_files',
-    description: 'Read specific files from the knowledge base.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        files: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              kb_identifier: { type: 'string', description: 'Knowledge base task ID' },
-              file_name: { type: 'string', description: 'File name to read' }
-            },
-            required: ['kb_identifier', 'file_name']
-          }
-        }
-      },
-      required: ['files']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/read-knowledge-base-files', context: ctx(context),
-      body: { files: args.files }
     });
     return jsonResult(data);
   }
