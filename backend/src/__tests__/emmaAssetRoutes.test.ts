@@ -1,7 +1,7 @@
 /**
  * ENG-2840 (W2-10): the two /api/emma routes behind the MCP tools `search_user_assets` and `inspect_linkedin_account`
  * (routes/emmaAssetRoutes.ts). Each checks the body by name and value and reads as `req.user.userId` only: the asset search calls the
- * session search and the task-run read with `{ backfill: false, warm: false }` (tasks.assetWarmOption.test.ts drives the real task read);
+ * session search and the task-run read with `{ backfill: false, warm: false, sessions: false }` (tasks.assetWarmOption.test.ts drives the real task read);
  * the account read runs Emma's own tool through her registry with `{ userId }` only, and her "not connected" answer becomes a fixed
  * refusal that does not repeat the id. The router here stands in for emmaApi's (its auth and budget middleware have their own tests).
  */
@@ -62,7 +62,7 @@ describe('identity: req.user.userId only', () => {
     expect(res.status).toBe(200);
     expect(mockEnforce).toHaveBeenCalledWith('caller-1', 'search_user_assets');
     expect(mockSearch.mock.calls).toStrictEqual([['caller-1', 'htmlReports', 'deck', false, false]]);
-    expect(mockExecutions.mock.calls).toStrictEqual([['caller-1', 'html-reports', '', { backfill: false, warm: false }]]);
+    expect(mockExecutions.mock.calls).toStrictEqual([['caller-1', 'html-reports', '', { backfill: false, warm: false, sessions: false }]]);
     expect(mockExecute).not.toHaveBeenCalled();
   });
 

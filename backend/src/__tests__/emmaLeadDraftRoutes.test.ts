@@ -96,6 +96,14 @@ describe('access, before Emma runs', () => {
     expect(mockExecute).not.toHaveBeenCalled();
   });
 
+  it('answers a failed list read as a failure (500), not as a missing list', async () => {
+    mockGetList.mockRejectedValue(new Error('DynamoDB throttled'));
+    const res = await post(VALID);
+    expect(res.status).toBe(500);
+    expect(res.body.message).toBe('The draft could not be written. Try again later.');
+    expect(mockExecute).not.toHaveBeenCalled();
+  });
+
   it('checks access as req.user.userId', async () => {
     mockExecute.mockResolvedValue(OK_RESULT);
     await post(VALID);

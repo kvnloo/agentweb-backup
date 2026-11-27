@@ -282,3 +282,12 @@ describe('size limits', () => {
     expect(mockRead).toHaveBeenCalledTimes(1);
   });
 });
+
+// ENG-2840 (W2-10 review): the Drive text read now stops at 50 MB; that refusal has its own fixed text.
+describe('a Drive file over the read ceiling', () => {
+  it('is classified too_large, with the fixed text', () => {
+    const { classifyFailure, KB_FILE_READ_ERRORS } = require('../routes/emmaKbFileReadRoutes');
+    expect(classifyFailure({ success: false, message: 'Failed to read Google Drive file "huge.mp4": "huge.mp4" is larger than 50 MB, the most that can be read here' })).toBe('too_large');
+    expect(KB_FILE_READ_ERRORS.too_large).toBe('Too large: this file is over 50 MB, the most that can be read here.');
+  });
+});

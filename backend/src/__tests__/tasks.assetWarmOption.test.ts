@@ -108,6 +108,16 @@ beforeEach(() => {
 });
 
 describe('getExecutionsWithAssets warm option', () => {
+  it('sessions: false reads only the task-run files: no session is listed, read or written', async () => {
+    const result = await getExecutionsWithAssets('user123', 'images', '', { backfill: false, warm: false, sessions: false });
+    await settle();
+    expect(proto.getSessionsWithoutMessages).not.toHaveBeenCalled();
+    expect(proto.getMessagesFromMessagesTable).not.toHaveBeenCalled();
+    expect(proto.getMessagesFromIndex).not.toHaveBeenCalled();
+    expectNoWriteNoFetchNoClassifier();
+    expect(Object.keys(result).some((k) => k.startsWith('agent-mode-'))).toBe(false);
+  });
+
   it('default (warm on): uncached sessions are warmed in the background and their caches written (unchanged behaviour)', async () => {
     await getExecutionsWithAssets('user123', 'html-reports', '', { backfill: false });
     await settle();
