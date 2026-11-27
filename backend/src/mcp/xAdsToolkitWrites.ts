@@ -20,7 +20,9 @@
  *   3. Read the current state the preview describes (stable fields only, so spend counters
  *      moving between preview and confirm do not void the token).
  *   4. X_ADS_TOOLKIT_SPEND_CEILING (micros, same shape as GOOGLE_TOOLKIT_SPEND_CEILING) on
- *      daily budgets, and on activating at the daily spend that activation unlocks.
+ *      daily budgets, and on activating at the daily spend that activation unlocks. Unset/empty
+ *      → built-in DEFAULT_GOOGLE_X_SPEND_CEILING ($500/day, ≤2x per change; ENG-3212). Google's
+ *      env var is never read for X.
  *   5. No confirm → PREVIEW + single-use preview_token bound to user, arguments and state.
  *   6. confirm=true + matching token → applied ONCE → independent read-back. Only CONFIRMED is
  *      success. A failure without a definite answer (no response, 5xx, 408) may have applied,
