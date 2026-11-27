@@ -528,11 +528,16 @@ export function googleAdsPolicyReasons(e: any): string | undefined {
   }
   const v = e?.details?.policyViolationDetails;
   if (v?.key?.policyName && /^[a-z0-9_]+$/i.test(String(v.key.policyName))) reasons.push(String(v.key.policyName));
+  // Google's own policy title (no digits, so it cannot read as an HTTP status), when no key is given.
+  else if (v?.externalPolicyName && /^[A-Za-z][A-Za-z &/'-]{0,80}$/.test(String(v.externalPolicyName))) reasons.push(String(v.externalPolicyName));
   // Which field failed, e.g. headlines[2]: tells the caller which line to rewrite.
   const path = (e?.location?.fieldPathElements ?? [])
     .map((p: any) => (/^[a-z_]+$/.test(String(p?.fieldName ?? '')) ? `${p.fieldName}${Number.isInteger(p.index) ? `[${p.index}]` : ''}` : ''))
     .filter(Boolean).join('.');
-  if (reasons.length && path) reasons.push(`at ${path}`);
+  // A policy error with no readable topic still names the field; other errors never get a "Policy:" suffix.
+  const isPolicy = !!(e?.details?.policyFindingDetails || e?.details?.policyViolationDetails
+    || e?.errorCode?.policyFindingError || e?.errorCode?.policyViolationError);
+  if (path && (reasons.length || isPolicy)) reasons.push(`at ${path}`);
   return reasons.length ? [...new Set(reasons)].join(', ') : undefined;
 }
 
