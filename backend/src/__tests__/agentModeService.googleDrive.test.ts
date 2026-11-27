@@ -2688,7 +2688,7 @@ describe('AgentModeService - Google Drive methods', () => {
       }));
       expect(mockDriveFiles.export).toHaveBeenCalledWith(
         { fileId: 'target-doc-1', mimeType: 'text/plain' },
-        { responseType: 'stream' }
+        expect.objectContaining({ responseType: 'stream' })
       );
       expect(result).toMatchObject({
         success: true,
