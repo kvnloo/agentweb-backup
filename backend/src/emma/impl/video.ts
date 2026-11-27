@@ -111,6 +111,12 @@ import { isSupportedVideoModel, normalizeVideoModel } from '../../services/video
 /** Total time for downloading a caller's video, redirects included (the size cap is MAX_DOWNLOADED_VIDEO_SIZE_MB, default 100 MB). */
 const VIDEO_DOWNLOAD_TIMEOUT_MS = 180_000;
 
+/** The guarded download ended at its time limit (the abort signal, axios's own timeout, or the redirect deadline). */
+function isDownloadTimeout(err: any): boolean {
+  return err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || err?.code === 'ECONNABORTED'
+    || /timed out|timeout of \d+ms exceeded/i.test(String(err?.message || ''));
+}
+
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 
 
@@ -318,14 +324,16 @@ export async function describeVideo(
         }
       ];
     } else {
-      const maxSizeMb = parseInt(process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB || '100', 10);
+      // A setting that is not a positive number falls back to 100 MB (NaN here would turn the size cap off).
+      const configuredMb = parseInt(process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB || '100', 10);
+      const maxSizeMb = Number.isFinite(configuredMb) && configuredMb > 0 ? configuredMb : 100;
       const maxSizeBytes = maxSizeMb * 1024 * 1024;
 
       // ENG-2840: the URL is the caller's choice, so it is fetched only through the SSRF-guarded fetch (DNS pinned to a public address,
       // every redirect re-checked, the size capped while downloading, the whole download bounded in time). Before, a plain axios GET with
       // no host check and no timeout let any signed-in user make the server request an internal address.
       const { fetchCallerUrlBuffer, CallerUrlBlockedError, CallerUrlTooLargeError } = await import('../../utils/callerUrlFetch');
-      let downloaded: { buffer: Buffer; contentType: string };
+      let downloaded: { buffer: Buffer; contentType: string } | null;
       try {
         downloaded = await fetchCallerUrlBuffer(videoFileUrl, {
           tool: 'describe_video',
@@ -338,6 +346,12 @@ export async function describeVideo(
           return { success: false, message: `Video file too large for analysis: it exceeds the limit of ${maxSizeMb} MB` };
         }
         if (err instanceof CallerUrlBlockedError) return { success: false, message: err.message };
+        if (isDownloadTimeout(err)) {
+          return {
+            success: false,
+            message: `The video did not download within ${VIDEO_DOWNLOAD_TIMEOUT_MS / 1000} s. Use a smaller file or a faster host.`,
+          };
+        }
         throw err;
       }
 
@@ -373,6 +387,8 @@ export async function describeVideo(
         };
       }
       await fs.writeFile(tempFilePath, downloaded.buffer);
+      // The file holds the video now: drop the buffer (up to the size cap) before the upload and the analysis.
+      downloaded = null;
 
       const uploadResponse = await aiClient.files.upload({
         file: tempFilePath,
