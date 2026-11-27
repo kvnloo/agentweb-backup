@@ -176,6 +176,33 @@ describe('early-signup free period', () => {
     expect(plan?.publish_enabled).toBe(true);
   });
 
+  it('early signup with an unsettled trial: no payment-pending block, publish allowed', async () => {
+    setEarly();
+    const sec = (iso: string) => Math.floor(Date.parse(iso) / 1000);
+    const trial: any = {
+      id: 'sub_t', status: 'trialing', created: sec('2026-11-20T00:00:00Z'), trial_start: sec('2026-11-20T00:00:00Z'), trial_end: sec('2026-11-27T00:00:00Z'),
+      latest_invoice: { id: 'in_fee', status: 'open' }, cancel_at_period_end: false, metadata: { product: 'zoma_plan', userId: 'u1' },
+      items: { data: [{ current_period_start: sec('2026-11-20T00:00:00Z'), current_period_end: sec('2026-11-27T00:00:00Z') }] },
+    };
+    const d = deps(IN_WINDOW, DEC_2, { findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([trial]) });
+    const plan = await getZomaPlanSummary('u1', d);
+    expect(plan?.error).toBeUndefined();
+    expect(plan?.publish_enabled).toBe(true);
+    expect(formatZomaPlanLine(plan!, getZomaBillingConfig(BILLING_ENV))).toMatch(/^  \[x\] Zoma plan: trial/);
+    await expect(publish(d)).resolves.toBeUndefined();
+  });
+
+  it.each(['past_due', 'unpaid'])('early signup with a %s plan shows free, no link, no error', async (status) => {
+    setEarly();
+    const d = deps(IN_WINDOW, DEC_2, {
+      findCustomerId: jest.fn().mockResolvedValue('cus_1'),
+      listSubscriptions: jest.fn().mockResolvedValue([{ id: 'sub_p', status, created: 5, metadata: { product: 'zoma_plan' }, items: { data: [] } }]),
+    });
+    const plan = await getZomaPlanSummary('u1', d);
+    expect(plan).toEqual({ status: 'none', publish_enabled: true, free_until: 'Jan 1, 2027' });
+    expect(d.createCheckoutSession).not.toHaveBeenCalled();
+  });
+
   it('early signup with a cancelled old plan still shows free, and no checkout', async () => {
     setEarly();
     const d = deps(IN_WINDOW, DEC_2, {

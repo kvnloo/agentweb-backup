@@ -530,8 +530,8 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
       throw error;
     });
     if (!state) return freeSummary();
-    // An early signup who already holds a live or failing plan sees that plan, not "no card needed".
-    const holdsPlan = state.status === 'trialing' || state.status === 'active' || planPaymentFailed(state);
+    // An early signup who already holds a live plan sees that plan, not "no card needed".
+    const holdsPlan = state.status === 'trialing' || state.status === 'active';
     if (early && !holdsPlan) return freeSummary();
     const summary: ZomaPlanSummary = {
       status: state.status,
@@ -542,7 +542,9 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
       ...(state.hadPlan ? { returning: true } : {}),
       ...(state.periodStart && state.periodEnd ? { period: { start: state.periodStart, end: state.periodEnd } } : {}),
     };
-    if (planPaymentPending(state)) {
+    if (early) {
+      // Exempt: publishing is allowed, so no payment-block message and no checkout link.
+    } else if (planPaymentPending(state)) {
       summary.error = PAYMENT_PENDING_MESSAGE;
     } else if (planPaymentFailed(state)) {
       summary.error = paymentFailedMessage(cfg);
