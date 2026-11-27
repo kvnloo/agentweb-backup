@@ -2333,10 +2333,13 @@ export async function getExecutionsWithAssets(
   // ENG-2840 (W2-10): `warm: false` writes no session asset cache either (no background warm
   // of uncached sessions, no incremental cache update), so with `backfill: false` the call is
   // a pure read (search_user_assets over MCP). Default true: unchanged.
-  options: { backfill?: boolean; warm?: boolean } = {},
+  // `sessions: false` reads only the task-run files: no agent-mode session is read at all (a caller that lists session assets another
+  // way, like the MCP asset search, would otherwise pay a full scan of every uncached session's messages for nothing).
+  options: { backfill?: boolean; warm?: boolean; sessions?: boolean } = {},
 ): Promise<Record<string, any>> {
   const backfill = options.backfill !== false;
   const warm = options.warm !== false;
+  const includeSessions = options.sessions !== false;
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
 
@@ -2452,7 +2455,7 @@ export async function getExecutionsWithAssets(
 
   // Search Agent Mode sessions for assets using incremental caching
   const chatbotDbForEnrich = new ChatbotDB();
-  try {
+  if (includeSessions) try {
     const chatbotDb = chatbotDbForEnrich;
     // Load sessions metadata only (no messages) — single DynamoDB query
     const agentSessions = await chatbotDb.getSessionsWithoutMessages(userId, 'agent');
@@ -2915,9 +2918,7 @@ async function getWorkspaceExecutionsWithAssets(
   return getWorkspaceAssets(caller, {
     getOrgMembers: (orgId) => orgDb.getOrgMembers(orgId),
     fetchForUser: (memberId) =>
-      // ENG-2874 / ENG-2840: only the owner's own read writes anything (searchable text, report labels, the session asset caches);
-      // a teammate's read of the shared workspace is read-only.
-      getExecutionsWithAssets(memberId, assetType, errorMessage, { backfill: memberId === userId, warm: memberId === userId }),
+      getExecutionsWithAssets(memberId, assetType, errorMessage, { backfill: memberId === userId }),
   });
 }
 

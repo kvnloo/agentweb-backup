@@ -90,7 +90,8 @@ async function searchAssets(caller: string, args: Record<string, unknown>): Prom
     // As in Emma: with no type (or all) only the task runs' HTML reports are added.
     const taskType = !typeFilter || typeFilter === 'htmlReports' ? 'html-reports' : typeFilter;
     const assetType: AssetType = taskType === 'html-reports' ? 'htmlReport' : taskType === 'images' ? 'image' : 'video';
-    const executions = await getExecutionsWithAssets(caller, taskType, '', { backfill: false, warm: false });
+    // Task-run files only: the session assets come from searchUserAssets above, so no session is scanned here.
+    const executions = await getExecutionsWithAssets(caller, taskType, '', { backfill: false, warm: false, sessions: false });
     for (const task of Object.values(executions) as any[]) {
       if (task?.source !== 'task') continue;
       for (const execution of task.executions || []) {
