@@ -60,7 +60,7 @@ import {
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
 import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
-import { annotateCreativeCta, ctaNoteForRequested, withAnnotatedCreativeCta } from '../utils/metaCtaAliases';
+import { annotateCreativeCta, ctaNoteForRequested, requestedCtaForStored, withAnnotatedCreativeCta } from '../utils/metaCtaAliases';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
@@ -12527,7 +12527,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           body: params.body || vd.message || creativeData.body || '',
           title: params.title || vd.title || creativeData.title || '',
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
-          call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+          call_to_action_type: params.call_to_action_type || requestedCtaForStored('video_data', vd.call_to_action?.type),
           url_tags: carriedUrlTags,
           ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
@@ -14079,7 +14079,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
         title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
         link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || requestedCtaForStored('video_data', vd.call_to_action?.type) || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
@@ -14096,7 +14096,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+        call_to_action_type: params.call_to_action_type || requestedCtaForStored('video_data', vd.call_to_action?.type),
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
