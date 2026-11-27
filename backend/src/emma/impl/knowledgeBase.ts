@@ -2851,12 +2851,19 @@ export async function materializeKnowledgeBaseAsset(
     // ENG-2840: streamed with the byte cap applied while downloading. Drive's reported `size` can be missing or stale (e.g. 0 during a
     // virus scan); before, the whole file was buffered first and only then measured, so a large file with bad metadata was held in memory
     // in full.
-    const mediaResponse = await drive.files.get(
-      { fileId: file.id!, alt: 'media', supportsAllDrives: true },
-      { responseType: 'stream' }
-    );
+    const abort = new AbortController();
+    let mediaResponse: any;
+    try {
+      mediaResponse = await drive.files.get(
+        { fileId: file.id!, alt: 'media', supportsAllDrives: true },
+        { responseType: 'stream', signal: abort.signal }
+      );
+    } catch (err) {
+      const { normalizeStreamedDriveError } = await import('./shared/googleDriveErrors');
+      throw normalizeStreamedDriveError(err);
+    }
     const { readWithByteCap } = await import('../../utils/readWithByteCap');
-    const buffer = await readWithByteCap(mediaResponse.data, MATERIALIZE_ASSET_MAX_BYTES);
+    const buffer = await readWithByteCap(mediaResponse.data, MATERIALIZE_ASSET_MAX_BYTES, () => abort.abort());
     if (!buffer) {
       return {
         success: false,

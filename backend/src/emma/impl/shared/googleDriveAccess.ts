@@ -140,22 +140,29 @@ export async function readGoogleDriveFileContent(drive: any, fileId: string, fil
   // a binary one then converted to base64) whatever its size, so naming a large video in a registered folder could exhaust the
   // process's memory. Drive's reported size can be missing, so it is not trusted.
   const { readWithByteCap } = await import('../../../utils/readWithByteCap');
+  const { normalizeStreamedDriveError } = await import('./googleDriveErrors');
   const tooLarge = () => new Error(`"${fileName}" is larger than ${DRIVE_TEXT_READ_MAX_BYTES / (1024 * 1024)} MB, the most that can be read here`);
-  const exportAs = (exportMime: string) => drive.files.export({ fileId, mimeType: exportMime }, { responseType: 'stream' });
+  const abort = new AbortController();
+  const options = { responseType: 'stream', signal: abort.signal };
+  const exportAs = (exportMime: string) => drive.files.export({ fileId, mimeType: exportMime }, options);
 
   // Google Workspace files need to be exported
   let res: any;
-  if (mimeType === 'application/vnd.google-apps.document') {
-    res = await exportAs('text/plain');
-  } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
-    res = await exportAs('text/csv');
-  } else if (mimeType === 'application/vnd.google-apps.presentation') {
-    res = await exportAs('text/plain');
-  } else {
-    // Binary files — download directly
-    res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
+  try {
+    if (mimeType === 'application/vnd.google-apps.document') {
+      res = await exportAs('text/plain');
+    } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
+      res = await exportAs('text/csv');
+    } else if (mimeType === 'application/vnd.google-apps.presentation') {
+      res = await exportAs('text/plain');
+    } else {
+      // Binary files — download directly
+      res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, options);
+    }
+  } catch (err) {
+    throw normalizeStreamedDriveError(err);
   }
-  const read = await readWithByteCap(res?.data, DRIVE_TEXT_READ_MAX_BYTES);
+  const read = await readWithByteCap(res?.data, DRIVE_TEXT_READ_MAX_BYTES, () => abort.abort());
   if (!read) throw tooLarge();
   const content: Buffer = read;
 

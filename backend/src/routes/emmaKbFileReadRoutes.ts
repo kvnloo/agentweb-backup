@@ -167,14 +167,14 @@ function statusOf(value: any): number | undefined {
 export function classifyFailure(result: unknown): KbReadErrorClass {
   const r: Record<string, unknown> = isPlainObject(result) ? result : {};
   const message = typeof r.message === 'string' ? r.message : '';
+  // ENG-2840 (checked first: a file name can contain any of the words below): the Drive text read stops at DRIVE_TEXT_READ_MAX_BYTES (emma/impl/shared/googleDriveAccess.ts).
+  if (/is larger than \d+ MB, the most that can be read here/.test(message)) return 'too_large';
   if (statusOf(r) === 429 || /rate-limited|rate limit/i.test(message)) return 'rate_limited';
   if (/^(ClickUp|Foreplay) not connected$/.test(message)) return 'not_connected';
   if (/^Not authorized to access /.test(message)) return 'not_found';
   if (/^Multiple files named /.test(message)) return 'ambiguous';
   // Drive: the folder (or a sub-folder) could not be opened, the walk stopped at a bound, or the name query itself failed or timed out.
   if (/could not be accessed|not a confirmed absence|^Could not determine whether /.test(message)) return 'search_incomplete';
-  // ENG-2840: the Drive text read stops at DRIVE_TEXT_READ_MAX_BYTES (emma/impl/shared/googleDriveAccess.ts).
-  if (/is larger than \d+ MB, the most that can be read here/.test(message)) return 'too_large';
   if (/^Failed to read /.test(message)) return 'read_failed';
   if (/not found|does not exist/i.test(message)) return 'not_found';
   return 'read_failed';

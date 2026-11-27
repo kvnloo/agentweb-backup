@@ -7,8 +7,9 @@
  *  - the stream ends: the bytes read;
  *  - the stream errors, or closes without ending: an error (a short download must not pass as a complete file).
  * A body that is already bytes (some transports, and tests) is measured as is. Anything else is an error.
+ * `onExceeded` is called when the cap is passed, before the stream is destroyed (to abort the request that produced it).
  */
-export async function readWithByteCap(body: unknown, maxBytes: number): Promise<Buffer | null> {
+export async function readWithByteCap(body: unknown, maxBytes: number, onExceeded?: () => void): Promise<Buffer | null> {
   if (Buffer.isBuffer(body)) return body.length > maxBytes ? null : body;
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
     const buffer = Buffer.from(body as any);
@@ -33,6 +34,9 @@ export async function readWithByteCap(body: unknown, maxBytes: number): Promise<
       if (total > maxBytes) {
         done = true;
         chunks.length = 0;
+        // Stop the request itself too (an abort signal the caller passed to it): destroying the body stream alone can leave the HTTP
+        // response paused with its socket open until the server gives up.
+        try { onExceeded?.(); } catch { /* the cap still holds */ }
         stream.destroy?.();
         resolve(null);
         return;
