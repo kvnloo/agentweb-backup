@@ -30,6 +30,7 @@ import {
 } from '../services/mcpUsageEventsService';
 import { getBackendUrl } from './oauth/authChallenge';
 import { ZomaNotReadyError } from './zomaErrors';
+import { formatEarlySignupFreeUntil, userHasEarlySignupFree } from './zomaEarlySignup';
 
 export const ZOMA_PLAN_PRODUCT_TAG = 'zoma_plan';
 /** Stripe ends a trial that has no payment method a little after trial_end, not at the same second. */
@@ -469,6 +470,8 @@ export async function assertZomaPublishAllowed(
 ): Promise<void> {
   const cfg = deps.config();
   if (!cfg.enabled) return;
+  // Early-signup free period (dark unless ZOMA_EARLY_SIGNUP_FREE_ENABLED=true).
+  if (await userHasEarlySignupFree(userId, deps.getUser, deps.now())) return;
   let state: ZomaPlanState;
   try {
     state = await getZomaPlanState(userId, deps);
@@ -509,6 +512,8 @@ export interface ZomaPlanSummary {
   link?: string;
   /** Had a plan before: the link sells the plan itself, with no trial. */
   returning?: boolean;
+  /** Early-signup free period: publishing is allowed without a plan until this date (display string). */
+  free_until?: string;
   error?: string;
 }
 
@@ -516,6 +521,8 @@ export interface ZomaPlanSummary {
 export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps = defaultZomaBillingDeps): Promise<ZomaPlanSummary | undefined> {
   const cfg = deps.config();
   if (!cfg.enabled) return undefined;
+  const early = await userHasEarlySignupFree(userId, deps.getUser, deps.now());
+  if (early) return { status: 'none', publish_enabled: true, free_until: formatEarlySignupFreeUntil(early) };
   try {
     const state = await getZomaPlanState(userId, deps);
     const summary: ZomaPlanSummary = {
@@ -545,6 +552,7 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
 export function formatZomaPlanLine(plan: ZomaPlanSummary, cfg: ZomaBillingConfig): string {
   const box = plan.publish_enabled ? '[x]' : '[ ]';
   if (plan.error) return `  ${box} Zoma plan (needed to make ads live): ${plan.error}`;
+  if (plan.free_until) return `  [x] Zoma plan: free until ${plan.free_until}, no card needed`;
   if (plan.status === 'trialing') {
     const until = plan.trial_ends_at ? ` until ${plan.trial_ends_at.slice(0, 10)}` : '';
     return plan.cancels_at_period_end
