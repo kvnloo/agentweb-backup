@@ -68,10 +68,10 @@ export function evaluateMetaSpendCeiling(
   if (policy.maxChangeRatio !== undefined && change.field !== 'bid_amount' && change.prior !== undefined && change.prior !== null) {
     const prior = amount(change.prior);
     if (prior === undefined) return invalid('maxChangeRatio', `prior ${change.field} is not a non-negative amount`);
-    // An increase from zero has no finite ratio; treat it as exceeding any ratio ceiling.
-    const exceeds = prior === 0 ? proposed > 0 : proposed / prior > policy.maxChangeRatio;
-    if (exceeds) {
-      const ratio = prior === 0 ? 'an increase from 0' : `${(proposed / prior).toFixed(2)}x`;
+    // A zero prior means no budget was set (adding one), so there is no ratio to apply;
+    // like a create, it is skipped here and maxDailyBudget still caps daily_budget above.
+    if (prior !== 0 && proposed / prior > policy.maxChangeRatio) {
+      const ratio = `${(proposed / prior).toFixed(2)}x`;
       return {
         allowed: false,
         code: 'SPEND_CEILING_EXCEEDED',
