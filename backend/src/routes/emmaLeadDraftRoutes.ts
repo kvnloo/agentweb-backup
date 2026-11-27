@@ -119,7 +119,8 @@ export function registerLeadDraftRoutes(router: Router): void {
     const { args } = checked;
     try {
       const { crmDb } = await import('../services/db');
-      const list = await crmDb.getLeadListById(args.list_id).catch(() => null);
+      // A failed read is a failure (500, fixed text), not a missing list.
+      const list = await crmDb.getLeadListById(args.list_id);
       const { canAccessCrmList, canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../services/crmAccessControl');
       if (!list || !(await canAccessCrmList(caller, list))) return res.status(404).json({ message: LIST_NOT_FOUND });
       if (!(await canDestructiveCrmList(caller, list))) return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
