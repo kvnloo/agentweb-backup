@@ -141,3 +141,18 @@ describe('google_calendar_list_calendars error mapping', () => {
     expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
   });
 });
+
+// ENG-2840 (W2-10): each Calendar read has a time limit (it had none; the MCP self-call waits 60 s).
+describe('Calendar reads have a time limit', () => {
+  it('passes a 30 s timeout on list_events, get_event and list_calendars', async () => {
+    mockEventsList.mockResolvedValue({ data: { items: [] } });
+    mockEventsGet.mockResolvedValue({ data: { id: 'e1' } });
+    mockCalendarListList.mockResolvedValue({ data: { items: [] } });
+    await runListEvents();
+    await runGetEvent({ event_id: 'e1' });
+    await runListCalendars();
+    expect(mockEventsList).toHaveBeenCalledWith(expect.any(Object), { timeout: 30_000 });
+    expect(mockEventsGet).toHaveBeenCalledWith(expect.any(Object), { timeout: 30_000 });
+    expect(mockCalendarListList).toHaveBeenCalledWith(expect.any(Object), { timeout: 30_000 });
+  });
+});

@@ -34,6 +34,13 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   luma_get_guests: 'write',
   luma_list_events: 'write',
   scan_website_links: 'read',
+  // ENG-2840 (W2-10): Calendar reads refresh and store the caller's Google sign-in; the draft tool saves a draft and spends model calls.
+  google_calendar_get_event: 'write',
+  google_calendar_list_calendars: 'write',
+  google_calendar_list_events: 'write',
+  inspect_linkedin_account: 'read',
+  search_user_assets: 'read',
+  update_email_draft_for_lead: 'write',
   assess_client_health: 'write',
   cancel_smartlead_push: 'write',
   check_account_tracking_health: 'write',
@@ -146,7 +153,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   read_client_meta_budgets: 'write',
   read_email: 'read',
   read_file_content: 'read',
-  read_knowledge_base_files: 'write',
+  read_knowledge_base_files: 'read', // ENG-2840 (W2-10): reshaped to a fixed-field read; no path stores a token or writes
   read_landing_page_file: 'write',
   resolve_landing_page_by_url: 'write',
   resolve_skill: 'write',

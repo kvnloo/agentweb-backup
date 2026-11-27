@@ -75,6 +75,13 @@ export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
   'luma_get_guests',
   'luma_list_events',
   'scan_website_links',
+  // W2-10: Calendar reads, asset search, the LinkedIn outreach account, lead email drafts (model calls, never the agent).
+  'google_calendar_get_event',
+  'google_calendar_list_calendars',
+  'google_calendar_list_events',
+  'inspect_linkedin_account',
+  'search_user_assets',
+  'update_email_draft_for_lead',
   'create_knowledge_base_file',
   'create_lead_list',
   'create_schedule_from_template',
