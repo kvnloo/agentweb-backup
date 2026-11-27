@@ -100,6 +100,12 @@ describe('2. Google policy rejections name the policy', () => {
     expect(googleAdsPolicyReasons({ details: { policyViolationDetails: { externalPolicyName: 'Trademarks', key: { policyName: 'trademark', violatingText: 'Acme' } } } }))
       .toBe('trademark');
     expect(googleAdsPolicyReasons({ message: 'no policy' })).toBeUndefined();
+    // CodeRabbit (f05c1712b): Google's policy title when no key is given; the field path alone for a policy error.
+    expect(googleAdsPolicyReasons({ details: { policyViolationDetails: { externalPolicyName: 'Trademarks in ad text' } } })).toBe('Trademarks in ad text');
+    expect(googleAdsPolicyReasons({ details: { policyViolationDetails: { externalPolicyName: 'Save 500 today' } } })).toBeUndefined();
+    const path = { location: { fieldPathElements: [{ fieldName: 'headlines', index: 1 }] } };
+    expect(googleAdsPolicyReasons({ errorCode: { policyFindingError: 'POLICY_FINDING' }, ...path })).toBe('at headlines[1]');
+    expect(googleAdsPolicyReasons({ errorCode: { requestError: 'INVALID_INPUT' }, ...path })).toBeUndefined();
   });
 });
 
