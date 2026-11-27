@@ -16,7 +16,7 @@
  */
 import AWS from "aws-sdk";
 import { probeDomain, decideFromVerdict } from "../services/domainReachabilityService";
-import { addCustomDomain, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { addCustomDomain, isReservedPlatformDomain, SUBDOMAIN_BASE } from "../services/customDomainService";
 import { isEvaluationUser } from "../services/evaluationPolicy";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
@@ -225,6 +225,8 @@ export async function reconcileUnregisteredDomains(
 
     if (registeredHosts.has(host)) continue;
     if (host === SUBDOMAIN_BASE || host.endsWith(managedSuffix)) continue;
+    // AgentWeb's own domains are refused by addCustomDomain: skip before the claim row, or a refused host leaves a phantom pending record.
+    if (isReservedPlatformDomain(host)) continue;
 
     // Claim first, atomically, before any Vercel call — see the doc comment above. The claim
     // id is deterministic (not uuidv4()) specifically so two racing instances compute the SAME

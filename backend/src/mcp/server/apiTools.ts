@@ -26,6 +26,15 @@ import './leadReadTools';
 import './accountReadTools';
 import './fileReadTool';
 import './leadEngagementTool';
+import './contentTools';
+import './siteScanAndLookupTools';
+import './meetingEventReadTools';
+import './hubspotReadTool';
+import './linkedInAdsReadTools';
+import './googleCalendarReadTools';
+import './assetAndOutreachAccountTools';
+import './leadDraftTool';
+import './kbFileReadTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -43,7 +52,7 @@ import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
 import { executeBrandRead, executeBrandUpdate } from './manageBrandWrites';
 import { executeStrategyRead, executeStrategyUpdate } from './manageStrategyWrites';
-import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from './knowledgeBaseParams';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET, withoutSignedStorageLinks } from './knowledgeBaseParams';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -466,7 +475,7 @@ mcpToolRegistry.register({
       path: '/api/tasks',
       context: await resolveClientScopedContext(context, args?.client_id, 'list_tasks')
     });
-    return jsonResult(data);
+    return jsonResult(withoutSignedStorageLinks(data));
   }
 });
 
@@ -494,20 +503,20 @@ mcpToolRegistry.register({
     switch (args.action) {
       case 'create': {
         const data = await mcpFetch({ method: 'POST', path: '/api/tasks', context: c, body: { name: args.name, prompt: args.prompt, category: args.category, description: args.description } });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'get': {
         const data = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'update': {
         const { action, task_id, ...updates } = args;
         const data = await mcpFetch({ method: 'PUT', path: `/api/tasks/${encodeURIComponent(task_id)}`, context: c, body: updates });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'delete': {
         const data = await mcpFetch({ method: 'DELETE', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
@@ -1839,7 +1848,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context), queryParams: buildKbListQuery(args) });
-    return jsonResult(data);
+    // No year-2500 signed file links (knowledgeBaseParams.ts): read a file with read_knowledge_base_files.
+    return jsonResult(withoutSignedStorageLinks(data));
   }
 });
 
@@ -1861,38 +1871,6 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/search-knowledge-base', context: ctx(context),
       body: { query: args.query, max_results: args.max_results || 5 }
-    });
-    return jsonResult(data);
-  }
-});
-
-mcpToolRegistry.register({
-  name: 'read_knowledge_base_files',
-  definition: {
-    name: 'read_knowledge_base_files',
-    description: 'Read specific files from the knowledge base.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        files: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              kb_identifier: { type: 'string', description: 'Knowledge base task ID' },
-              file_name: { type: 'string', description: 'File name to read' }
-            },
-            required: ['kb_identifier', 'file_name']
-          }
-        }
-      },
-      required: ['files']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/read-knowledge-base-files', context: ctx(context),
-      body: { files: args.files }
     });
     return jsonResult(data);
   }

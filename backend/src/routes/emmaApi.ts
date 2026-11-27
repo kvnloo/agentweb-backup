@@ -6,6 +6,13 @@
 
 import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { registerMeetingEventRoutes } from './emmaMeetingEventRoutes';
+import { registerHubspotReadRoutes } from './emmaHubspotReadRoutes';
+import { registerLinkedInAdsReadRoutes } from './emmaLinkedInAdsReadRoutes';
+import { registerGoogleCalendarRoutes } from './emmaGoogleCalendarRoutes';
+import { registerAssetAndOutreachAccountRoutes } from './emmaAssetRoutes';
+import { registerLeadDraftRoutes } from './emmaLeadDraftRoutes';
+import { registerKbFileReadRoutes } from './emmaKbFileReadRoutes';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { MCP_ENGAGEMENTS_PER_LEAD, MCP_ENGAGEMENT_MAX_LEAD_BYTES } from '../utils/agentEngagementLimits';
 import { chatbotDb } from '../services/chatbotService';
@@ -47,6 +54,17 @@ router.use(authenticateToken);
 // Classification lives in EMMA_ROUTE_BUDGET; a route with no entry is treated as
 // metered, and a contract test fails if a registered route is left unclassified.
 router.use(requireEmmaTokenBudget);
+
+// ENG-2840 (W2-9): provider reads for the MCP tools of the same names. Each route re-checks its arguments and calls Emma's own code as
+// req.user only (routes/emma*Routes.ts).
+registerMeetingEventRoutes(router);
+registerHubspotReadRoutes(router);
+registerLinkedInAdsReadRoutes(router);
+// ENG-2840 (W2-10): Calendar reads, asset search, the LinkedIn outreach account, lead email drafts, knowledge-base file reads.
+registerGoogleCalendarRoutes(router);
+registerAssetAndOutreachAccountRoutes(router);
+registerLeadDraftRoutes(router);
+registerKbFileReadRoutes(router);
 
 // ─── Lazy service imports ───────────────────────────────────────────────────
 
@@ -279,8 +297,9 @@ router.post('/describe-media', async (req: Request, res: Response) => {
         userId: userId(req), sessionId: session_id,
       });
     } else {
-      // ENG-1858: meter to the API caller instead of "system".
-      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt, {
+      // ENG-1858: meter to the API caller instead of "system". No model given: the vision model, as Emma's own tool uses (the old
+      // fallback, gpt-4o, is not a registered model and skipped the image download).
+      result = await svc.describeImage(typeof llm_model === 'string' && llm_model ? llm_model : undefined, url, prompt, {
         userId: userId(req), sessionId: session_id, feature: 'describe_image',
       });
     }

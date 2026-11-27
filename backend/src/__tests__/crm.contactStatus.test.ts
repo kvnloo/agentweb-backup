@@ -189,6 +189,11 @@ describe('PUT /lists/:listId/leads/bulk-contact-status', () => {
 
   const handler = () => findHandler(router, '/lists/:listId/leads/bulk-contact-status', 'put');
 
+  beforeEach(() => {
+    // The route reads each lead before updating it (ENG-2840); by default every named lead exists.
+    (crmDb.getLeadById as jest.Mock).mockImplementation(async (_listId: string, leadId: string) => ({ leadId }));
+  });
+
   it('returns 400 if leadIds is missing', async () => {
     mockReq.body = { contactStatus: 'do-not-contact' };
     await handler()!(mockReq, mockRes);
@@ -263,6 +268,36 @@ describe('PUT /lists/:listId/leads/bulk-contact-status', () => {
       contactStatusNote: null,
     });
     expect(mockRes.json).toHaveBeenCalledWith({ updated: 1, failed: 0, total: 1 });
+  });
+
+  // ENG-2840: updateLead is an upsert, so an unknown id used to create a stub lead in the list.
+  it('never creates a lead for an id that is not in the list: it counts as failed', async () => {
+    mockReq.body = { leadIds: ['lead-1', 'ghost-lead'], contactStatus: 'do-not-contact' };
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+    (crmDb.getLeadById as jest.Mock).mockImplementation(async (_listId: string, leadId: string) => (leadId === 'lead-1' ? { leadId } : null));
+    (crmDb.updateLead as jest.Mock).mockResolvedValue({});
+
+    await handler()!(mockReq, mockRes);
+
+    expect(crmDb.getLeadById).toHaveBeenCalledWith('list-1', 'ghost-lead', { consistentRead: true });
+    expect(crmDb.updateLead).toHaveBeenCalledTimes(1);
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][1]).toBe('lead-1');
+    expect(mockRes.json).toHaveBeenCalledWith({ updated: 1, failed: 1, total: 2 });
+  });
+
+  it('refuses more than 500 lead ids before touching the list', async () => {
+    mockReq.body = { leadIds: Array.from({ length: 501 }, (_, i) => `lead-${i}`), contactStatus: 'do-not-contact' };
+    await handler()!(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(400);
+    expect(crmDb.getLeadListById).not.toHaveBeenCalled();
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('refuses lead ids that are not strings', async () => {
+    mockReq.body = { leadIds: ['lead-1', { $ne: null }], contactStatus: 'do-not-contact' };
+    await handler()!(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
   });
 
   it('counts failed updates when updateLead throws', async () => {

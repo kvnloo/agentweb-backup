@@ -26,6 +26,7 @@
 import * as linkedInAdsService from '../services/linkedInAdsService';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { linkedInAdsWritesEnabled } from './zomaToolDefinitions';
+import { withUseWhen } from './zomaUseWhen';
 import {
   callLinkedIn, classifyLinkedInFailure, linkedInNotEnabledReadResult, linkedInRateLimitedResult, redactLinkedInText, type LinkedInAdsSession,
   type LinkedInCallResult,
@@ -189,8 +190,8 @@ export function getLinkedInAdsToolkitManifest(writes: boolean = linkedInAdsWrite
       additionalProperties: false,
     },
   };
-  if (!writes) return [read];
-  return [
+  if (!writes) return withUseWhen([read]);
+  return withUseWhen([
     read,
     {
       name: LINKEDIN_ADS_WRITE_TOOL,
@@ -214,7 +215,7 @@ export function getLinkedInAdsToolkitManifest(writes: boolean = linkedInAdsWrite
         additionalProperties: false,
       },
     },
-  ];
+  ]);
 }
 
 // ── Reads ──────────────────────────────────────────────────────────────────────
