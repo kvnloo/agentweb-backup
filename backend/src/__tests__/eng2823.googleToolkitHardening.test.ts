@@ -141,7 +141,7 @@ describe('ENG-2823 hardening: spend ceiling on enable', () => {
 
   it('enabling a campaign whose budget is above maxDailyBudget is refused, nothing sent', async () => {
     const d = deps({ spendCeilingPolicy: ceiling('{"maxDailyBudget":100000000}') }); // budget is 200 USD/day
-    await expect(executeGoogleToolkitWrite('u1', enable, 'USD', d)).rejects.toThrow(/Enabling this campaign would start spend at its budget.*100000000 \(micros\)/);
+    await expect(executeGoogleToolkitWrite('u1', enable, 'USD', d)).rejects.toThrow(/Enabling this campaign would start spend at its budget.*daily_budget 200\.00 USD exceeds this account.s max daily budget of 100\.00 USD\./);
     expect(d.dispatch).not.toHaveBeenCalled();
   });
 

@@ -143,7 +143,7 @@ describe('ENG-2823 Google guarded writes', () => {
 
   it('spend ceiling refuses before a preview or dispatch (GOOGLE_TOOLKIT_SPEND_CEILING, micros)', async () => {
     const d = writeDeps({ spendCeilingPolicy: () => googleSpendCeilingPolicyFromEnv('{"maxDailyBudget":40000000}') });
-    await expect(executeGoogleToolkitWrite('u1', budgetUpdate, 'USD', d)).rejects.toThrow(/exceeds this account's max daily budget of 40000000 \(micros\)/);
+    await expect(executeGoogleToolkitWrite('u1', budgetUpdate, 'USD', d)).rejects.toThrow(/exceeds this account's max daily budget of 40\.00 USD\./);
     const ratio = writeDeps({ spendCeilingPolicy: () => googleSpendCeilingPolicyFromEnv('{"maxChangeRatio":2}') });
     await expect(executeGoogleToolkitWrite('u1', budgetUpdate, 'USD', ratio)).rejects.toThrow(/2\.50x/);
     const malformed = writeDeps({ spendCeilingPolicy: () => googleSpendCeilingPolicyFromEnv('not json') });
