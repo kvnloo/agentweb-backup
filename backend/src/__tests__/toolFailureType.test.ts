@@ -1,6 +1,6 @@
 import { classifyToolFailureType, FAILURE_TYPES } from '../utils/toolFailureType';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
-import { ToolRestrictionDenied, restrictionRefusal, scheduleProvenanceUnverifiableRefusal } from '../services/toolRestrictionProfiles';
+import { ToolRestrictionDenied, restrictionRefusal, scheduleProvenanceUnverifiableRefusal, sensitiveActionRefusal, sensitiveActionScheduleRefusal, sensitiveActionUnverifiableRefusal } from '../services/toolRestrictionProfiles';
 
 /**
  * Decision-layer classification for agent tool failures. Sits on top of the
@@ -338,6 +338,26 @@ describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM r
     });
     it('keeps the transient provenance-unverifiable refusal as bug (class name alone is not enough)', () => {
       expect(roundTrip(scheduleProvenanceUnverifiableRefusal(t))).toBe('bug');
+    });
+    // ENG-3170: a visitor refused a sensitive tool on a link the owner left off is the guard working, not a tool bug
+    it.each([
+      ['share-link sensitive action', sensitiveActionRefusal('delete_leads')],
+      ['scheduled-run sensitive action', sensitiveActionScheduleRefusal('slack_send_message')],
+      ['scheduled-run sensitive action (profile refusal)', restrictionRefusal('share_visitor_schedule', 'delete_leads', [], {})],
+    ])('round-trips the %s refusal to by_design', (_n, msg) => {
+      expect(msg).toBeTruthy();
+      expect(roundTrip(msg as string)).toBe('by_design');
+    });
+    // ENG-3187: the browser's navigate refusals are the boundary working, not a tool bug (they must not feed the bug-triage stream)
+    it.each([
+      'The browser can only open public web pages (http or https). It cannot open local files or other kinds of address.',
+      'The browser can only open public web pages. It cannot open internal, local-network or IPv6 literal addresses.',
+      'The browser could not check that address just now (it did not resolve). Check the spelling, or try again in a moment.',
+    ])('classifies the browser navigate refusal "%s" as by_design', (msg) => {
+      expect(roundTrip(msg)).toBe('by_design');
+    });
+    it('keeps "the owner\'s setting could not be verified just now" as bug, like the provenance one', () => {
+      expect(roundTrip(sensitiveActionUnverifiableRefusal('delete_leads'))).toBe('bug');
     });
   });
 

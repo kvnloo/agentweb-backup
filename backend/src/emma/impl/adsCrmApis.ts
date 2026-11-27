@@ -510,6 +510,37 @@ async function runGoogleAdsTrackingGate(
   };
 }
 
+/**
+ * The policy topics Google attaches to a POLICY_FINDING / POLICY_VIOLATION error, and the
+ * field that failed. Without them the caller sees only "PROHIBITED" and cannot tell which
+ * headline or rule to fix.
+ *
+ * The advertiser's own text (evidences, violatingText, trigger) is deliberately NOT quoted:
+ * this string is read by error classifiers (toolErrorClassifier, zomaErrorNextStep), and ad
+ * copy such as "Save 500 today" or "Sign in for free" would be misread as a 5xx or a
+ * setup failure. The field path already names the headline to rewrite.
+ */
+export function googleAdsPolicyReasons(e: any): string | undefined {
+  const reasons: string[] = [];
+  const entries: any[] = e?.details?.policyFindingDetails?.policyTopicEntries ?? [];
+  for (const entry of entries) {
+    if (/^[A-Z0-9_]+$/.test(String(entry?.topic ?? ''))) reasons.push(`${entry.topic}${/^[A-Z_]+$/.test(String(entry.type ?? '')) ? ` (${entry.type})` : ''}`);
+  }
+  const v = e?.details?.policyViolationDetails;
+  if (v?.key?.policyName && /^[a-z0-9_]+$/i.test(String(v.key.policyName))) reasons.push(String(v.key.policyName));
+  // Google's own policy title (no digits, so it cannot read as an HTTP status), when no key is given.
+  else if (v?.externalPolicyName && /^[A-Za-z][A-Za-z &/'-]{0,80}$/.test(String(v.externalPolicyName))) reasons.push(String(v.externalPolicyName));
+  // Which field failed, e.g. headlines[2]: tells the caller which line to rewrite.
+  const path = (e?.location?.fieldPathElements ?? [])
+    .map((p: any) => (/^[a-z_]+$/.test(String(p?.fieldName ?? '')) ? `${p.fieldName}${Number.isInteger(p.index) ? `[${p.index}]` : ''}` : ''))
+    .filter(Boolean).join('.');
+  // A policy error with no readable topic still names the field; other errors never get a "Policy:" suffix.
+  const isPolicy = !!(e?.details?.policyFindingDetails || e?.details?.policyViolationDetails
+    || e?.errorCode?.policyFindingError || e?.errorCode?.policyViolationError);
+  if (path && (reasons.length || isPolicy)) reasons.push(`at ${path}`);
+  return reasons.length ? [...new Set(reasons)].join(', ') : undefined;
+}
+
 export async function handleCallGoogleAdsApi(userId: string, args: {
   customer_id: string;
   entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION' | 'CAMPAIGN_CONVERSION_GOAL' | 'CUSTOMER_CONVERSION_GOAL';
@@ -689,6 +720,12 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           status: args.status || 'PAUSED',
           brandBusinessName: args.brand_business_name,
           brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
+          // Network settings exist on Search campaigns only (another type would be rejected by Google).
+          ...(args.type === 'SEARCH' ? {
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+          } : {}),
         });
         return { success: true, campaignResourceName: campaign.resourceName };
       }
@@ -1368,7 +1405,9 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
     const gadsError = gadsErrors.length
       ? gadsErrors.map((e: any) => {
           const code = Object.values(e.errorCode || {})[0];
-          return code ? `${code}: ${e.message}` : e.message;
+          const text = code ? `${code}: ${e.message}` : e.message;
+          const reasons = googleAdsPolicyReasons(e);
+          return reasons ? `${text} Policy: ${reasons}.` : text;
         }).join('; ')
       : undefined;
     if (args.entity_type === 'CAMPAIGN_CRITERION') {
@@ -1609,12 +1648,68 @@ async function hubspotMarketingPreflight(
 
 import { normalizeHubSpotArgs } from '../../services/agentMode/crmToolArgs';
 
-export async function handleHubspotApi(userId: string, args: any): Promise<any> {
+/** Deal fields returned by DEALS SEARCH (callers may add more via `properties`). */
+const HUBSPOT_DEAL_PROPS = [
+  'dealname', 'amount', 'dealstage', 'pipeline', 'createdate', 'closedate',
+  'hs_lastmodifieddate', 'hubspot_owner_id', 'hs_analytics_source', 'hs_analytics_source_data_1', 'hs_analytics_source_data_2',
+];
+
+/** Contact source/UTM fields used for campaign-to-pipeline attribution. */
+const HUBSPOT_CONTACT_ATTRIBUTION_PROPS = [
+  'email', 'firstname', 'lastname', 'company', 'jobtitle', 'createdate', 'lifecyclestage',
+  'hs_analytics_source', 'hs_analytics_source_data_1', 'hs_analytics_source_data_2',
+  'hs_latest_source', 'hs_latest_source_data_1', 'hs_latest_source_data_2',
+  'hs_analytics_first_url', 'hs_analytics_first_referrer', 'recent_conversion_event_name', 'first_conversion_event_name',
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+];
+
+function mergeProps(base: string[], extra: unknown): string[] {
+  const add = Array.isArray(extra) ? extra.map(String) : typeof extra === 'string' ? extra.split(',') : [];
+  return [...new Set([...base, ...add.map((s) => s.trim()).filter(Boolean)])];
+}
+
+/** created_after / created_before (ISO date or epoch ms) → HubSpot createdate filters. */
+export function hubspotDateFilters(args: any):
+  { filters: Array<{ propertyName: string; operator: string; value?: string; values?: string[] }> } | { error: string } {
+  const filters: Array<{ propertyName: string; operator: string; value?: string }> = [];
+  for (const [key, op] of [['created_after', 'GTE'], ['created_before', 'LT']] as const) {
+    const raw = args?.[key];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const s = String(raw).trim();
+    // Pure digits: 13+ digits is epoch ms; 9-12 digits is epoch seconds (an epoch-ms value
+    // that short would be a 1970 date, which no caller means). Shorter digit runs are rejected.
+    let ms: number;
+    if (/^\d+$/.test(s)) {
+      if (s.length < 9) return { error: `${key} must be an ISO date (e.g. 2026-11-01), epoch seconds, or epoch milliseconds.` };
+      ms = s.length >= 13 ? Number(s) : Number(s) * 1000;
+    } else {
+      ms = Date.parse(s);
+    }
+    if (!Number.isFinite(ms)) return { error: `${key} must be an ISO date (e.g. 2026-11-01), epoch seconds, or epoch milliseconds.` };
+    filters.push({ propertyName: 'createdate', operator: op, value: String(ms) });
+  }
+  return { filters };
+}
+
+/**
+ * ENG-2840 (W2-9): options for the MCP read route (`POST /api/emma/hubspot-read`). Emma's own tool passes none, and every option left
+ * out keeps the old behaviour exactly.
+ */
+export interface HubspotApiOptions {
+  /** Told which connection will serve the call, once it is resolved (the route says in its answer whose account answered). */
+  onResolved?: (svc: HubSpotService) => void;
+  /** DEALS GET_CONTACTS: read at most this many of the deal's contacts, and stop paging associations once more than this many ids are
+   * held (the answer then has `contacts_cut: true`). Default: every page and every contact, as before. */
+  maxDealContacts?: number;
+}
+
+export async function handleHubspotApi(userId: string, args: any, options: HubspotApiOptions = {}): Promise<any> {
   args = normalizeHubSpotArgs(args);
   const entityType: string = (args?.entity_type ?? '').toUpperCase();
   const action: string = (args?.action ?? '').toUpperCase();
   try {
     const svc = await resolveHubSpotService(userId, args?.account_id);
+    options.onResolved?.(svc);
 
     // Refuse a call the connection provably cannot serve, BEFORE spending a round trip
     // on a guaranteed 403 whose message does not name the real problem.
@@ -1638,8 +1733,79 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
     if (preflight) return preflight;
 
     if (entityType === 'CONTACTS') {
-      if (action !== 'LIST') return { success: false, error: 'Valid CONTACTS action: LIST (cursor optional).' };
-      return { success: true, ...await svc.listContacts(args?.cursor) };
+      if (action === 'LIST') return { success: true, ...await svc.listContacts(args?.cursor) };
+      if (action === 'SEARCH') {
+        const filters = hubspotDateFilters(args);
+        if ('error' in filters) return { success: false, error: filters.error };
+        const properties = mergeProps(HUBSPOT_CONTACT_ATTRIBUTION_PROPS, args?.properties);
+        const page = await svc.searchCrmObjects('contacts', {
+          filters: filters.filters, properties, cursor: args?.cursor, limit: args?.limit,
+          sortBy: 'createdate', sortDirection: 'DESCENDING',
+        });
+        return { success: true, entity_type: 'CONTACTS', total: page.total, contacts: page.results, nextCursor: page.nextCursor };
+      }
+      return { success: false, error: 'Valid CONTACTS actions: LIST (cursor?), SEARCH (created_after?, created_before?, properties?, limit?, cursor?).' };
+    }
+
+    // ─── DEALS (read-only) ─────────────────────────────────────────────────
+    if (entityType === 'DEALS') {
+      switch (action) {
+        case 'LIST_PIPELINES':
+          return { success: true, pipelines: await svc.listDealPipelines() };
+        case 'SEARCH': {
+          const filters = hubspotDateFilters(args);
+          if ('error' in filters) return { success: false, error: filters.error };
+          const f = [...filters.filters];
+          if (args?.pipeline) f.push({ propertyName: 'pipeline', operator: 'EQ', value: String(args.pipeline) });
+          let stageIds: string[] = [];
+          const stageArg = args?.deal_stage ?? args?.dealstage;
+          if (stageArg) {
+            // Accept either an internal stage id or a human label ("New Business Meetings").
+            const wanted = String(stageArg).trim().toLowerCase();
+            const pipelines = await svc.listDealPipelines();
+            const scoped = pipelines.filter((p) => !args?.pipeline || p.id === String(args.pipeline));
+            // An exact stage id wins over a stage whose label happens to equal it.
+            for (const p of scoped) for (const s of p.stages) if (s.id.toLowerCase() === wanted) stageIds.push(s.id);
+            if (!stageIds.length) {
+              for (const p of scoped) for (const s of p.stages) if (s.label.trim().toLowerCase() === wanted) stageIds.push(s.id);
+            }
+            if (!stageIds.length) {
+              return {
+                success: false,
+                error: `No deal stage matches "${stageArg}". Use DEALS LIST_PIPELINES to see stage ids and labels.`,
+              };
+            }
+            stageIds = [...new Set(stageIds)];
+            f.push(stageIds.length === 1
+              ? { propertyName: 'dealstage', operator: 'EQ', value: stageIds[0] }
+              : { propertyName: 'dealstage', operator: 'IN', values: stageIds });
+          }
+          const properties = mergeProps(HUBSPOT_DEAL_PROPS, args?.properties);
+          const page = await svc.searchCrmObjects('deals', {
+            filters: f, properties, cursor: args?.cursor, limit: args?.limit,
+            sortBy: 'createdate', sortDirection: 'DESCENDING',
+          });
+          return { success: true, entity_type: 'DEALS', matched_stage_ids: stageIds, total: page.total, deals: page.results, nextCursor: page.nextCursor };
+        }
+        case 'GET_CONTACTS': {
+          const dealId = args?.deal_id ?? args?.id;
+          if (!dealId) return { success: false, error: 'deal_id is required for DEALS GET_CONTACTS.' };
+          // Emma's call (no maxDealContacts) reads every association page, exactly as before. The MCP route's bound stops paging once
+          // more than `max` ids are held, so how many the deal has in all is not known then: the answer only says the list was cut.
+          const max = options.maxDealContacts;
+          const allIds = max !== undefined
+            ? await svc.getDealContactAssociations(String(dealId), { stopAfter: Math.max(0, max) })
+            : await svc.getDealContactAssociations(String(dealId));
+          const ids = max !== undefined && allIds.length > max ? allIds.slice(0, Math.max(0, max)) : allIds;
+          const contacts = ids.length
+            ? await svc.batchReadContacts(ids, mergeProps(HUBSPOT_CONTACT_ATTRIBUTION_PROPS, args?.properties))
+            : [];
+          if (ids.length < allIds.length) return { success: true, deal_id: String(dealId), contacts, contacts_cut: true };
+          return { success: true, deal_id: String(dealId), contacts };
+        }
+        default:
+          return { success: false, error: `Unknown action "${action}" for DEALS. Valid (read-only): LIST_PIPELINES, SEARCH, GET_CONTACTS.` };
+      }
     }
 
     // ─── CONTACT_LIST ──────────────────────────────────────────────────────
@@ -2051,7 +2217,7 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
       }
     }
 
-    return { success: false, error: `Unknown entity_type "${entityType}". Valid: CONTACT_LIST, CAMPAIGN, EMAIL, FORM, LANDING_PAGE, BLOG_POST, WORKFLOW, SOCIAL.` };
+    return { success: false, error: `Unknown entity_type "${entityType}". Valid: CONTACTS, DEALS, CONTACT_LIST, CAMPAIGN, EMAIL, FORM, LANDING_PAGE, BLOG_POST, WORKFLOW, SOCIAL.` };
   } catch (err: any) {
     if (err?.response?.status === 403) {
       // HubSpot returns 403 both for tier/scope limits and for tokens granted

@@ -38,7 +38,7 @@ Alternative (no token): `claude mcp add --transport http zoma https://api.agentw
 
 Every tool response ends with the next step to take.
 
-Reads work without a payment method. Changes to ads need a payment method on file and a connected Meta ad account whose connection granted ads management.
+Reads work without a payment method. Changes to ads need a connected Meta ad account whose connection granted ads management, plus a payment method only when the `zoma_status` checklist lists one. `payment.required: false` means no card is needed at this step: never tell the user a payment method is on file unless the checklist says so.
 
 ## Reporting: `zoma_ads_report`
 The first tool for "how are my ads doing?". Spend, impressions, clicks, CTR, CPC, conversions and ROAS per campaign (or `level: "account"` for one total), read-only.
@@ -53,7 +53,7 @@ The first tool for "how are my ads doing?". Spend, impressions, clicks, CTR, CPC
 - With more than one connected ad account, pass `account_id`.
 
 ## Creatives: upload your own images and videos
-Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Canva, a designer). You don't need Ads Manager. These calls need no preview because an asset or creative can't spend anything until an ad uses it. They still need the payment method, the Meta connection and ads management.
+Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Canva, a designer). You don't need Ads Manager. These calls need no preview because an asset or creative can't spend anything until an ad uses it. They still need the Meta connection and ads management, plus a payment method only when `zoma_status` lists one.
 
 1. **Get the file to Meta.**
    - The file already has a public `https` URL (a CDN link, or the direct `.mp4` link of a UGC video): skip to step 2 and pass that URL. A link to a post page (TikTok, Instagram, YouTube) is a web page, not a file; Zoma refuses it, so download the file and use `zoma_prepare_upload`.
@@ -127,6 +127,19 @@ If a result says `TERMS_NOT_ACCEPTED`, give the user `terms_url` (Meta's Custom 
 - **Assets:** `ASSET UPLOAD` runs without a preview, because an asset can't spend until something uses it. Use `asset_type` IMAGE or LOGO with `data` set to an https image URL or the `file_url` from `zoma_prepare_upload`, TEXT with the text as `data`, or VIDEO with a YouTube video id. It returns the asset resource name.
 - **Performance Max, end to end:** (1) upload the logo (`LOGO`), the square and landscape images (`IMAGE`); (2) `BUDGET CREATE`; (3) `CAMPAIGN CREATE` with `type: PERFORMANCE_MAX`, `brand_business_name` (≤25 characters) and `brand_logo_asset_resource_name`; (4) `ASSET_GROUP CREATE` with `name`, `campaign_resource_name`, `final_url`, 3–15 `headlines` (≤30), 1–5 `long_headlines` (≤90), 2–5 `descriptions` (≤90, at least one ≤60), `square_image_assets`, `landscape_image_assets`, and optionally `logo_assets` / `video_assets`; (5) `ASSET_GROUP UPDATE status: ENABLED`, then `CAMPAIGN UPDATE status: ENABLED`, each with its own approval.
 <!-- zoma-google:end -->
+<!-- zoma-linkedin:start -->
+
+## LinkedIn Ads (when enabled for the account)
+`linkedin_ads_read` reads the connected LinkedIn ad account and changes nothing: `LIST_ACCOUNTS`, `LIST_CAMPAIGN_GROUPS`, `LIST_CAMPAIGNS` (optionally one `campaign_group_id`), `LIST_CREATIVES` (`campaign_id`), `LIST_TARGETING_FACETS`, `SEARCH_TARGETING_ENTITIES` (`facet_urn`, `query`), `ESTIMATE_AUDIENCE` (`targeting_include`) and `GET_ANALYTICS` (`pivot`, `start_date`, `end_date`; LinkedIn's adAnalytics). Money is in the account currency in major units.
+- **What works for which ad account:** reporting (`GET_ANALYTICS`) works for every connected ad account. For an ad account LinkedIn has not enabled for the Zoma app yet, the other reads can come back as `ad_account_not_enabled`: say so plainly, and offer reporting instead. Never guess at the missing data.
+- **If a result says `rate_limited`:** LinkedIn (or Zoma's per-minute limit) asked to slow down. Wait `retry_after_seconds`, then try once; do not retry in a loop.
+<!-- zoma-linkedin-writes:start -->
+- **Changes:** `linkedin_ads_write` uses the same two-call preview → `confirm: true` + `preview_token` flow and the same `verification: CONFIRMED` rule. Campaign groups, campaigns and creatives are always created `DRAFT` and never go live; going live is `ACTIVATE`, its own preview and approval, checked against the daily budget it unlocks. Every value is sent as you give it (name, campaign type, objective, cost type, bid, daily budget, schedule, locale, political intent, targeting): ask the user for each one, because nothing is defaulted. Order: `CAMPAIGN_GROUP CREATE`, then `CAMPAIGN CREATE` with its `campaign_group_id`, then `CREATIVE CREATE` with the `campaign_id` and a `post_urn` (or a text ad), then `ACTIVATE` each.
+- **Zoma's safety limit (USD accounts only for now):** a campaign's daily budget is at most $50, one change may raise a budget by at most 2x (lowering a budget is always allowed), and a total (lifetime) budget is at most $1,500. An ad account in any other currency is refused until Zoma enables it. A refusal says what the limit is and who changes it: tell the user, suggest asking Zoma support (support@agentweb.pro), and never split a change into smaller ones to get around it.
+- **Only for ad accounts LinkedIn has enabled for the Zoma app:** for any other ad account the result says write access is not enabled for it yet and nothing was changed; reading and reporting still work. Tell the user that; do not retry.
+- **Read-back is conservative:** `CONFIRMED` only when LinkedIn's own answer shows the change. `UNCONFIRMED` means Zoma could not tell (no answer, a failed read, an unexpected shape): re-read with `linkedin_ads_read` before doing anything again, so nothing is created twice.
+<!-- zoma-linkedin-writes:end -->
+<!-- zoma-linkedin:end -->
 
 ## Usage
 Call `zoma_usage` when the user asks what they have used this month. Billing is not enabled yet; usage is only recorded.

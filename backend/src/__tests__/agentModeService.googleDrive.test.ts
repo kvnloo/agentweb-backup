@@ -1061,6 +1061,45 @@ describe('AgentModeService - Google Drive methods', () => {
       expect((s3Utils.uploadFileToS3 as jest.Mock)).not.toHaveBeenCalled();
     });
 
+    // ENG-2840: the download is streamed and stops once it passes the ceiling, so bad size metadata cannot make the process hold the
+    // whole file in memory.
+    it('stops a streamed download as soon as it passes the ceiling, without reading the rest', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'huge.mp4', mimeType: 'video/mp4', size: '0' }] },
+      });
+      const { Readable } = require('stream');
+      const chunk = Buffer.alloc(8 * 1024 * 1024);
+      let produced = 0;
+      const body = new Readable({
+        read() {
+          produced++;
+          this.push(produced <= 1000 ? chunk : null); // would be 8 GB if read to the end
+        },
+      });
+      mockDriveFiles.get.mockResolvedValue({ data: body });
+
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'huge.mp4', USER_ID);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/limit/i);
+      expect(produced).toBeLessThan(40); // 200 MB ceiling / 8 MB chunks, plus read-ahead
+      expect(body.destroyed).toBe(true);
+      expect((s3Utils.uploadFileToS3 as jest.Mock)).not.toHaveBeenCalled();
+    });
+
+    it('reads a streamed download under the ceiling in full', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '0' }] },
+      });
+      const { Readable } = require('stream');
+      mockDriveFiles.get.mockResolvedValue({ data: Readable.from([Buffer.from('fake-'), Buffer.from('png-bytes')]) });
+
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
+
+      expect(result.success).toBe(true);
+      expect((s3Utils.uploadFileToS3 as jest.Mock).mock.calls[0][0].toString()).toBe('fake-png-bytes');
+    });
+
     it('downloads the binary via alt:media with supportsAllDrives and uploads to S3', async () => {
       mockDriveFiles.list.mockResolvedValue({
         data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },
@@ -1071,7 +1110,7 @@ describe('AgentModeService - Google Drive methods', () => {
 
       expect(mockDriveFiles.get).toHaveBeenCalledWith(
         expect.objectContaining({ fileId: 'file-1', alt: 'media', supportsAllDrives: true }),
-        expect.objectContaining({ responseType: 'arraybuffer' })
+        expect.objectContaining({ responseType: 'stream' })
       );
       expect(s3Utils.uploadFileToS3).toHaveBeenCalledWith(
         expect.any(Buffer), 'ad.png', USER_ID, 'image/png'
@@ -2649,7 +2688,7 @@ describe('AgentModeService - Google Drive methods', () => {
       }));
       expect(mockDriveFiles.export).toHaveBeenCalledWith(
         { fileId: 'target-doc-1', mimeType: 'text/plain' },
-        { responseType: 'arraybuffer' }
+        expect.objectContaining({ responseType: 'stream' })
       );
       expect(result).toMatchObject({
         success: true,

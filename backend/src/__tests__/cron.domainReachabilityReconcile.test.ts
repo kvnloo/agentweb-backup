@@ -12,8 +12,13 @@
  */
 
 const mockAddCustomDomain = jest.fn();
+// ENG-2840 (W2-8): the cron now also imports isReservedPlatformDomain; it stays the REAL one (loaded lazily, with the Vercel
+// token helper stubbed) so the reserved-host cases below pin the actual list, not a copy of it.
+jest.mock("../utils/secretsManager", () => ({ getVercelToken: jest.fn() }));
 jest.mock("../services/customDomainService", () => ({
   addCustomDomain: (...a: unknown[]) => mockAddCustomDomain(...a),
+  isReservedPlatformDomain: (host: string) =>
+    jest.requireActual("../services/customDomainService").isReservedPlatformDomain(host),
   SUBDOMAIN_BASE: "agentwebforms.com",
 }));
 
@@ -202,4 +207,56 @@ describe("reconcileUnregisteredDomains — cross-instance race (review finding)"
     expect(mockPut).toHaveBeenCalledTimes(1);
     expect(mockAddCustomDomain).toHaveBeenCalledTimes(1);
   });
+});
+
+// ENG-2840 (W2-8): addCustomDomain refuses AgentWeb's own domains, so the reconcile must skip them BEFORE the claim row, or
+// every sweep leaves a phantom pending_verification record for a host that can never be registered.
+describe("reconcileUnregisteredDomains — AgentWeb's own domains (ENG-2840)", () => {
+  beforeEach(() => {
+    mockAddCustomDomain.mockReset();
+    mockAddCustomDomain.mockResolvedValue({ id: "new-dom", domain: "campaign.acme.com" });
+    mockPut.mockReset();
+    mockPut.mockReturnValue({ promise: () => Promise.resolve({}) });
+  });
+
+  it.each([
+    "https://agentweb.pro",
+    "https://app.agentweb.pro/some/path",
+    "https://hireemma.ai",
+    "https://www.hireemma.ai",
+    "https://API.AgentWeb.Pro",
+  ])("skips a page whose customDomainUrl host is reserved (%s): no claim row, no addCustomDomain", async (url) => {
+    const result = await reconcileUnregisteredDomains([], [page({ customDomainUrl: url })]);
+
+    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    expect(result).toEqual({ reconciled: 0, errors: 0, created: [] });
+  });
+
+  it("a reserved page does not stop the next (normal) page from being registered", async () => {
+    const pages = [
+      page({ id: "page-1", customDomainUrl: "https://shop.hireemma.ai" }),
+      page({ id: "page-2", customDomainUrl: "https://campaign.acme.com" }),
+    ];
+    const result = await reconcileUnregisteredDomains([], pages);
+
+    expect(mockPut).toHaveBeenCalledTimes(1);
+    expect(mockPut).toHaveBeenCalledWith(
+      expect.objectContaining({ Item: expect.objectContaining({ id: "reconcile:campaign.acme.com" }) })
+    );
+    expect(mockAddCustomDomain).toHaveBeenCalledTimes(1);
+    expect(mockAddCustomDomain).toHaveBeenCalledWith("user-1", "proj-1", "campaign.acme.com");
+    expect(result.reconciled).toBe(1);
+  });
+
+  it.each(["https://notagentweb.pro", "https://agentweb.pro.evil.com", "https://myhireemma.ai"])(
+    "a look-alike host (%s) is still reconciled as a normal custom domain",
+    async (url) => {
+      const host = new URL(url).host;
+      const result = await reconcileUnregisteredDomains([], [page({ customDomainUrl: url })]);
+      expect(mockPut).toHaveBeenCalledTimes(1);
+      expect(mockAddCustomDomain).toHaveBeenCalledWith("user-1", "proj-1", host);
+      expect(result.reconciled).toBe(1);
+    }
+  );
 });

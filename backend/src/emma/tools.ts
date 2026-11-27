@@ -9,8 +9,9 @@ import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
-import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
-import { MEMORY_AUTOSPLIT_MAX_CHARS, splitMemoryContent } from '../utils/memoryContentLimit';
+import { userDb } from '../services/db';
+import { MEMORY_AUTOSPLIT_MAX_CHARS } from '../utils/memoryContentLimit';
+import { MEMORY_CATEGORIES } from '../utils/memoryCategories';
 import { crmDb } from '../services/db';
 import { askCrm } from '../services/askCrmService';
 import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
@@ -48,6 +49,8 @@ import * as leadsImpl from './impl/leads';
 import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
 // ENG-2103 (F2): video-generation / media-post-processing tool cluster, same treatment as booksImpl above.
 import * as mediaVideoImpl from './impl/mediaVideo';
+// ENG-2840 (W2-1): the four memory tool bodies, shared with the MCP memory tools.
+import * as memoryImpl from './impl/memory';
 // ENG-2103 (F2): createHtmlFile/createHtmlTemplate tool cluster, same treatment as booksImpl above.
 import * as htmlCreationImpl from './impl/htmlCreation';
 // ENG-2103 (F2): updateHtmlFile tool cluster, same treatment as booksImpl above.
@@ -6577,7 +6580,7 @@ emmaToolRegistry.register({
               },
               notes: {
                 type: 'string',
-                description: 'Optional notes about what was accomplished or why the step was skipped'
+                description: 'Optional notes about what was accomplished or why the step was skipped. If a required API key is missing, keep status pending and record the exact token reason=no_key in notes; never mark unfinished work completed or skipped.'
               }
             },
             required: ['stepCount', 'status']
@@ -6807,50 +6810,15 @@ emmaToolRegistry.register({
         },
         category: {
           type: 'string',
-          enum: ['preference', 'history', 'insight', 'workflow'],
+          enum: [...MEMORY_CATEGORIES],
           description: 'Category for the memory fact.'
         }
       },
       required: ['content', 'category']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    const { userDb } = await import('../services/db');
-    const user = await userDb.getUserById(userId);
-    if (user?.memoryEnabled === false) {
-      return { success: false, message: 'Memory is disabled for this account.' };
-    }
-
-    // Embed at write time so the memory can later be retrieved by relevance, not just
-    // recency. Best-effort: a failure must not block saving (read path falls back to recency).
-    const { embedText } = await import('../utils/embeddings');
-    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
-    const chunks = splitMemoryContent(String(args.content ?? ''));
-    const memoryIds: string[] = [];
-    for (const chunk of chunks) {
-      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
-      const memory = await accountMemoryDb.addMemory(
-        userId,
-        args.category,
-        chunk,
-        context?.sessionId,
-        embedding
-      );
-      memoryIds.push(memory.memoryId);
-    }
-    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
-    return {
-      success: true,
-      memoryId: memoryIds[0],
-      ...(memoryIds.length > 1 ? { memoryIds } : {}),
-      message: memoryIds.length > 1
-        ? `Saved memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
-        : `Saved memory: ${preview}`
-    };
-  }
+  // ENG-2840 (W2-1): the body lives in emma/impl/memory.ts, shared with the MCP memory tools.
+  execute: (args: any, context?: any) => memoryImpl.saveAccountMemory(args, context),
 });
 
 emmaToolRegistry.register({
@@ -6869,13 +6837,7 @@ emmaToolRegistry.register({
       required: ['memoryId']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    await accountMemoryDb.deleteMemory(userId, args.memoryId);
-    return { success: true, message: `Memory ${args.memoryId} deleted.` };
-  }
+  execute: (args: any, context?: any) => memoryImpl.deleteAccountMemory(args, context),
 });
 
 // ─── Org Memory Tools ────────────────────────────────────────
@@ -6895,64 +6857,21 @@ emmaToolRegistry.register({
         },
         category: {
           type: 'string',
-          enum: ['preference', 'history', 'insight', 'workflow'],
+          enum: [...MEMORY_CATEGORIES],
           description: 'Category for the memory fact.'
         }
       },
       required: ['content', 'category']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    const { userDb, orgDb } = await import('../services/db');
-    const user = await userDb.getUserById(userId);
-    if (!user?.orgId) {
-      return { success: false, message: 'User is not a member of any organization.' };
-    }
-
-    const org = await orgDb.getOrgById(user.orgId);
-    if (!org) {
-      return { success: false, message: 'Organization not found.' };
-    }
-    if (org.orgMemoryEnabled === false) {
-      return { success: false, message: 'Organization memory is disabled.' };
-    }
-
-    // Embed at write time so the memory can later be retrieved by relevance (best-effort).
-    const { embedText } = await import('../utils/embeddings');
-    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
-    const chunks = splitMemoryContent(String(args.content ?? ''));
-    const memoryIds: string[] = [];
-    for (const chunk of chunks) {
-      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
-      const memory = await orgMemoryDb.addMemory(
-        user.orgId,
-        args.category,
-        chunk,
-        userId,
-        embedding
-      );
-      memoryIds.push(memory.memoryId);
-    }
-    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
-    return {
-      success: true,
-      memoryId: memoryIds[0],
-      ...(memoryIds.length > 1 ? { memoryIds } : {}),
-      message: memoryIds.length > 1
-        ? `Saved org memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
-        : `Saved org memory: ${preview}`
-    };
-  }
+  execute: (args: any, context?: any) => memoryImpl.saveOrgMemory(args, context),
 });
 
 emmaToolRegistry.register({
   name: 'delete_org_memory',
   definition: {
     name: 'delete_org_memory',
-    description: 'Delete a specific org memory by its ID. Use this when an org-wide fact is no longer accurate or relevant. Only org owners can delete org memories.',
+    description: 'Delete a specific org memory by its ID. Use this when an org-wide fact is no longer accurate or relevant. Only org owners and admins can delete org memories.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6964,27 +6883,7 @@ emmaToolRegistry.register({
       required: ['memoryId']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    const { userDb, orgDb } = await import('../services/db');
-    const user = await userDb.getUserById(userId);
-    if (!user?.orgId) {
-      return { success: false, message: 'User is not a member of any organization.' };
-    }
-
-    const org = await orgDb.getOrgById(user.orgId);
-    if (!org) {
-      return { success: false, message: 'Organization not found.' };
-    }
-    if (!can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure")) {
-      return { success: false, message: 'Only org owners and admins can delete org memories.' };
-    }
-
-    await orgMemoryDb.deleteMemory(user.orgId, args.memoryId);
-    return { success: true, message: `Org memory ${args.memoryId} deleted.` };
-  }
+  execute: (args: any, context?: any) => memoryImpl.deleteOrgMemory(args, context),
 });
 
 emmaToolRegistry.register({
@@ -7175,7 +7074,7 @@ output_fields guidance: one entry per distinct data point. Each entry has a snak
       throw new Error('Authentication required: no user context');
     }
     const { runEmmaEnrichment, pickPreviewLeadIds } = await import('./enrichmentToolRunner');
-    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids);
+    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids, context.userId);
     const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
@@ -7391,7 +7290,6 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
 // Ensure apiTools has registered its tools before we try to bridge them.
 import '../mcp/server/apiTools';
 import { mcpToolRegistry } from '../mcp/server/registry';
-import { can } from "../services/orgAuthz";
 
 // Also register get_visual_context in mcpToolRegistry (after the import above, which is needed
 // for mcpToolRegistry to be available).
@@ -9461,7 +9359,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
-For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts, CONTACTS + SEARCH (created_after/created_before) for contacts with source/UTM attribution fields, and DEALS (read-only) for pipeline data.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9523,6 +9421,14 @@ ASSET METRICS (CAMPAIGN LIST_ASSETS):
   WORKFLOW → enrolled, active, completed counts
   SOCIAL_BROADCAST → facebook_clicks, linkedin_clicks, twitter_clicks
 
+  CONTACTS     → LIST (cursor?) | SEARCH (created_after?, created_before?, properties[]?, limit?, cursor?)
+               SEARCH returns source/UTM attribution fields (hs_analytics_source*, hs_latest_source*, utm_*, first/recent conversion).
+  DEALS        → (read-only; scope crm.objects.deals.read)
+               LIST_PIPELINES → pipelines with stage ids + labels
+               SEARCH (deal_stage? [stage label like "New Business Meetings" or stage id], pipeline?, created_after?, created_before?, properties[]?, limit?, cursor?)
+               GET_CONTACTS (deal_id) → associated contacts with source/UTM attribution fields
+               Attribution rule: only report a deal as campaign-attributed when an associated contact's UTM/source value
+               actually names the campaign. Never estimate unmatched deals.
   CONTACT_LIST → LIST (query?, cursor?, count?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
                → ADD_CONTACTS (list_id, record_ids[]) | REMOVE_CONTACTS (list_id, record_ids[])
                → DELETE (list_id)
@@ -9539,7 +9445,16 @@ TYPICAL WORKFLOW:
     inputSchema: {
       type: 'object',
       properties: {
-        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST).' },
+        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS', 'DEALS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST/SEARCH; DEALS supports LIST_PIPELINES/SEARCH/GET_CONTACTS, read-only).' },
+        deal_stage:       { type: 'string', description: 'DEALS SEARCH: stage label (e.g. "New Business Meetings") or internal stage id.' },
+        pipeline:         { type: 'string', description: 'DEALS SEARCH: pipeline id (from LIST_PIPELINES).' },
+        deal_id:          { type: 'string', description: 'DEALS GET_CONTACTS: deal id.' },
+        created_after:    { type: 'string', description: 'CONTACTS/DEALS SEARCH: inclusive lower bound on createdate (ISO date, epoch seconds, or epoch ms).' },
+        created_before:   { type: 'string', description: 'CONTACTS/DEALS SEARCH: exclusive upper bound on createdate (ISO date, epoch seconds, or epoch ms).' },
+        // Untyped on purpose: a write attempt (e.g. DEALS UPDATE with an object) must reach the
+        // handler's read-only refusal instead of failing schema validation; mergeProps ignores non-lists.
+        properties:       { description: 'CONTACTS/DEALS SEARCH, DEALS GET_CONTACTS: extra HubSpot property names to return (string array or comma-separated string).' },
+        limit:            { type: 'integer', description: 'CONTACTS/DEALS SEARCH page size (integer, max 100). HubSpot caps one search query at 10,000 total results; for larger sets split into non-overlapping created_after/created_before ranges and restart paging per range.' },
         action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         // CAMPAIGN
         guid:             { type: 'string', description: 'Campaign guid. Required for CAMPAIGN GET/UPDATE/DELETE/GET_METRICS/LIST_ASSETS/ADD_ASSET/REMOVE_ASSET.' },

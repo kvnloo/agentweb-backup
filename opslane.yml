@@ -18,6 +18,8 @@ env:
   GOOGLE_CLIENT_SECRET: placeholder
   MCP_ACCESS_TOKEN: local-mcp-access-token-0123456789
   CONNECT_TOKEN_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+  # Record agent runs (failureType telemetry) so /api/admin/agent-runs is checkable, as on staging.
+  AGENT_RUNTIME_SPINE_ENABLED: "true"
 migrate: node dist/scripts/create-tables.js
 auth:
   # Signs in over the API; the session is a bearer token (headers), which hunts' signed-in http calls send.

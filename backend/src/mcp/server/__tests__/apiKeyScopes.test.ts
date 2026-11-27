@@ -1,4 +1,4 @@
-import { effectiveApiKeyScopes, findScopeDenial } from '../apiKeyScopes';
+import { effectiveApiKeyScopes, findApiKeyOnlyToolCall, findApiKeyOnlyToolCallForNonKey, findScopeDenial } from '../apiKeyScopes';
 
 // ENG-1083 decision A: API key scopes are a real permission boundary.
 const lookup = (name: string) =>
@@ -37,5 +37,44 @@ describe('ENG-1083 API key scope enforcement', () => {
   it('checks every message in a JSON-RPC batch and ignores non-call methods', () => {
     expect(findScopeDenial({ method: 'tools/list' }, [], lookup)).toBeNull();
     expect(findScopeDenial([call('get_stats'), call('send_email')], ['tools:read'], lookup)).toMatchObject({ tool: 'send_email' });
+  });
+});
+
+describe('a tool name that is not text (ENG-2840 W2-2: found in review, it left the request hanging)', () => {
+  // `String(x)` on an object whose toString is not a function throws inside an async Express handler, and nothing answers the request.
+  const hostile: unknown[] = [{ toString: 'x' }, { toString: null }, Object.create(null), [], ['save_memory'], 7, true, null, undefined];
+  const callNamed = (name: unknown) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
+  const withLookup = (name: string) => (name === 'get_stats' ? { readOnly: true } : name === 'locked' ? { requiredScope: 'x:y', apiKeyOnly: true } : undefined);
+
+  it.each(hostile.map((h) => [JSON.stringify(h) ?? String(h), h]))('findScopeDenial treats %s as an unknown tool (a write), without throwing', (_label, name) => {
+    expect(() => findScopeDenial(callNamed(name), ['tools:read'], withLookup)).not.toThrow();
+    expect(findScopeDenial(callNamed(name), ['tools:read'], withLookup)).toMatchObject({ requiredScope: 'tools:execute' });
+    expect(findScopeDenial(callNamed(name), ['tools:execute'], withLookup)).toBeNull();
+  });
+
+  it.each(hostile.map((h) => [JSON.stringify(h) ?? String(h), h]))('the two API-key-only checks pass %s over without throwing', (_label, name) => {
+    expect(() => findApiKeyOnlyToolCall(callNamed(name), withLookup)).not.toThrow();
+    expect(() => findApiKeyOnlyToolCallForNonKey(callNamed(name), withLookup)).not.toThrow();
+    expect(findApiKeyOnlyToolCall(callNamed(name), withLookup)).toBeNull();
+    expect(findApiKeyOnlyToolCallForNonKey(callNamed(name), withLookup)).toBeNull();
+  });
+
+  it('a hostile name in a batch does not hide a real refusal next to it', () => {
+    expect(findScopeDenial([callNamed({ toString: 'x' }), callNamed('get_stats'), callNamed('locked')], ['tools:read', 'tools:execute'], withLookup)).toMatchObject({ tool: 'locked', requiredScope: 'x:y' });
+    expect(findApiKeyOnlyToolCallForNonKey([callNamed({ toString: 'x' }), callNamed('locked')], withLookup)).toMatchObject({ tool: 'locked' });
+  });
+});
+
+describe('a tool name that is an array is not read as its first element (second review)', () => {
+  const callNamed = (name: unknown) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
+  const lookup = (name: string) => (name === 'locked' ? { requiredScope: 'x:y', apiKeyOnly: true } : undefined);
+
+  it('naming a gated tool inside an array neither gets it checked as that tool nor gets it past the check as another', () => {
+    // As an unknown tool it needs tools:execute (a key with it passes the gate; the SDK then rejects a name that is not text), as a
+    // gated tool it would need x:y. A key that has execute but not x:y must not be refused for "locked" here, nor treated as having it.
+    expect(findScopeDenial(callNamed(['locked']), ['tools:execute'], lookup)).toBeNull();
+    expect(findApiKeyOnlyToolCallForNonKey(callNamed(['locked']), lookup)).toBeNull();
+    expect(findApiKeyOnlyToolCall(callNamed(['locked']), lookup)).toBeNull();
+    expect(findScopeDenial(callNamed(['locked']), ['tools:read'], lookup)).toMatchObject({ requiredScope: 'tools:execute' });
   });
 });

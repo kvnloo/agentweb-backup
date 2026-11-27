@@ -80,8 +80,15 @@ export function toolResultError(result: unknown): Error | null {
 
   const policyBlock = () => {
     if (obj.blocked !== true || typeof obj.reason !== 'string' || !obj.reason.trim()) return null;
+    const base = extractToolResultMessage(obj) || `Tool was blocked by policy: ${obj.reason}`;
+    // ENG-3148: a policy gate's generic `message` ("Required function calls have
+    // not been made yet") omits WHICH calls/steps are missing; that detail lives
+    // only in `formattedContent`. Dropping it left the model guessing — prod
+    // session e68025bf spent 13 of its 40 steps on rejected set_work_plan_status
+    // retries and hit the iteration limit. Carry the detail through.
+    const detail = typeof obj.formattedContent === 'string' ? obj.formattedContent.trim() : '';
     return new ToolResultPolicyBlockedError(
-      extractToolResultMessage(obj) || `Tool was blocked by policy: ${obj.reason}`,
+      detail && !base.includes(detail) ? `${base}\n${detail}` : base,
       obj.reason,
     );
   };

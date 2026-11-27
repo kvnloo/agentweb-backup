@@ -35,6 +35,7 @@ import { isZomaAdsReportTool, ZOMA_ADS_REPORT_DEFINITION } from './zomaAdsReport
 import { isZomaIndustryBenchmarkTool } from './zomaIndustryBenchmark';
 import { measurementReportsEnabled, ZOMA_MEASUREMENT_REPORT_DEFINITION } from './zomaMeasurementReport';
 import { ZOMA_REPORT_SCHEDULE_DEFINITION } from './zomaReportSchedule';
+import { withUseWhen } from './zomaUseWhen';
 
 export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
@@ -103,6 +104,21 @@ function narrowDefinition(definition: any): any {
       };
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;
+      // CREATE_PAUSED_BUNDLE is not on this surface, so its child props only advertised a one-call
+      // campaign + ad set + ads create that CAMPAIGN CREATE then refused. The nested campaign
+      // shape is accepted (flattenNestedCampaignCreate); the rest is one entity per call.
+      const pp = props.params?.properties;
+      if (pp) {
+        delete pp.ad_set;
+        delete pp.ads;
+        delete pp.requested_ad_count;
+        if (pp.campaign) {
+          pp.campaign = {
+            type: 'object',
+            description: 'CAMPAIGN CREATE only: the campaign fields (name, objective, special_ad_categories, ...) may be nested here instead of directly in params. Creates the campaign only; create the ad set and ads with their own calls.',
+          };
+        }
+      }
     }
   }
   if (Array.isArray(def?.inputSchema?.required)) {
@@ -128,7 +144,8 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
   });
   // ENG-2303: toolkit-local Zoma onboarding tools (handled by the gateway, not the registry).
   // ENG-2916: read-only account health + learning-phase tools (handled by the gateway).
-  return [
+  // Every description leads with a plain-language "Use when the user …" sentence (zomaUseWhen.ts).
+  return withUseWhen([
     ...metaTools,
     ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
@@ -156,7 +173,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...((opts.measurementReports ?? measurementReportsEnabled())
       ? [ZOMA_MEASUREMENT_REPORT_DEFINITION, ZOMA_REPORT_SCHEDULE_DEFINITION].map((d) => JSON.parse(JSON.stringify(d)))
       : []),
-  ];
+  ]);
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */

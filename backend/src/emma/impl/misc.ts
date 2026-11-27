@@ -261,7 +261,7 @@
  */
 import axios from 'axios';
 import { createHash } from 'crypto';
-import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../../utils/s3Utils';
+import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectStreamAbortable, getS3ObjectMetadata } from '../../utils/s3Utils';
 import { pdfPageRender } from './shared/pdfTextRender';
 import { resolvePinnedPublicAddress, SsrfBlockedError } from '../../utils/ssrfGuard';
 import { getCrmSenders } from './shared/crmSenders';
@@ -542,6 +542,27 @@ export async function saveFile(
  */
 export interface ReadFileCallerContext {
   userId?: string | null;
+  /**
+   * ENG-2840 (W2-7, the MCP tool): read only a file in the caller's own AgentWeb storage; any other URL is refused before anything is
+   * fetched (no web pages, no other hosts). Emma leaves it unset.
+   */
+  ownStorageOnly?: boolean;
+  /**
+   * ENG-2840 (W2-7, the MCP tool): refuse a stored file larger than this many bytes, from its stored size before reading and again while
+   * reading. Emma leaves it unset (no limit).
+   */
+  maxBytes?: number;
+}
+
+/** The refusal for a URL outside the caller's own storage when `ownStorageOnly` is set. */
+export const OWN_STORAGE_ONLY_MESSAGE = 'Only a file in your own AgentWeb storage can be read here (a file URL that AgentWeb returned for your account). Web pages and other sites are not fetched.';
+
+function fileTooLarge(maxBytes: number): { success: false; message: string; error: string } {
+  return {
+    success: false,
+    message: `This file is larger than ${Math.floor(maxBytes / (1024 * 1024))} MB, the most that can be read here.`,
+    error: 'File too large',
+  };
 }
 
 /** Key prefixes a user owns in the shared bucket (see s3Utils/brand/books/sandbox writers). */
@@ -643,6 +664,12 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
       };
     }
 
+    // ENG-2840 (W2-7): with ownStorageOnly, anything that is not a file of AgentWeb's own bucket is refused first, before any other answer
+    // (an image or video URL elsewhere gets the same refusal) and before anything is fetched.
+    if (caller?.ownStorageOnly === true && !extractS3KeyFromUrl(normalizedFileUrl)) {
+      return { success: false, message: OWN_STORAGE_ONLY_MESSAGE, error: 'Not a file in your AgentWeb storage' };
+    }
+
     // Determine file type from URL
     const urlPath = new URL(normalizedFileUrl).pathname;
     const extension = urlPath.split('.').pop()?.toLowerCase() || '';
@@ -681,18 +708,42 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
           error: 'File not accessible'
         };
       }
+      const maxBytes = caller?.maxBytes;
+      let meta: any;
+      if (maxBytes !== undefined) {
+        // ENG-2840 (W2-7): the stored size first, so a file over the limit is never downloaded. A size that cannot be read is not a pass:
+        // the stream below still stops at the limit.
+        try {
+          meta = await getS3ObjectMetadata(s3Key);
+        } catch {
+          meta = undefined;
+        }
+        if (typeof meta?.ContentLength === 'number' && meta.ContentLength > maxBytes) return fileTooLarge(maxBytes);
+      }
       // Private bucket object — stream via SDK (same pattern as filesController)
-      const stream = getS3ObjectStream(s3Key);
+      // With a limit, the stream's destroy() also aborts the S3 request, so stopping early frees the connection.
+      const stream = maxBytes !== undefined ? getS3ObjectStreamAbortable(s3Key) : getS3ObjectStream(s3Key);
       const chunks: Buffer[] = [];
+      let received = 0;
       for await (const chunk of stream) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const piece = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        received += piece.length;
+        if (maxBytes !== undefined && received > maxBytes) {
+          (stream as any).destroy?.();
+          return fileTooLarge(maxBytes);
+        }
+        chunks.push(piece);
       }
       buffer = Buffer.concat(chunks);
-      try {
-        const meta = await getS3ObjectMetadata(s3Key);
-        contentType = meta.ContentType || '';
-      } catch {
-        contentType = '';
+      if (maxBytes !== undefined) {
+        contentType = meta?.ContentType || '';
+      } else {
+        try {
+          const stored = await getS3ObjectMetadata(s3Key);
+          contentType = stored.ContentType || '';
+        } catch {
+          contentType = '';
+        }
       }
       console.log(`AgentMode: Fetched S3 file via SDK, size: ${buffer.length} bytes, type: ${contentType}`);
     } else {
