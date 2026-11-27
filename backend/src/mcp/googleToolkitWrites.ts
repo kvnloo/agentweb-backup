@@ -33,7 +33,7 @@
  * refused, not rounded) and echoed as both.
  */
 import { getJwtSecret } from '../config/jwt';
-import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
+import { evaluateMetaSpendCeiling, SPEND_CEILING_RAISE_PATH, type MetaSpendCeilingPolicy, type MetaSpendCeilingVerdict } from '../services/agentMode/metaSpendCeiling';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { assertBidTargetIsAddressable } from '../services/googleAdsBidTargets';
 import { resolveZomaImageUrl } from './metaToolkitCreatives';
@@ -282,6 +282,27 @@ const positiveMicros = (amount: unknown, currency: string, field: string): numbe
 export function formatMicros(micros: number, currency: string): string {
   const digits = currencyDigits(currency);
   return `${(micros / 1e6).toFixed(digits)} ${currency}`;
+}
+
+/**
+ * A daily-budget spend-ceiling refusal in the account currency. The shared core reports raw
+ * micros; Google and X show the same verdict as money. INVALID verdicts pass through unchanged.
+ */
+export function spendCeilingRefusalMessage(
+  verdict: Extract<MetaSpendCeilingVerdict, { allowed: false }>,
+  policy: MetaSpendCeilingPolicy,
+  proposedAmount: unknown,
+  prior: unknown,
+  currency: string,
+): string {
+  if (verdict.code !== 'SPEND_CEILING_EXCEEDED') return verdict.message;
+  const proposed = Number(proposedAmount);
+  if (verdict.ceiling === 'maxDailyBudget') {
+    return `daily_budget ${formatMicros(proposed, currency)} exceeds this account's max daily budget of ${formatMicros(policy.maxDailyBudget!, currency)}. ${SPEND_CEILING_RAISE_PATH}`;
+  }
+  const before = Number(prior);
+  const ratio = before === 0 ? 'an increase from 0' : `${(proposed / before).toFixed(2)}x`;
+  return `daily_budget change ${formatMicros(before, currency)} -> ${formatMicros(proposed, currency)} is ${ratio}, above this account's max single-change ratio of ${policy.maxChangeRatio}x. ${SPEND_CEILING_RAISE_PATH}`;
 }
 
 export interface ToolkitKeyword { text: string; matchType: 'BROAD' | 'PHRASE' | 'EXACT' }
@@ -1083,13 +1104,13 @@ export async function executeGoogleToolkitWrite(
   if (policy && validated.budgetMicros !== undefined) {
     const prior = (state.prior as GoogleBudgetState | undefined)?.amountMicros;
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: validated.budgetMicros, prior });
-    if (!verdict.allowed) throw new MetaToolkitRefusal(verdict.message.replace('(minor units)', '(micros)'));
+    if (!verdict.allowed) throw new MetaToolkitRefusal(spendCeilingRefusalMessage(verdict, policy, validated.budgetMicros, prior, currency));
   }
   if (policy && action === 'UPDATE' && validated.expectedStatus === 'ENABLED') {
     // Fail closed: a ceiling that cannot see the campaign's budget never allows enabling it.
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: enableBudgetMicros });
     if (!verdict.allowed) {
-      throw new MetaToolkitRefusal(`Enabling this ${NOUN[validated.target!.kind] ?? 'object'} would start spend at its budget. ${verdict.message.replace('(minor units)', '(micros)')}`);
+      throw new MetaToolkitRefusal(`Enabling this ${NOUN[validated.target!.kind] ?? 'object'} would start spend at its budget. ${spendCeilingRefusalMessage(verdict, policy, enableBudgetMicros, undefined, currency)}`);
     }
   }
 
