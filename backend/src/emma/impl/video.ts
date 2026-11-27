@@ -66,8 +66,9 @@
  * constructs a real `AWS.DynamoDB.DocumentClient` at module load — the same
  * established idiom as `books.ts`/`gtmPlans.ts`.
  *
- * All other imports below (`axios`, `getSecret`, `fs`/`os`/`path`, `Readable`,
- * `meterUsageFromResponse`) are unchanged STATIC imports, exactly matching how
+ * All other imports below (`getSecret`, `fs`/`os`/`path`, `meterUsageFromResponse`)
+ * are unchanged STATIC imports (ENG-2840 removed `axios` and `Readable`: the video
+ * download now goes through the lazily imported `utils/callerUrlFetch`), exactly matching how
  * `agentModeService.ts` already imported every one of them — none of these
  * modules imports `agentModeService.ts`, `chatbotService.ts`,
  * `settingsService.ts`, `orgProfileResolver.ts`,
@@ -97,11 +98,9 @@
  * that requiring this module alone does NOT load `agentModeService.ts` or
  * `chatbotService.ts`.
  */
-import axios from 'axios';
-import { createWriteStream, promises as fs } from 'fs';
+import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
-import { Readable } from 'stream';
 import { getSecret } from '../../utils/secretsManager';
 import { meterUsageFromResponse } from '../../utils/llmClients';
 import { isSupportedVideoModel, normalizeVideoModel } from '../../services/videoModels';
@@ -109,6 +108,9 @@ import { isSupportedVideoModel, normalizeVideoModel } from '../../services/video
 // Shared with an out-of-scope call site elsewhere in agentModeService.ts
 // (unrelated to this cluster) — duplicated here rather than exported/imported
 // back, per the F2 design draft §3.2 ("just strings/literals; inline them").
+/** Total time for downloading a caller's video, redirects included (the size cap is MAX_DOWNLOADED_VIDEO_SIZE_MB, default 100 MB). */
+const VIDEO_DOWNLOAD_TIMEOUT_MS = 180_000;
+
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 
 
@@ -319,18 +321,27 @@ export async function describeVideo(
       const maxSizeMb = parseInt(process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB || '100', 10);
       const maxSizeBytes = maxSizeMb * 1024 * 1024;
 
-      const response = await axios.get(videoFileUrl, { responseType: 'stream' });
-      const responseStream = response.data as Readable;
-      const contentLengthHeader = response.headers['content-length'];
-      const declaredSize = contentLengthHeader ? parseInt(contentLengthHeader.toString(), 10) : 0;
-      if (declaredSize && declaredSize > maxSizeBytes) {
-        return {
-          success: false,
-          message: `Video file too large for analysis: ${Math.round(declaredSize / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
-        };
+      // ENG-2840: the URL is the caller's choice, so it is fetched only through the SSRF-guarded fetch (DNS pinned to a public address,
+      // every redirect re-checked, the size capped while downloading, the whole download bounded in time). Before, a plain axios GET with
+      // no host check and no timeout let any signed-in user make the server request an internal address.
+      const { fetchCallerUrlBuffer, CallerUrlBlockedError, CallerUrlTooLargeError } = await import('../../utils/callerUrlFetch');
+      let downloaded: { buffer: Buffer; contentType: string };
+      try {
+        downloaded = await fetchCallerUrlBuffer(videoFileUrl, {
+          tool: 'describe_video',
+          userId: options?.userId,
+          maxBytes: maxSizeBytes,
+          timeoutMs: VIDEO_DOWNLOAD_TIMEOUT_MS,
+        });
+      } catch (err: any) {
+        if (err instanceof CallerUrlTooLargeError) {
+          return { success: false, message: `Video file too large for analysis: it exceeds the limit of ${maxSizeMb} MB` };
+        }
+        if (err instanceof CallerUrlBlockedError) return { success: false, message: err.message };
+        throw err;
       }
 
-      const contentTypeHeader = (response.headers['content-type'] || '').toString();
+      const contentTypeHeader = downloaded.contentType || '';
       const urlExtension = path.extname(url.pathname).toLowerCase();
       const mimeTypeMap: Record<string, string> = {
         '.mp4': 'video/mp4',
@@ -355,34 +366,13 @@ export async function describeVideo(
       const fileExtension = urlExtension || '.mp4';
       const tempFilePath = path.join(tempDirPath, `video${fileExtension}`);
 
-      const writer = createWriteStream(tempFilePath);
-      let downloadedBytes = 0;
-      await new Promise<void>((resolve, reject) => {
-        responseStream.on('data', (chunk: Buffer) => {
-          downloadedBytes += chunk.length;
-          if (downloadedBytes > maxSizeBytes) {
-            responseStream.destroy(new Error('Video file too large'));
-          }
-        });
-        responseStream.on('error', reject);
-        writer.on('error', reject);
-        writer.on('finish', resolve);
-        responseStream.pipe(writer);
-      });
-
-      if (downloadedBytes === 0) {
+      if (downloaded.buffer.length === 0) {
         return {
           success: false,
           message: 'Downloaded video file is empty'
         };
       }
-
-      if (downloadedBytes > maxSizeBytes) {
-        return {
-          success: false,
-          message: `Video file too large for analysis: ${Math.round(downloadedBytes / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
-        };
-      }
+      await fs.writeFile(tempFilePath, downloaded.buffer);
 
       const uploadResponse = await aiClient.files.upload({
         file: tempFilePath,
