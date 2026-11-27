@@ -2330,9 +2330,13 @@ export async function getExecutionsWithAssets(
   // writes it back to the owner's records (and bills the classifier call). Only the
   // owner's own read may do that; teammate reads in the shared workspace must be
   // read-only so they never rewrite another member's result_files or incur their LLM cost.
-  options: { backfill?: boolean } = {},
+  // ENG-2840 (W2-10): `warm: false` writes no session asset cache either (no background warm
+  // of uncached sessions, no incremental cache update), so with `backfill: false` the call is
+  // a pure read (search_user_assets over MCP). Default true: unchanged.
+  options: { backfill?: boolean; warm?: boolean } = {},
 ): Promise<Record<string, any>> {
   const backfill = options.backfill !== false;
+  const warm = options.warm !== false;
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
 
@@ -2469,7 +2473,7 @@ export async function getExecutionsWithAssets(
       // Background-warm uncached sessions (fire-and-forget).
       // Cap at 50 per request to avoid thundering-herd on large accounts.
       const MAX_WARM_PER_REQUEST = 50;
-      if (uncachedSessions.length > 0) {
+      if (warm && uncachedSessions.length > 0) {
         const sessionsToWarm = uncachedSessions.slice(0, MAX_WARM_PER_REQUEST);
         (async () => {
           try {
@@ -2539,7 +2543,7 @@ export async function getExecutionsWithAssets(
         }, 0);
         const newScanIndex = maxIndex + 1;
 
-        chatbotDb.updateAssetCache(session.sessionId, existingCache, newScanIndex);
+        if (warm) chatbotDb.updateAssetCache(session.sessionId, existingCache, newScanIndex);
       }
 
       const sessionKey = `agent-mode-${session.sessionId}`;
@@ -2911,7 +2915,9 @@ async function getWorkspaceExecutionsWithAssets(
   return getWorkspaceAssets(caller, {
     getOrgMembers: (orgId) => orgDb.getOrgMembers(orgId),
     fetchForUser: (memberId) =>
-      getExecutionsWithAssets(memberId, assetType, errorMessage, { backfill: memberId === userId }),
+      // ENG-2874 / ENG-2840: only the owner's own read writes anything (searchable text, report labels, the session asset caches);
+      // a teammate's read of the shared workspace is read-only.
+      getExecutionsWithAssets(memberId, assetType, errorMessage, { backfill: memberId === userId, warm: memberId === userId }),
   });
 }
 
