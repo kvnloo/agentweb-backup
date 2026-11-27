@@ -511,23 +511,28 @@ async function runGoogleAdsTrackingGate(
 }
 
 /**
- * The policy topics (and violating text) Google attaches to a POLICY_FINDING /
- * POLICY_VIOLATION error. Without them the caller sees only "PROHIBITED" and cannot tell
- * which headline or rule to fix.
+ * The policy topics Google attaches to a POLICY_FINDING / POLICY_VIOLATION error, and the
+ * field that failed. Without them the caller sees only "PROHIBITED" and cannot tell which
+ * headline or rule to fix.
+ *
+ * The advertiser's own text (evidences, violatingText, trigger) is deliberately NOT quoted:
+ * this string is read by error classifiers (toolErrorClassifier, zomaErrorNextStep), and ad
+ * copy such as "Save 500 today" or "Sign in for free" would be misread as a 5xx or a
+ * setup failure. The field path already names the headline to rewrite.
  */
 export function googleAdsPolicyReasons(e: any): string | undefined {
   const reasons: string[] = [];
   const entries: any[] = e?.details?.policyFindingDetails?.policyTopicEntries ?? [];
   for (const entry of entries) {
-    if (entry?.topic) reasons.push(entry.type ? `${entry.topic} (${entry.type})` : String(entry.topic));
+    if (/^[A-Z0-9_]+$/.test(String(entry?.topic ?? ''))) reasons.push(`${entry.topic}${/^[A-Z_]+$/.test(String(entry.type ?? '')) ? ` (${entry.type})` : ''}`);
   }
   const v = e?.details?.policyViolationDetails;
-  if (v?.externalPolicyName) {
-    const text = v.key?.violatingText ? ` on "${v.key.violatingText}"` : '';
-    reasons.push(`${v.externalPolicyName}${text}`);
-  }
-  const trigger = e?.trigger?.stringValue;
-  if (reasons.length && trigger) reasons.push(`triggered by "${trigger}"`);
+  if (v?.key?.policyName && /^[a-z0-9_]+$/i.test(String(v.key.policyName))) reasons.push(String(v.key.policyName));
+  // Which field failed, e.g. headlines[2]: tells the caller which line to rewrite.
+  const path = (e?.location?.fieldPathElements ?? [])
+    .map((p: any) => (/^[a-z_]+$/.test(String(p?.fieldName ?? '')) ? `${p.fieldName}${Number.isInteger(p.index) ? `[${p.index}]` : ''}` : ''))
+    .filter(Boolean).join('.');
+  if (reasons.length && path) reasons.push(`at ${path}`);
   return reasons.length ? [...new Set(reasons)].join(', ') : undefined;
 }
 

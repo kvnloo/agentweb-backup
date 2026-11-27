@@ -103,7 +103,7 @@ const GOOGLE_ADS_API_DESCRIPTION =
 
 /** Parameter descriptions written for the Zoma surface (the shared Emma ones name actions and tools Zoma does not offer). */
 const ZOMA_PARAM_DESCRIPTIONS: Record<string, string> = {
-  customer_id: 'Google Ads customer id (numeric, no dashes), from zoma_status. Needed only when more than one account is connected.',
+  customer_id: 'Google Ads customer id (numeric, no dashes), from zoma_status.',
   campaign_resource_name: 'customers/<id>/campaigns/<id>, from CAMPAIGN LIST. Required for CAMPAIGN UPDATE, AD_GROUP LIST / CREATE and ASSET_GROUP CREATE; for KEYWORD ADD_NEGATIVE as the alternative to ad_group_resource_name.',
   ad_group_resource_name: 'customers/<id>/adGroups/<id>, from AD_GROUP LIST. Required for AD_GROUP UPDATE, KEYWORD LIST / ADD and AD LIST / CREATE; for KEYWORD ADD_NEGATIVE as the alternative to campaign_resource_name.',
   ad_resource_name: 'customers/<id>/adGroupAds/<adGroupId>~<adId>, from AD LIST. Required for AD UPDATE.',
