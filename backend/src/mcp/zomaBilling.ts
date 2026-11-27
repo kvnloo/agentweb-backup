@@ -522,12 +522,21 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
   const cfg = deps.config();
   if (!cfg.enabled) return undefined;
   const early = await userHasEarlySignupFree(userId, deps.getUser, deps.now());
-  if (early) return { status: 'none', publish_enabled: true, free_until: formatEarlySignupFreeUntil(early) };
+  const freeSummary = (): ZomaPlanSummary => ({ status: 'none', publish_enabled: true, free_until: formatEarlySignupFreeUntil(early!) });
   try {
-    const state = await getZomaPlanState(userId, deps);
+    const state = await getZomaPlanState(userId, deps).catch((error) => {
+      // The write guard lets an early signup publish without reading the plan, so status must agree.
+      if (early) return undefined;
+      throw error;
+    });
+    if (!state) return freeSummary();
+    // An early signup who already holds a live or failing plan sees that plan, not "no card needed".
+    const holdsPlan = state.status === 'trialing' || state.status === 'active' || planPaymentFailed(state);
+    if (early && !holdsPlan) return freeSummary();
     const summary: ZomaPlanSummary = {
       status: state.status,
-      publish_enabled: planAllowsPublish(state),
+      // The write guard skips the paywall for early signups, whatever their plan state.
+      publish_enabled: early ? true : planAllowsPublish(state),
       ...(state.status === 'trialing' && state.trialEnd ? { trial_ends_at: state.trialEnd } : {}),
       ...(state.cancelAtPeriodEnd ? { cancels_at_period_end: true } : {}),
       ...(state.hadPlan ? { returning: true } : {}),

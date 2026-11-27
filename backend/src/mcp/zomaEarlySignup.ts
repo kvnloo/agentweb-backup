@@ -24,6 +24,12 @@ const ISO_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\
 function parseInstant(raw: string | undefined): number | undefined {
   const value = raw?.trim();
   if (!value || !ISO_WITH_OFFSET.test(value)) return undefined;
+  // Reject impossible calendar dates (2027-02-30): Date.parse would roll them over silently.
+  const [y, m, d] = value.slice(0, 10).split('-').map(Number);
+  const cal = new Date(Date.UTC(y, m - 1, d));
+  if (cal.getUTCFullYear() !== y || cal.getUTCMonth() !== m - 1 || cal.getUTCDate() !== d) return undefined;
+  const [hh, mm, ss] = value.slice(11, 19).split(':').map(Number);
+  if (hh > 23 || mm > 59 || (ss ?? 0) > 59) return undefined;
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? ms : undefined;
 }

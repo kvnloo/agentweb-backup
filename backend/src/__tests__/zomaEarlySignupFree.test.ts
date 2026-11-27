@@ -161,6 +161,51 @@ describe('early-signup free period', () => {
     expect(plan?.link).toContain('/api/zoma/billing/checkout/');
   });
 
+  it('early signup with an existing active plan sees that plan, not "free"', async () => {
+    setEarly();
+    const sec = (iso: string) => Math.floor(Date.parse(iso) / 1000);
+    const active: any = {
+      id: 'sub_1', status: 'active', created: sec('2026-11-20T00:00:00Z'), latest_invoice: { id: 'in_1', status: 'paid' },
+      cancel_at_period_end: false, metadata: { product: 'zoma_plan', userId: 'u1' },
+      items: { data: [{ current_period_start: sec('2026-11-27T00:00:00Z'), current_period_end: sec('2026-12-27T00:00:00Z') }] },
+    };
+    const d = deps(IN_WINDOW, DEC_2, { findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([active]) });
+    const plan = await getZomaPlanSummary('u1', d);
+    expect(plan?.status).toBe('active');
+    expect(plan?.free_until).toBeUndefined();
+    expect(plan?.publish_enabled).toBe(true);
+  });
+
+  it('early signup with a cancelled old plan still shows free, and no checkout', async () => {
+    setEarly();
+    const d = deps(IN_WINDOW, DEC_2, {
+      findCustomerId: jest.fn().mockResolvedValue('cus_1'),
+      listSubscriptions: jest.fn().mockResolvedValue([{ id: 'sub_old', status: 'canceled', created: 1, metadata: { product: 'zoma_plan' }, items: { data: [] } }]),
+    });
+    expect((await getZomaPlanSummary('u1', d))?.free_until).toBe('Jan 1, 2027');
+    expect(d.createCheckoutSession).not.toHaveBeenCalled();
+  });
+
+  it('early signup: Stripe read failure still shows free (matches the write guard)', async () => {
+    setEarly();
+    const d = deps(IN_WINDOW, DEC_2, { findCustomerId: jest.fn().mockRejectedValue(new Error('stripe down')) });
+    expect((await getZomaPlanSummary('u1', d))?.free_until).toBe('Jan 1, 2027');
+    await expect(publish(d)).resolves.toBeUndefined();
+  });
+
+  it('non-early: Stripe read failure is unchanged (error, publish disabled)', async () => {
+    setEarly();
+    const d = deps(BEFORE_WINDOW, DEC_2, { findCustomerId: jest.fn().mockRejectedValue(new Error('stripe down')) });
+    const plan = await getZomaPlanSummary('u1', d);
+    expect(plan?.publish_enabled).toBe(false);
+    expect(plan?.error).toMatch(/Could not check/);
+  });
+
+  it.each(['2027-02-30T00:00:00-08:00', '2027-01-01T24:00:00-08:00', '2027-13-01T00:00:00Z'])('impossible date %s disables the skip', async (bad) => {
+    setEarly({ ZOMA_EARLY_SIGNUP_FREE_UNTIL: bad });
+    expect(getZomaEarlySignupConfig()).toBeUndefined();
+  });
+
   it('isEarlySignupFree pure checks', () => {
     setEarly();
     const cfg = getZomaEarlySignupConfig()!;
