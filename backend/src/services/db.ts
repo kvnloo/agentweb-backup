@@ -13657,7 +13657,7 @@ const OAUTH_SESSIONS_TABLE = `${TABLE_PREFIX}AW-OAuthSessions`;
 export interface PendingOAuthSession {
   sessionId: string;
   userId: string;
-  provider: 'hubspot' | 'fathom';
+  provider: 'hubspot' | 'fathom' | 'linkedin' | 'linkedin_ads';
   payload: unknown;
 }
 

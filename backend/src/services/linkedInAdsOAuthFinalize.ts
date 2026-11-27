@@ -6,20 +6,15 @@
  * Everything here is READ-ONLY toward LinkedIn: it exchanges the code, lists the member's ad accounts,
  * and saves a connected_accounts row. It never creates a campaign, creative or account.
  *
- * KNOWN LIMITATION (not redesigned here): the pending token sessions are an in-memory Map with a 10
- * minute TTL, one process. A finalize on one backend instance followed by a connect that lands on
- * another instance (or after a restart) finds no session and the user must connect again. Same as the
- * portal flow had before the extraction.
+ * Pending token sessions live in the shared AW-OAuthSessions row (10 minute TTL, one-time use), so a
+ * finalize on one backend instance may be followed by a connect on another (ENG-3043).
  */
 import axios from 'axios';
-import crypto from 'crypto';
 import { getLinkedInAdsConfig } from '../config/integrations';
 import { createAccount, getAccountsByUserId, type ConnectedAccount } from './connectedAccountsDb';
 import { getFreshLinkedInAdsToken, LinkedInConnectionError, type LinkedInTokenDeps } from './linkedInAdsCredentials';
 import { listAdAccounts } from './linkedInAdsService';
-
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
+import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from './oauthFlowSessions';
 
 /**
  * ENG-1644 gap-closing: linkedin_ads was a live platform with zero auto-resolve wiring — a
@@ -37,7 +32,7 @@ async function safeAutoResolve(label: string, userId: string, platform: string, 
   }
 }
 
-interface TokenSession {
+interface TokenSession extends LocalOAuthFlowSession {
   tokens: {
     access_token: string;
     refresh_token?: string;
@@ -45,39 +40,15 @@ interface TokenSession {
     scopes: string[];
     personUrn?: string;
   };
-  userId: string;
-  expires: number;
   adAccountRefs: { [accountId: string]: string }; // accountId → organization URN (reference field)
 }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
 
 const storeTokenSession = (
   userId: string,
   tokens: TokenSession['tokens'],
   adAccountRefs: TokenSession['adAccountRefs']
-): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS, adAccountRefs });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): TokenSession | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId); // one-time use
-  return session;
-};
+): Promise<string> =>
+  storeOAuthFlowSession<TokenSession>('linkedin_ads', { tokens, userId, expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS, adAccountRefs });
 
 export interface LinkedInAdsFinalizeResult {
   adAccounts: any[];
@@ -155,7 +126,7 @@ export async function finalizeLinkedInAdsOAuth(params: { userId: string; code: s
   }
 
   // Store tokens server-side, return session ID
-  const tokenSessionId = storeTokenSession(userId, {
+  const tokenSessionId = await storeTokenSession(userId, {
     access_token,
     refresh_token,
     expires_in,
@@ -219,7 +190,7 @@ export async function connectLinkedInAdsAccounts(params: {
   tokenDeps?: LinkedInTokenDeps;
 }): Promise<LinkedInAdsConnectResult> {
   const { userId, tokenSessionId } = params;
-  const session = retrieveTokenSession(tokenSessionId, userId);
+  const session = await consumeOAuthFlowSession<TokenSession>('linkedin_ads', tokenSessionId, userId);
   if (!session) return { ok: false, reason: 'invalid_session' };
 
   const { tokens } = session;

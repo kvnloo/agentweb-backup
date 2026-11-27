@@ -8,6 +8,7 @@ import { redactAccountsSecrets } from '../utils/accountSecretRedaction';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from '../services/oauthFlowSessions';
 
 const router = express.Router();
 
@@ -22,8 +23,6 @@ interface AuthenticatedRequest extends Request {
 // Constants (Fix #9)
 // ============================================
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 /**
@@ -88,64 +87,20 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
 // ============================================
 // Token Session Store (Secure server-side storage)
 // ============================================
-// Stores tokens server-side with a secure session ID to avoid
-// passing sensitive tokens via postMessage in the browser.
+// Tokens stay server-side behind a one-time session ID (never sent via postMessage), in the shared
+// AW-OAuthSessions row so /finalize and /connect-accounts may land on different instances (ENG-3043).
 
-interface TokenSession {
+interface TokenSession extends LocalOAuthFlowSession {
   tokens: {
     access_token: string;
     refresh_token?: string;
     expires_in: number;
     scopes: string[];
   };
-  userId: string;
-  expires: number;
 }
 
-const tokenSessions = new Map<string, TokenSession>();
-// Using TOKEN_SESSION_TTL_MS from constants above
-
-// Clean up expired sessions periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [sessionId, session] of tokenSessions.entries()) {
-    if (now > session.expires) {
-      tokenSessions.delete(sessionId);
-    }
-  }
-}, SESSION_CLEANUP_INTERVAL_MS);
-
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens']): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, {
-    tokens,
-    userId,
-    expires: Date.now() + TOKEN_SESSION_TTL_MS
-  });
-  console.log(`[TokenSession] Stored session ${sessionId.substring(0, 8)}... for user ${userId}`);
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): TokenSession['tokens'] | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session) {
-    console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... not found`);
-    return null;
-  }
-  if (session.userId !== userId) {
-    console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... userId mismatch`);
-    return null;
-  }
-  if (Date.now() > session.expires) {
-    console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... expired`);
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  // One-time use: delete after retrieval
-  tokenSessions.delete(sessionId);
-  console.log(`[TokenSession] Retrieved and deleted session ${sessionId.substring(0, 8)}...`);
-  return session.tokens;
-};
+const storeTokenSession = (userId: string, tokens: TokenSession['tokens']): Promise<string> =>
+  storeOAuthFlowSession<TokenSession>('linkedin', { userId, tokens, expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS });
 
 // ============================================
 // LinkedIn Type-Specific OAuth (Personal or Company)
@@ -320,7 +275,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     }
 
     // Store tokens server-side and return session ID
-    const tokenSessionId = storeTokenSession(userId, {
+    const tokenSessionId = await storeTokenSession(userId, {
       access_token,
       refresh_token,
       expires_in,
@@ -361,13 +316,13 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing token session ID' });
   }
 
-  // Retrieve tokens from secure server-side session
-  const tokens = retrieveTokenSession(tokenSessionId, userId);
-  if (!tokens) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
   try {
+    // Retrieve tokens from secure server-side session (one-time use)
+    const tokens = (await consumeOAuthFlowSession<TokenSession>('linkedin', tokenSessionId, userId))?.tokens;
+    if (!tokens) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
+
     const config = await getLinkedInConfig();
     const connectedAccounts = [];
 

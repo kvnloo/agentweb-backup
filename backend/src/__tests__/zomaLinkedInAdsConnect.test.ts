@@ -30,7 +30,10 @@ jest.mock('../services/connectedAccountsDb', () => ({
 }));
 jest.mock('../services/approvalInboxCustomerNotify', () => ({ safeAutoResolveCredentialDecision: jest.fn() }));
 jest.mock('../services/journeyMilestones', () => ({ zomaMilestone: jest.fn().mockResolvedValue(undefined) }));
-jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+  oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
+}));
 jest.mock('../services/stripeService', () => ({ stripeService: {} }));
 jest.mock('../middleware/auth', () => ({ authenticateToken: (req: any, _res: any, next: any) => { req.user = { userId: 'u1' }; next(); } }));
 

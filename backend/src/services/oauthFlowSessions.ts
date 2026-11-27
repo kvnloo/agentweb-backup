@@ -13,7 +13,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isStrings = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every(item => typeof item === 'string');
 
-// Validate both provider payloads at the shared persistence boundary before route use.
+// Validate every provider payload at the shared persistence boundary before route use.
 function isValidPayload(value: unknown, provider: PendingOAuthSession['provider'], userId: string): boolean {
   if (!isRecord(value) || value.userId !== userId ||
       typeof value.expires !== 'number' || !Number.isFinite(value.expires) || value.expires <= Date.now() ||
@@ -23,6 +23,12 @@ function isValidPayload(value: unknown, provider: PendingOAuthSession['provider'
       typeof tokens.expires_in !== 'number' || !Number.isFinite(tokens.expires_in) ||
       (tokens.refresh_token !== undefined && typeof tokens.refresh_token !== 'string')) return false;
   if (provider === 'fathom') return true;
+  if (provider === 'linkedin' || provider === 'linkedin_ads') {
+    if (!isStrings(tokens.scopes)) return false;
+    return provider === 'linkedin' || (isRecord(value.adAccountRefs) &&
+      Object.values(value.adAccountRefs).every(ref => typeof ref === 'string') &&
+      (tokens.personUrn === undefined || typeof tokens.personUrn === 'string'));
+  }
   return isRecord(value.hubInfo) && typeof value.hubInfo.hub_id === 'number' &&
     Number.isFinite(value.hubInfo.hub_id) && typeof value.hubInfo.hub_domain === 'string' &&
     typeof value.hubInfo.user === 'string' && (value.accountType === 'crm' || value.accountType === 'marketing') &&
