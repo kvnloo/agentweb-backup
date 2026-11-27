@@ -14,6 +14,7 @@ import { jsonResult } from './toolHelpers';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
 import { leadPutGuardMode, SERVER_OWNED_LEAD_KEYS } from '../../utils/leadWriteGuard';
 import { isDoNotContact } from '../../utils/leadContactStatus';
+import { STATUS_NOTE_MAX_CHARS } from '../../utils/agentEngagementLimits';
 
 /** Most rows one add or delete call handles (the same cap Emma's bulk tools use). */
 export const MAX_LEAD_ROWS_PER_CALL = 100;
@@ -352,6 +353,23 @@ async function readStoredLead(listId: string, leadId: string, action: string): P
 }
 
 /**
+ * ENG-2840 (W2-7): `status_note`, an optional note kept on the pipeline status change this update makes (Emma's `update_lead_status` takes
+ * `notes` for the same). Only with `updates.status`; the route stores it in the `status.changed` event only when the status really changes
+ * and answers `statusNoteRecorded`. It never touches the lead's own `notes` field.
+ */
+export function statusNoteArg(value: unknown, status: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof status !== 'string') throw new Error('manage_leads update: status_note goes with a status change: give updates.status too.');
+  if (typeof value !== 'string') throw new Error('manage_leads update: status_note must be text.');
+  const note = value.trim();
+  // Checked on the text as sent: trim() would remove some of these characters from the ends and hide them.
+  if (note === '' || note.length > STATUS_NOTE_MAX_CHARS || /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069\ufeff]/.test(value)) {
+    throw new Error(`manage_leads update: status_note must be 1 to ${STATUS_NOTE_MAX_CHARS} characters, with no control or invisible characters.`);
+  }
+  return note;
+}
+
+/**
  * `update`: Emma's semantics through the REST route. The lead is always read first, through the same route (so its access rules apply and a
  * missing lead is a 404: the REST update would otherwise create a one-field row for an id that does not exist).
  */
@@ -363,6 +381,7 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
   }
   const { standard, custom, refused } = classifyLeadFields(args.updates);
   if (refused.length > 0) throw refusalError('update', refused);
+  const statusNote = statusNoteArg(args.status_note, standard.status);
   if (Object.keys(standard).length === 0 && Object.keys(custom).length === 0) {
     throw new Error('manage_leads update: nothing to update: give at least one field (an empty customFields object changes nothing).');
   }
@@ -400,6 +419,7 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
     const { suppressionContactStatusUpdates } = await import('../../emma/impl/leads');
     Object.assign(body, suppressionContactStatusUpdates(standard.status, stored ?? existing, actingUserOf(c)));
   }
+  if (statusNote !== undefined) body.statusNote = statusNote;
   const data = await mcpFetch({ method: 'PUT', path: leadPath(listId, args.lead_id), context: c, body });
   // Changing a lead's address to one the owner already marked do-not-contact must not make it sendable (the same inheritance as an add). Only when the address
   // really changes, and never on a lead that is already opted out: the inheritance rewrites the contact status, its reason, note and actor, which would

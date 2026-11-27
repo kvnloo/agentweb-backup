@@ -145,7 +145,10 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     mockHandle.mockRejectedValue(new Error('graph.facebook.com secret internals'));
     const res = await rpc({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'meta_get_insights' } }, 'Bearer x').expect(200);
-    expect(res.body.error).toEqual({ code: -32603, message: 'Meta Toolkit call failed.' });
+    expect(res.body.error.code).toBe(-32603);
+    // Not the bare generic message (it gave the caller nothing to act on), and still no internals.
+    expect(res.body.error.message).toMatch(/^Meta Toolkit call failed: internal error \(Error\)/);
+    expect(res.body.error.message).not.toMatch(/secret|graph\.facebook/);
   });
 
   it('missing tool name is -32602; unknown method is -32601; malformed body is -32600', async () => {

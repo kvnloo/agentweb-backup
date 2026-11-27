@@ -17,3 +17,20 @@ export function classifyMetaBudgetChange(prior: unknown, proposed: unknown) {
     proposed: after,
   };
 }
+
+const BUDGET_FIELDS = ['daily_budget', 'lifetime_budget'] as const;
+const unset = (value: unknown) => value === undefined || value === null || value === '';
+
+/**
+ * The prior value a budget change is compared against. A campaign / ad set Meta read back
+ * successfully (it has an id) with NEITHER a daily nor a lifetime budget has no budget at all, so
+ * adding one is a change from 0 — not an unverifiable one. Treating it as unknown blocked every
+ * "add a budget to a campaign that had none" with META_BUDGET_UNVERIFIED. A failed read (no id)
+ * stays unknown, and so does a field missing next to a budget that IS set (e.g. switching a
+ * lifetime-budget object to a daily one), since that is not a 0 → new change.
+ */
+export function priorBudgetForComparison(prior: Record<string, unknown> | null | undefined, field: string): unknown {
+  if (!prior || unset(prior.id)) return undefined;
+  if (!(BUDGET_FIELDS as readonly string[]).includes(field) || !unset(prior[field])) return prior[field];
+  return BUDGET_FIELDS.every((f) => unset(prior[f])) ? 0 : undefined;
+}

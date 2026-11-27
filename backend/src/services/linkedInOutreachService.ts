@@ -1,5 +1,6 @@
 import { UnipileClient } from 'unipile-node-sdk';
 import { getUnipileCredentials } from '../utils/secretsManager';
+import { recordSuccessfulSend } from './sentMessageShadow';
 import { userDb } from './db';
 
 // NOTE: Unipile actively maintains: Emails, WhatsApp, LinkedIn, Telegram, Instagram (as of March 2026).
@@ -1672,6 +1673,32 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * ENG-2984: outbound (is_sender=1) non-event messages in a known chat, using the same
+   * page size/cap as getMessagesWithContact. Read-only; used by the send-message shadow
+   * duplicate check, which already has the chat_id from the send response.
+   */
+  async getOutboundMessagesInChat(chatId: string): Promise<Array<{ id?: string; provider_id?: string; text: string | null; timestamp?: string }>> {
+    if (!chatId) return [];
+    const client = await this.getClient();
+    const MAX_PAGES = 10;
+    const out: any[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const params: any = { chat_id: chatId, limit: 100 };
+      if (cursor) params.cursor = cursor;
+      const result = await client.messaging.getAllMessagesFromChat(params);
+      for (const msg of result?.items ?? []) {
+        if ((msg as any).is_event === 1 || (msg as any).is_sender !== 1) continue;
+        out.push(msg);
+      }
+      cursor = (result as any)?.cursor ?? undefined;
+      pages++;
+    } while (cursor && pages < MAX_PAGES);
+    return out;
+  }
+
+  /**
    * Send a LinkedIn InMail to a profile (works for 2nd/3rd-degree connections).
    * Requires a LinkedIn Premium account with InMail credits.
    * @param accountId      - The Unipile account ID to send from.
@@ -1700,6 +1727,7 @@ export class LinkedInOutreachService {
           },
         },
       });
+      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id ?? undefined, adapter: 'linkedin:inmail' });
       this.log(`InMail sent successfully`, { accountId, providerId });
       return res;
     } catch (error: any) {
@@ -1726,6 +1754,7 @@ export class LinkedInOutreachService {
         attendees_ids: [providerId],
         text: messageText
       });
+      recordSuccessfulSend({ channel: 'linkedin', accountId, recipients: [providerId], providerId: res?.message_id ?? undefined, adapter: 'linkedin:message' });
       this.log(`Message sent successfully`, { accountId, providerId });
       return res;
     } catch (error: any) {

@@ -241,6 +241,9 @@ export interface ChatSession {
     token?: string;
     sharedAt?: string;
     expiresAt?: string;
+    // ENG-3170: the owner's choice on this link: may a visitor run sensitive actions (see utils/interactiveShare). Absent on links made
+    // before the setting existed; every link minted since carries an explicit boolean.
+    allowSensitiveActions?: boolean;
   };
   workPlan?: {
     title: string;
@@ -3366,7 +3369,7 @@ export class ChatbotDB {
 
   async updateSessionInteractiveShareMetadata(
     sessionId: string,
-    interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string; expiresAt?: string }
+    interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string; expiresAt?: string; allowSensitiveActions?: boolean }
   ): Promise<ChatSession> {
     const params = {
       TableName: this.tableName,
@@ -3386,6 +3389,46 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session interactive share metadata:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-3170: set ONLY the owner's sensitive-actions choice on the link that is already there. Attribute level, not the whole map:
+   * `updateSessionInteractiveShareMetadata` writes back whatever copy its caller read, so a caller holding a copy read a moment ago
+   * (an email or alert that is only reusing the link) could write the previous choice back over the owner's change. The condition
+   * keeps this from creating a half-made link on a session that has none.
+   */
+  async setInteractiveShareAllowSensitiveActions(sessionId: string, allowSensitiveActions: boolean): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: "SET interactiveShareMetadata.allowSensitiveActions = :allow",
+        ConditionExpression: "attribute_exists(interactiveShareMetadata.#token)",
+        ExpressionAttributeNames: { "#token": "token" },
+        ExpressionAttributeValues: { ":allow": allowSensitiveActions },
+      }).promise();
+    } catch (error) {
+      console.error("Error setting the sensitive-actions choice on the interactive share:", error);
+      throw error;
+    }
+  }
+
+  /** ENG-3170: remove ONLY the expiry from the existing link (attribute level, for the same reason as above). */
+  async removeInteractiveShareExpiry(sessionId: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: "REMOVE interactiveShareMetadata.expiresAt",
+        // ...and not off a link the owner turned on FULL CONTROL a moment ago (the caller decided from a copy that may be stale)
+        ConditionExpression: "attribute_exists(interactiveShareMetadata.#token) AND (attribute_not_exists(interactiveShareMetadata.allowSensitiveActions) OR interactiveShareMetadata.allowSensitiveActions <> :on)",
+        ExpressionAttributeNames: { "#token": "token" },
+        ExpressionAttributeValues: { ":on": true },
+      }).promise();
+    } catch (error) {
+      console.error("Error removing the expiry from the interactive share:", error);
       throw error;
     }
   }
@@ -4533,7 +4576,11 @@ export class ChatbotDB {
    * 7d link was minted first, a later external send clears its `expiresAt` so the
    * mailed/posted link can never expire.
    */
-  async createOrReuseInteractiveShare(sessionId: string, expirationDays?: number | null): Promise<string> {
+  async createOrReuseInteractiveShare(
+    sessionId: string,
+    expirationDays?: number | null,
+    options?: { allowSensitiveActions?: boolean },
+  ): Promise<string> {
     try {
       // First, get the current session to check if it already has an interactive share
       const session = await this.getChatSession(sessionId);
@@ -4548,23 +4595,57 @@ export class ChatbotDB {
       // wires a falsy value through.
       const hasTimedExpiry = expirationDays != null && expirationDays > 0;
 
+      // ENG-3170: a link whose owner turned on FULL CONTROL keeps the expiry the owner chose (see below), so once that date has passed it is dead
+      // and must not be handed out again by an alert, an email or a Slack post. It is treated as absent: the code below makes a new link
+      // (off, unless the caller says otherwise). Any other expired-but-active link is, as before, made permanent by a no-expiry caller.
+      // (An expiry that cannot be read counts as expired, as it does for the liveness check the visitor routes use.)
+      const isExpiredFullControl = (share: { allowSensitiveActions?: unknown; expiresAt?: unknown } | undefined) =>
+        share?.allowSensitiveActions === true && !!share.expiresAt && !(Date.parse(String(share.expiresAt)) > Date.now());
+      let expiredFullControl = isExpiredFullControl(session.interactiveShareMetadata);
+      if (expiredFullControl) {
+        // The copy read above is eventually consistent, and the owner may have made a new link a moment ago (new token, new expiry). Before the link
+        // is replaced, ask again with a consistent read: if the owner's new link is there, that is the link, and it is reused as it stands.
+        try {
+          const fresh = await this.getChatSessionRecord(sessionId, true);
+          if (fresh?.interactiveShareMetadata) {
+            session.interactiveShareMetadata = fresh.interactiveShareMetadata;
+            expiredFullControl = isExpiredFullControl(fresh.interactiveShareMetadata);
+          }
+        } catch (refreshError) {
+          console.error(`Error re-reading the interactive share for session ${sessionId} before replacing an expired link:`, refreshError);
+        }
+      }
+
       // Check if there's already an active interactive share
-      if (session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) {
+      if (session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && !expiredFullControl) {
         // If this caller wants no timed expiry but the stored token carries one —
         // e.g. an admin review link (45d) or a legacy 7d link — strip it. Links
         // shared out via email/slack/oncall must never expire regardless of who
         // minted the token first.
-        if (!hasTimedExpiry && session.interactiveShareMetadata.expiresAt) {
+        // ENG-3170: not off a link whose owner explicitly turned on FULL CONTROL. The owner chose that expiry for that power (the dialog shows it),
+        // and an alert or email that merely reuses the link must not turn "full control for 7 days" into "full control for ever". Such a
+        // mailed link stops working at the owner's chosen date, as any link the owner made with an expiry does.
+        if (!hasTimedExpiry && session.interactiveShareMetadata.expiresAt && session.interactiveShareMetadata.allowSensitiveActions !== true) {
           // Best-effort: a failed strip must not lose the working ishare link
           // (the outer catch would otherwise downgrade it to a login-required
           // /agent-mode URL). Worst case the link keeps its existing expiry and
           // a later send strips it.
           try {
-            const { expiresAt, ...withoutExpiry } = session.interactiveShareMetadata;
-            await this.updateSessionInteractiveShareMetadata(sessionId, withoutExpiry);
+            // ENG-3170: attribute level, so nothing else on the link (the owner's sensitive-actions choice above all) is written back
+            // from this copy, which may be a moment old.
+            await this.removeInteractiveShareExpiry(sessionId);
           } catch (stripError) {
             console.error(`Error stripping expiry from reused interactive share for session ${sessionId}:`, stripError);
           }
+        }
+        // ENG-3170: an EXPLICIT choice (only the owner's share dialog passes one) is applied to the link that is already there, because
+        // there is one token per session and "reuse untouched" would otherwise drop the owner's choice. Callers that pass no choice
+        // (emails, Slack posts, alerts) never touch the setting, so sending a report can not switch an owner's "on" back to "off".
+        // A failed write is not caught here: it goes to the catch below (the login-URL fallback, no share link), and the route that made
+        // the choice re-reads the stored value before it answers.
+        // The write is unconditional: `session` is an eventually consistent copy, and "it already says that" could be a stale reading.
+        if (typeof options?.allowSensitiveActions === 'boolean') {
+          await this.setInteractiveShareAllowSensitiveActions(sessionId, options.allowSensitiveActions);
         }
         const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
         return `${customerFrontendUrl}/ishare/${sessionId}?conversable=${session.interactiveShareMetadata.token}`;
@@ -4575,10 +4656,13 @@ export class ChatbotDB {
       const conversableToken = crypto.randomBytes(32).toString('hex');
 
       // Only write expiresAt when the caller explicitly requested a timed expiry.
-      const interactiveShareMetadata: { isActive: boolean; token: string; sharedAt: string; expiresAt?: string } = {
+      // ENG-3170: every new link stores an explicit choice. Off unless the caller (the owner's share dialog) says so, so a link that is
+      // mailed, posted to Slack or raised in an alert never carries sensitive actions.
+      const interactiveShareMetadata: { isActive: boolean; token: string; sharedAt: string; expiresAt?: string; allowSensitiveActions: boolean } = {
         isActive: true,
         token: conversableToken,
         sharedAt: new Date().toISOString(),
+        allowSensitiveActions: options?.allowSensitiveActions === true,
       };
       if (hasTimedExpiry) {
         interactiveShareMetadata.expiresAt = new Date(Date.now() + (expirationDays as number) * 86400000).toISOString();

@@ -19,6 +19,22 @@ import './readEmailTool';
 // Smartlead for outside agents (aw_ keys with smartlead:read / smartlead:control only).
 import './smartleadTools';
 import './conversionSummaryTool';
+import './memoryTools';
+import './gtmTools';
+import './gtmEmailTool';
+import './leadReadTools';
+import './accountReadTools';
+import './fileReadTool';
+import './leadEngagementTool';
+import './contentTools';
+import './siteScanAndLookupTools';
+import './meetingEventReadTools';
+import './hubspotReadTool';
+import './linkedInAdsReadTools';
+import './googleCalendarReadTools';
+import './assetAndOutreachAccountTools';
+import './leadDraftTool';
+import './kbFileReadTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -36,7 +52,7 @@ import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
 import { executeBrandRead, executeBrandUpdate } from './manageBrandWrites';
 import { executeStrategyRead, executeStrategyUpdate } from './manageStrategyWrites';
-import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from './knowledgeBaseParams';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET, withoutSignedStorageLinks } from './knowledgeBaseParams';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -459,7 +475,7 @@ mcpToolRegistry.register({
       path: '/api/tasks',
       context: await resolveClientScopedContext(context, args?.client_id, 'list_tasks')
     });
-    return jsonResult(data);
+    return jsonResult(withoutSignedStorageLinks(data));
   }
 });
 
@@ -487,20 +503,20 @@ mcpToolRegistry.register({
     switch (args.action) {
       case 'create': {
         const data = await mcpFetch({ method: 'POST', path: '/api/tasks', context: c, body: { name: args.name, prompt: args.prompt, category: args.category, description: args.description } });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'get': {
         const data = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'update': {
         const { action, task_id, ...updates } = args;
         const data = await mcpFetch({ method: 'PUT', path: `/api/tasks/${encodeURIComponent(task_id)}`, context: c, body: updates });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       case 'delete': {
         const data = await mcpFetch({ method: 'DELETE', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
-        return jsonResult(data);
+        return jsonResult(withoutSignedStorageLinks(data));
       }
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
@@ -1679,6 +1695,7 @@ mcpToolRegistry.register({
         search: { type: 'string', description: 'Only leads matching this text (list action)' },
         status: { type: 'string', description: 'Only leads with this pipeline status (list action)' },
         engaged_only: { type: 'boolean', description: 'Only leads that have engaged (list action)' },
+        status_note: { type: 'string', description: 'Optional, update action with updates.status only: a note (1 to 500 characters) kept on the pipeline status change event, like a reason for the change. Recorded only when the status really changes (the answer has statusNoteRecorded); it is not the lead\'s own notes field. A note containing clicked, replied or received marks the lead as engaged.' },
         client_id: {
           type: 'string',
           description: "Admin-only. Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Supported for 'list', 'get', and 'add'. For 'add', the real write additionally requires the MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED flag; dry_run:true always works regardless of the flag. Still rejected for 'update'/'delete' (broader authorization review pending).",
@@ -1704,6 +1721,10 @@ mcpToolRegistry.register({
     // Only update/delete remain blanket-rejected — add graduated out under
     // ENG-1557 v1. Still reject ANY present client_id (not just non-empty
     // strings — CodeRabbit, PR #2651) rather than silently falling through.
+    // status_note belongs to update only: anywhere else it would be dropped silently and an agent would think the note was kept.
+    if (args.status_note !== undefined && args.status_note !== null && args.action !== 'update') {
+      throw new Error(`manage_leads ${args.action}: status_note goes only with action "update" and a status change. Nothing was changed.`);
+    }
     const isRejectedWrite = (args.action === 'update' || args.action === 'delete') && hasClientId;
     if (isRejectedWrite) {
       throw new Error(
@@ -1801,148 +1822,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
-  name: 'manage_gtm_plan',
-  definition: {
-    name: 'manage_gtm_plan',
-    description: 'Create, read, update, or delete a GTM plan. Use action: "create", "get", "update", or "delete".',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['create', 'get', 'update', 'delete'], description: 'CRUD action' },
-        plan_id: { type: 'string', description: 'Plan ID (required for get/update/delete)' },
-        title: { type: 'string', description: 'Plan title (create/update)' },
-        description: { type: 'string', description: 'Plan description (create/update)' },
-        goals: { type: 'array', items: { type: 'string' }, description: 'Plan goals (create/update)' },
-        target_audience: { type: 'string', description: 'Target audience (create/update)' },
-        timeline: { type: 'string', description: 'Timeline (create/update)' },
-        budget: { type: 'string', description: 'Budget (create/update)' },
-        status: { type: 'string', description: 'Plan status (update)' }
-      },
-      required: ['action']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const c = ctx(context);
-    switch (args.action) {
-      case 'create': {
-        const { action, plan_id, ...body } = args;
-        const data = await mcpFetch({ method: 'POST', path: '/api/gtm-plan', context: c, body });
-        return jsonResult(data);
-      }
-      case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
-        return jsonResult(data);
-      }
-      case 'update': {
-        const { action, plan_id, ...body } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}`, context: c, body });
-        return jsonResult(data);
-      }
-      case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
-        return jsonResult(data);
-      }
-      default:
-        return jsonResult({ error: `Unknown action: ${args.action}` });
-    }
-  }
-});
-
-mcpToolRegistry.register({
-  name: 'manage_gtm_items',
-  definition: {
-    name: 'manage_gtm_items',
-    description: 'Manage GTM plan phases and work items. Use action: "add_phase", "update_phase", "delete_phase", "add_work_items", "update_work_item", "delete_work_item", "get_common_items", "add_common_items", or "send_status_report".',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', description: 'Action to perform' },
-        plan_id: { type: 'string', description: 'Plan ID' },
-        phase_id: { type: 'string', description: 'Phase ID' },
-        work_item_id: { type: 'string', description: 'Work item ID' },
-        name: { type: 'string', description: 'Phase/item name' },
-        description: { type: 'string', description: 'Description' },
-        status: { type: 'string', description: 'Status' },
-        work_items: { type: 'array', description: 'Array of work item objects' },
-        items: { type: 'array', description: 'Common items to add' },
-        target_phase_id: { type: 'string', description: 'Target phase for common items' },
-        new_phase_name: { type: 'string', description: 'New phase name for common items' },
-        include_summary: { type: 'boolean', description: 'Include summary in status report' },
-        include_details: { type: 'boolean', description: 'Include details in status report' }
-      },
-      required: ['action', 'plan_id']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const c = ctx(context);
-    const { plan_id, phase_id, work_item_id } = args;
-    switch (args.action) {
-      case 'add_phase': {
-        const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases`, context: c,
-          body: { name: args.name, description: args.description, status: args.status }
-        });
-        return jsonResult(data);
-      }
-      case 'update_phase': {
-        const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c,
-          body: { name: args.name, description: args.description, status: args.status }
-        });
-        return jsonResult(data);
-      }
-      case 'delete_phase': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c });
-        return jsonResult(data);
-      }
-      case 'add_work_items': {
-        const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items`, context: c,
-          body: { workItems: args.work_items }
-        });
-        return jsonResult(data);
-      }
-      case 'update_work_item': {
-        const { action: _a, plan_id: _p, phase_id: _ph, work_item_id: _w, ...updates } = args;
-        const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c,
-          body: updates
-        });
-        return jsonResult(data);
-      }
-      case 'delete_work_item': {
-        const data = await mcpFetch({
-          method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c
-        });
-        return jsonResult(data);
-      }
-      case 'get_common_items': {
-        const data = await mcpFetch({ method: 'GET', path: '/api/gtm-plan/common-items', context: c });
-        return jsonResult(data);
-      }
-      case 'add_common_items': {
-        const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/add-common-items`, context: c,
-          body: { items: args.items, targetPhaseId: args.target_phase_id, newPhaseName: args.new_phase_name }
-        });
-        return jsonResult(data);
-      }
-      case 'send_status_report': {
-        const path = phase_id
-          ? `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/send-status-report`
-          : `/api/gtm-plan/${encodeURIComponent(plan_id)}/send-status-report`;
-        const data = await mcpFetch({
-          method: 'POST', path, context: c,
-          body: { includeSummary: args.include_summary, includeDetails: args.include_details }
-        });
-        return jsonResult(data);
-      }
-      default:
-        return jsonResult({ error: `Unknown action: ${args.action}` });
-    }
-  }
-});
+// manage_gtm_plan and manage_gtm_items live in ./gtmTools (ENG-2840 W2-4).
 
 // ─── Knowledge Base ─────────────────────────────────────────────────────────
 
@@ -1968,7 +1848,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context), queryParams: buildKbListQuery(args) });
-    return jsonResult(data);
+    // No year-2500 signed file links (knowledgeBaseParams.ts): read a file with read_knowledge_base_files.
+    return jsonResult(withoutSignedStorageLinks(data));
   }
 });
 
@@ -1990,38 +1871,6 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/search-knowledge-base', context: ctx(context),
       body: { query: args.query, max_results: args.max_results || 5 }
-    });
-    return jsonResult(data);
-  }
-});
-
-mcpToolRegistry.register({
-  name: 'read_knowledge_base_files',
-  definition: {
-    name: 'read_knowledge_base_files',
-    description: 'Read specific files from the knowledge base.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        files: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              kb_identifier: { type: 'string', description: 'Knowledge base task ID' },
-              file_name: { type: 'string', description: 'File name to read' }
-            },
-            required: ['kb_identifier', 'file_name']
-          }
-        }
-      },
-      required: ['files']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/read-knowledge-base-files', context: ctx(context),
-      body: { files: args.files }
     });
     return jsonResult(data);
   }

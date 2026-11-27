@@ -1,5 +1,6 @@
 import { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
 export { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
+import { campaignBidStrategyDefault } from '../utils/metaCampaignBidStrategyDefault';
 import {
   normaliseUserDataField,
   NormalisableUserDataField,
@@ -1491,7 +1492,8 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
+      // bid_strategy: under CBO the ad set inherits the campaign's (createMetaAdsAdSet).
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap', 'bid_strategy'];
       this.log(`Fetching campaign: ${campaignId}`);
       /*
        * `adAccountId` was accepted and never used: a node id is global, so this returned any
@@ -1599,7 +1601,6 @@ export class MetaService {
         objective: params.objective,
         status: params.status || 'PAUSED',
         special_ad_categories: specialCategories,
-        is_adset_budget_sharing_enabled: false, // Required by some accounts when CBO is off
       };
 
       // Agent calls supply normalized daily_budget. Direct SDK-wrapper callers may
@@ -1609,6 +1610,12 @@ export class MetaService {
       } else if ((params as any).advantage_campaign_budget && (params as any).budget_amount !== undefined) {
         const currency = await this.getAdAccountCurrency(adAccountId, accessToken);
         finalParams.daily_budget = normalizeMetaMoney((params as any).budget_amount, currency).minorUnits;
+      }
+
+      // Meta requires is_adset_budget_sharing_enabled (true/false) on a campaign WITHOUT a campaign
+      // budget; it describes ad-set budgets, so it is only sent when the campaign has none.
+      if (finalParams.daily_budget === undefined) {
+        finalParams.is_adset_budget_sharing_enabled = false;
       }
 
       // ENG-2364: under CBO the bid strategy lives on the campaign. Without one, Meta rejects
@@ -1646,7 +1653,18 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
+      const setsBudget = params?.daily_budget !== undefined || params?.lifetime_budget !== undefined;
+      const current = await MetaService.verifyWriteOwnership(
+        campaign, campaignId, 'Campaign', adAccountId, setsBudget ? ['daily_budget', 'lifetime_budget', 'bid_strategy'] : [],
+      );
+      // ENG-2364, mirrored from createCampaign: a new campaign budget with no bid strategy breaks
+      // every ad set create/copy (subcode 1815857). The default is added only when neither the
+      // caller nor the campaign has a strategy (a deliberate COST_CAP is kept); the Toolkit
+      // preview uses the same function so it shows what is sent.
+      const defaultStrategy = campaignBidStrategyDefault(params, current);
+      if (defaultStrategy) {
+        params = { ...params, bid_strategy: defaultStrategy };
+      }
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
       return { success: true };
@@ -2446,10 +2464,11 @@ export class MetaService {
     nodeId: string,
     nodeLabel: string,
     adAccountId: string,
-  ): Promise<void> {
+    extraFields: string[] = [],
+  ): Promise<Record<string, any>> {
     let ownerData: Record<string, any>;
     try {
-      const owner = await node.get(MetaService.withOwnershipField([]));
+      const owner = await node.get(MetaService.withOwnershipField(extraFields));
       ownerData = { ...((owner as any)?._data ?? {}) };
     } catch (error) {
       console.error(`[MetaService] ownership check failed for ${nodeLabel} ${nodeId}:`, error);
@@ -2458,6 +2477,7 @@ export class MetaService {
       );
     }
     MetaService.assertOwnedByAccount(ownerData.account_id, nodeId, nodeLabel, adAccountId);
+    return ownerData;
   }
 
   /**

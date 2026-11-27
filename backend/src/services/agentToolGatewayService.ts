@@ -765,6 +765,12 @@ const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   client_name_or_email: ['client_id', 'client_email', 'client'],
 };
 
+/** call_hubspot_api actions that only read. */
+const HUBSPOT_READ_ACTIONS: ReadonlySet<string> = new Set([
+  'GET', 'LIST', 'SEARCH', 'GET_CONTACTS', 'GET_FORM_FIELDS', 'GET_METRICS', 'GET_PERFORMANCE', 'GET_STATS', 'GET_SUBMISSIONS',
+  'LIST_ASSETS', 'LIST_BROADCASTS', 'LIST_CHANNELS', 'LIST_PIPELINES', 'LIST_SUBSCRIPTION_TYPES',
+]);
+
 export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolPolicyDecision {
   const toolName = input.toolName || 'unknown';
   const effect = classifyToolEffect(toolName, input.args);
@@ -1489,11 +1495,16 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
   if (toolName === 'call_hubspot_api') {
     const action = stringField(args, 'action').toUpperCase();
     if (action === 'CREATE_BROADCAST') return 'external_publish';
+    // ENABLE turns a workflow live (it enrolls contacts and runs its actions, emails included).
+    if (action === 'ENABLE') return 'external_publish';
+    // SUBMIT posts a form submission into the customer's HubSpot, which can trigger its notifications and workflows.
+    if (action === 'SUBMIT') return 'external_send';
     if (
       action === 'DELETE' ||
       action === 'DELETE_BROADCAST' ||
       action === 'REMOVE_CONTACTS' ||
-      action === 'PUBLISH'
+      action === 'PUBLISH' ||
+      action === 'UNPUBLISH'
     )
       return 'destructive';
     if (
@@ -1501,10 +1512,15 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
       action === 'UPDATE' ||
       action === 'CLONE' ||
       action === 'ADD_CONTACTS' ||
-      action === 'ARCHIVE'
+      action === 'ARCHIVE' ||
+      action === 'DISABLE' ||
+      action === 'ADD_ASSET' ||
+      action === 'REMOVE_ASSET'
     )
       return 'internal_write';
-    return 'read';
+    // Only the known reads are reads; an action this list does not know is treated as a write (fail closed), not as safe to repeat.
+    if (HUBSPOT_READ_ACTIONS.has(action)) return 'read';
+    return 'internal_write';
   }
 
   if (toolName === 'call_attio_api') {

@@ -10,9 +10,13 @@ jest.mock('../services/enrichSoService', () => ({
 }));
 
 const mockGetLeadById = jest.fn();
+const mockGetLeadListById = jest.fn();
 jest.mock('../services/db', () => ({
-  crmDb: { getLeadById: mockGetLeadById },
+  crmDb: { getLeadById: mockGetLeadById, getLeadListById: mockGetLeadListById },
 }));
+// ENG-2840: a lead is read only from a list the caller may read.
+const mockCanAccessCrmList = jest.fn();
+jest.mock('../services/crmAccessControl', () => ({ canAccessCrmList: (...a: any[]) => mockCanAccessCrmList(...a) }));
 
 // Stub registry so the tool registers a callable execute fn we can introspect.
 const registered: any[] = [];
@@ -109,7 +113,23 @@ describe('find_or_lookup_email tool', () => {
     expect(r.results[0].found).toBe(false);
   });
 
+  it('leadId path: a list the caller may not read (or that does not exist) is never read: the lead is treated as missing', async () => {
+    mockGetLeadListById.mockResolvedValueOnce({ listId: 'list-x', userId: 'someone-else' });
+    mockCanAccessCrmList.mockResolvedValueOnce(false);
+    mockGetLeadById.mockResolvedValue({ leadId: 'L9', email: 'victim@other.com', firstName: 'V', company: 'Other' });
+    const r = await getTool().execute({ leadId: 'L9', listId: 'list-x' }, ctx);
+    expect(mockCanAccessCrmList).toHaveBeenCalledWith('u1', expect.objectContaining({ listId: 'list-x' }));
+    expect(mockGetLeadById).not.toHaveBeenCalled();
+    expect(mockSvc.reverseLookup).not.toHaveBeenCalled();
+    expect(JSON.stringify(r)).not.toContain('victim@other.com');
+    mockGetLeadListById.mockResolvedValueOnce(null);
+    await getTool().execute({ leadId: 'L9', listId: 'no-such-list' }, ctx);
+    expect(mockGetLeadById).not.toHaveBeenCalled();
+  });
+
   it('leadId path: resolves email from the lead and reverse-looks up', async () => {
+    mockGetLeadListById.mockResolvedValueOnce({ listId: 'list-1', userId: 'u1' });
+    mockCanAccessCrmList.mockResolvedValueOnce(true);
     mockGetLeadById.mockResolvedValue({
       leadId: 'L1', email: 'alice@acme.com', firstName: 'Alice', company: 'Acme',
     });
@@ -123,6 +143,8 @@ describe('find_or_lookup_email tool', () => {
   });
 
   it('leadId path: falls through to email finder when lead has name+company but no email', async () => {
+    mockGetLeadListById.mockResolvedValueOnce({ listId: 'list-1', userId: 'u1' });
+    mockCanAccessCrmList.mockResolvedValueOnce(true);
     mockGetLeadById.mockResolvedValue({
       leadId: 'L1', email: '', firstName: 'Alice', lastName: 'Smith', company: 'Acme',
     });

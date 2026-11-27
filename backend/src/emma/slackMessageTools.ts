@@ -12,6 +12,7 @@ import { userDb } from '../services/db';
 
 const NO_SLACK_CHANNEL_ERROR = 'No Slack channel is configured for your account. Ask your admin to set one up.';
 const NO_CHANNEL_SPECIFIED_ERROR = 'You have multiple Slack channels configured. Specify which channel to use via channel_id or channel_name.';
+const NO_USER_ERROR = 'Slack is not available for this call: no user account is attached to it.';
 
 // Returns the channel ID to use for a tool call.
 // Regular users are scoped to their configured slackChannels; admins can target any channel.
@@ -19,7 +20,9 @@ async function resolveChannelForUser(
   args: { channel_id?: string; channel_name?: string },
   context: { userId?: string }
 ): Promise<{ id: string } | { error: string }> {
-  if (context.userId) {
+  // No user, no channel: the bot is in every client's channel, so a call nobody is attached to reads nothing.
+  if (!context.userId) return { error: NO_USER_ERROR };
+  {
     const user = await userDb.getUserById(context.userId);
     if (!user?.isAdmin) {
       const allowed = await getEffectiveAllowedChannels(user);
@@ -34,16 +37,17 @@ async function resolveChannelForUser(
       if (!args.channel_id && !args.channel_name) {
         return { error: NO_CHANNEL_SPECIFIED_ERROR };
       }
+      // One answer for "no such channel" and "not yours": a channel name is resolved against every channel the bot is in, so a
+      // different answer would tell the caller which other clients' channels exist.
+      const notAllowed = { error: `Channel is not in your configured Slack channels. Allowed channels: ${allowed.join(', ')}.` };
       const resolved = await resolveChannelId(args.channel_id, args.channel_name);
-      if ('error' in resolved) return resolved;
-      if (!allowed.includes(resolved.id)) {
-        return { error: `Channel is not in your configured Slack channels. Allowed channels: ${allowed.join(', ')}.` };
-      }
+      if ('error' in resolved) return notAllowed;
+      if (!allowed.includes(resolved.id)) return notAllowed;
       return resolved;
     }
   }
 
-  // Admin (or no userId context): resolve from args as before
+  // Admin: resolve from args as before
   return resolveChannelId(args.channel_id, args.channel_name);
 }
 
@@ -79,7 +83,8 @@ emmaToolRegistry.register({
     },
   },
   execute: async (args: any, context: any = {}) => {
-    if (context.userId) {
+    if (!context.userId) return { success: false, error: NO_USER_ERROR };
+    {
       const user = await userDb.getUserById(context.userId);
       if (!user?.isAdmin) {
         const allowed = await getEffectiveAllowedChannels(user);
@@ -248,12 +253,13 @@ emmaToolRegistry.register({
       required: ['thread_ts'],
     },
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context: any = {}) => {
     if (!args.thread_ts) {
       return { success: false, error: 'thread_ts is required.' };
     }
 
-    const resolved = await resolveChannelId(args.channel_id, args.channel_name);
+    // Scoped exactly like slack_get_recent_messages: before, any session could read any thread in any channel the bot is in.
+    const resolved = await resolveChannelForUser(args, context);
     if ('error' in resolved) return { success: false, error: resolved.error };
 
     const allReplies = await getThreadReplies(resolved.id, args.thread_ts);

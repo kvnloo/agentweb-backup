@@ -25,6 +25,17 @@ export const CAPTURE_ROUTE_PATH = 'app/api/capture/route.ts';
 /** Same rate-limit shape as the meta-* classes: at most once per site per window. */
 export const CAPTURE_DRIFT_REALERT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * ENG-3179: repos whose capture route was deliberately hand-customized beyond what
+ * buildCaptureRoute can emit. Regenerating would drop the customization, so a drifted
+ * route on these repos is acknowledged, not alerted. Only `drifted` is acknowledged: a
+ * missing route and any middleware.ts drift still alert. Keys are case-insensitive.
+ */
+export const CUSTOMIZED_CAPTURE_ROUTES: Readonly<Record<string, string>> = {
+  'AgentWebPro/lp-create-a-high-converting-mobil-f80e1869':
+    'Smart Trade Team site: separate /become-a-pro recruitment list, NO_PIXEL_PATHS, SOURCE_BY_PATH tags (ENG-3179)',
+};
+
 export interface CaptureDriftSite {
   repoFullName: string;
   name: string;
@@ -40,6 +51,8 @@ export interface CaptureDriftDeps {
   transport?: AlertTransport;
   dryRun?: boolean;
   now?: number;
+  /** Defaults to CUSTOMIZED_CAPTURE_ROUTES. */
+  customizedCaptureRoutes?: Readonly<Record<string, string>>;
 }
 
 export interface CaptureDriftSummary {
@@ -73,6 +86,9 @@ export async function runCaptureDriftSweep(deps: CaptureDriftDeps): Promise<Capt
   const now = deps.now ?? Date.now();
   const dryRun = deps.dryRun === true;
   const transport = deps.transport ?? defaultTransport;
+  const customized = new Set(
+    Object.keys(deps.customizedCaptureRoutes ?? CUSTOMIZED_CAPTURE_ROUTES).map((k) => k.toLowerCase()),
+  );
   const summary: CaptureDriftSummary = {
     sitesChecked: 0, drifted: 0, clean: 0, unreadable: 0, alertsSent: 0, findings: [],
   };
@@ -98,6 +114,12 @@ export async function runCaptureDriftSweep(deps: CaptureDriftDeps): Promise<Capt
         deps.readFile(site.repoFullName, CAPTURE_ROUTE_PATH),
       ]);
       report = detectCaptureDrift({ middleware, captureRoute });
+      if (customized.has(site.repoFullName.toLowerCase())) {
+        const files = report.files.map((f) =>
+          f.path === CAPTURE_ROUTE_PATH && f.status === 'drifted' ? { path: f.path, status: 'match' as const } : f,
+        );
+        report = { ...report, files, drifted: files.some((f) => f.status !== 'match') };
+      }
     } catch (error: any) {
       summary.unreadable++;
       console.warn(`${TAG} ${site.repoFullName}: unreadable, skipped — ${error?.message}`);
