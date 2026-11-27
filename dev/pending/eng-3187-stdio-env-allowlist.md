@@ -1,3 +1,0 @@
-## ENG-3187: stdio MCP children get an allowlisted env, not process.env (2026-11-25)
-
-`createStdioTransport` spread `process.env` into every stdio MCP child since 2026-01-22, so a customer-driven server (Playwright `browser_run_code`) could read JWT_SECRET, AWS keys, Stripe/Slack tokens. Children now get `buildStdioChildEnv` (`backend/src/mcp/client/stdioChildEnv.ts`): PATH/HOME/locale/temp/proxy/CA plus the server's own config `env`. If a stdio server needs a secret, declare it in that server's `env` (`${VAR}` placeholders resolve), never rely on inheritance. Note: this does not stop vm-escape code reading `/proc/<backend pid>/environ` as the same OS user; process isolation is a separate step.
