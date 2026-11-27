@@ -1,5 +1,5 @@
 /**
- * Meta stores BOOK_NOW on video creatives as BOOK_TRAVEL (Haven account 1842363582956923, ads
+ * Meta has been observed storing BOOK_NOW on video creatives as BOOK_TRAVEL (Haven account 1842363582956923, ads
  * 120250484797880173 / 120250485131870173). Reads must surface the requested type without dropping
  * the stored one, and CREATE must say so up front. What is sent to Meta is unchanged.
  */
@@ -75,6 +75,10 @@ describe('metaCtaAliases', () => {
     expect(withAnnotatedCreativeCta({ id: 'ad' })).toEqual({ id: 'ad' });
   });
 
+  it('the note reports an observed alias, not a rule Meta always applies', () => {
+    expect(VIDEO_BOOK_NOW_CTA_NOTE).toMatch(/has been observed storing BOOK_NOW as BOOK_TRAVEL on video ads/);
+  });
+
   it('notes only a video BOOK_NOW request', () => {
     expect(ctaNoteForRequested('video_data', 'BOOK_NOW')).toBe(VIDEO_BOOK_NOW_CTA_NOTE);
     expect(ctaNoteForRequested('video_data', 'SHOP_NOW')).toBeUndefined();
@@ -123,5 +127,24 @@ describe('AD_CREATIVE / AD reads and CREATE surface the BOOK_NOW alias', () => {
     const image: any = await service.createMetaAdsAdCreative('u1', { ...base, image_hash: 'h' } as any);
     expect(image.success).toBe(true);
     expect(image.cta_note).toBeUndefined();
+  });
+
+  it('AD GET annotates the inline creative, keeping the stored type', async () => {
+    jest.mocked(metaService.getAd).mockResolvedValue({ id: '120250484797880173', creative: videoCreative('BOOK_TRAVEL') } as never);
+    const got: any = await service.manageMetaAdsAds('u1', 'GET', '1842363582956923', undefined, '120250484797880173');
+    expect(got.success).toBe(true);
+    expect(got.ad.creative).toMatchObject({ call_to_action_type: 'BOOK_NOW', cta_note: VIDEO_BOOK_NOW_CTA_NOTE });
+    expect(got.ad.creative.object_story_spec.video_data.call_to_action.type).toBe('BOOK_TRAVEL');
+  });
+
+  it('CREATE keeps the cta note when the read-back finds unapplied fields', async () => {
+    jest.mocked(metaService.createAdCreative).mockResolvedValue({ id: 'c2' });
+    // The read-back finds the requested link description missing from video_data.
+    jest.mocked(metaService.getAdCreative).mockResolvedValue(videoCreative('BOOK_TRAVEL'));
+    const result: any = await service.createMetaAdsAdCreative('u1', {
+      name: 'C', page_id: 'p', body: 'b', title: 't', link_url: 'https://x.test', call_to_action_type: 'BOOK_NOW',
+      video_id: 'v', image_hash: 'h', description: 'Book your stay',
+    } as any);
+    expect(result).toMatchObject({ success: true, verified: false, unapplied_fields: ['description'], cta_note: VIDEO_BOOK_NOW_CTA_NOTE });
   });
 });

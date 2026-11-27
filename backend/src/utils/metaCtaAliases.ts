@@ -15,7 +15,8 @@ const STORED_TO_REQUESTED: Record<CtaSlot, Record<string, string>> = {
   link_data: {},
 };
 
-export const VIDEO_BOOK_NOW_CTA_NOTE = 'Meta stores BOOK_NOW on video creatives as BOOK_TRAVEL';
+export const VIDEO_BOOK_NOW_CTA_NOTE =
+  'Meta has been observed storing BOOK_NOW as BOOK_TRAVEL on video ads, so a read-back may show BOOK_TRAVEL for a BOOK_NOW request';
 
 /** The CTA type the caller most likely requested, given the type Meta stored in this slot. */
 export function requestedCtaForStored(slot: CtaSlot, stored: string | undefined | null): string | undefined {
