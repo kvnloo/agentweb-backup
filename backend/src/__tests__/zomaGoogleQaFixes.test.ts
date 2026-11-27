@@ -39,7 +39,8 @@ describe('1. Search campaigns are Google Search only unless the caller opts in',
   it('sends search partners and Display Network off, says so in the preview, and verifies them', async () => {
     const objects: Record<string, any> = { [`budget:${BUDGET}`]: budget };
     const d = deps(objects, () => {
-      objects[`campaign:${CAMPAIGN}`] = { resourceName: CAMPAIGN, status: 'PAUSED', channelType: 'SEARCH', searchPartners: false, displayNetwork: false };
+      objects[`campaign:${CAMPAIGN}`] = { resourceName: CAMPAIGN, status: 'PAUSED', channelType: 'SEARCH', googleSearch: true, searchPartners: false, displayNetwork: false };
+      objects[`campaign_locations:${CAMPAIGN}`] = [1007753];
     });
     const p: any = await executeGoogleToolkitWrite('u', create, 'INR', d);
     expect(p.preview).toContain('Networks: Google Search (off: search partners, Display Network).');
@@ -95,9 +96,9 @@ describe('2. Google policy rejections name the policy', () => {
     expect(googleAdsPolicyReasons({
       details: { policyFindingDetails: { policyTopicEntries: [{ topic: 'EXCESSIVE_CAPITALIZATION', type: 'PROHIBITED' }, { topic: 'PUNCTUATION', type: 'PROHIBITED' }] } },
       trigger: { stringValue: 'BUY NOW!!!' },
-    })).toBe('EXCESSIVE_CAPITALIZATION (PROHIBITED), PUNCTUATION (PROHIBITED), triggered by "BUY NOW!!!"');
-    expect(googleAdsPolicyReasons({ details: { policyViolationDetails: { externalPolicyName: 'Trademarks', key: { violatingText: 'Acme' } } } }))
-      .toBe('Trademarks on "Acme"');
+    })).toBe('EXCESSIVE_CAPITALIZATION (PROHIBITED), PUNCTUATION (PROHIBITED)');
+    expect(googleAdsPolicyReasons({ details: { policyViolationDetails: { externalPolicyName: 'Trademarks', key: { policyName: 'trademark', violatingText: 'Acme' } } } }))
+      .toBe('trademark');
     expect(googleAdsPolicyReasons({ message: 'no policy' })).toBeUndefined();
   });
 });
@@ -179,8 +180,123 @@ describe('8. Enabling a child of a paused campaign is worded consistently', () =
       [`campaign:${CAMPAIGN}`]: { resourceName: CAMPAIGN, name: 'Spring', status: 'PAUSED', budget: BUDGET },
       [`budget:${BUDGET}`]: budget,
     }));
-    expect(p.preview).toContain('so this alone does not start delivery');
-    expect(p.preview).toContain('it starts delivery and spending once its campaign is also enabled');
+    // Both parents are paused: both are named, and enabling the campaign alone is not promised to be enough.
+    expect(p.preview).toContain('Its ad group "customers/1234567890/adGroups/33" is PAUSED and its campaign "Spring" is PAUSED, so this alone does not start delivery.');
+    expect(p.preview).toContain('only once those are enabled too');
     expect(p.preview).not.toContain('as soon as Google applies it');
+  });
+  it('names a paused ad group even when the campaign is enabled', async () => {
+    const ad = { resourceName: AD, status: 'PAUSED', type: 'RESPONSIVE_SEARCH_AD', adGroup: AD_GROUP };
+    const p: any = await executeGoogleToolkitWrite('u', { customer_id: CID, entity_type: 'AD', action: 'UPDATE', ad_resource_name: AD, status: 'ENABLED' }, 'INR', deps({
+      [`ad:${AD}`]: ad,
+      [`ad_group:${AD_GROUP}`]: { resourceName: AD_GROUP, name: 'AG', status: 'PAUSED', campaign: CAMPAIGN },
+      [`campaign:${CAMPAIGN}`]: { resourceName: CAMPAIGN, name: 'Spring', status: 'ENABLED', budget: BUDGET },
+      [`budget:${BUDGET}`]: budget,
+    }));
+    expect(p.preview).toContain('Its ad group "AG" is PAUSED, so this alone does not start delivery.');
+    expect(p.preview).toContain('only once that is enabled too');
+  });
+});
+
+describe('Review findings: bid targets match what is sent and are refused before the preview', () => {
+  const b = { [`budget:${BUDGET}`]: budget };
+  it.each([
+    [{ bidding_strategy: 'TARGET_ROAS', bidding_strategy_target: 0 }, /greater than 0/],
+    [{ bidding_strategy: 'TARGET_ROAS' }, /requires bidding_strategy_target/],
+    [{ bidding_strategy: 'TARGET_IMPRESSION_SHARE', bidding_strategy_target: 65 }, /fraction in \(0, 1\]/],
+    [{ bidding_strategy: 'TARGET_CPA', bidding_strategy_target: 'abc' }, /greater than 0/],
+    [{ bidding_strategy: 'MAXIMIZE_CONVERSIONS', cpc_bid_ceiling: 10 }, /cpc_bid_ceiling is not a campaign-level field/],
+    [{ bidding_strategy: 'MANUAL_CPC', bidding_strategy_target: 5, cpc_bid_ceiling: undefined }, /not a field of MANUAL_CPC/],
+  ])('%o is refused before any I/O', async (extra, error) => {
+    const d = deps(b);
+    await expect(executeGoogleToolkitWrite('u', { ...create, cpc_bid_ceiling: undefined, ...extra }, 'INR', d)).rejects.toThrow(error as RegExp);
+    expect(d.assertReady).not.toHaveBeenCalled();
+  });
+  it('a CPA in a zero-decimal currency is rounded the same in the preview and the dispatch', async () => {
+    const objects: Record<string, any> = { [`budget:${BUDGET}`]: budget };
+    const d = deps(objects, () => { objects[`campaign:${CAMPAIGN}`] = { resourceName: CAMPAIGN, status: 'PAUSED', googleSearch: true }; });
+    await expect(executeGoogleToolkitWrite('u', { ...create, cpc_bid_ceiling: undefined, bidding_strategy: 'TARGET_CPA', bidding_strategy_target: 150.5 }, 'JPY', d))
+      .rejects.toThrow(/bidding_strategy_target/); // JPY has no minor unit: 150.5 is refused, not silently re-rounded
+    const args = { ...create, cpc_bid_ceiling: undefined, bidding_strategy: 'TARGET_CPA', bidding_strategy_target: 150 };
+    const p: any = await executeGoogleToolkitWrite('u', args, 'JPY', d);
+    expect(p.preview).toContain('Bidding: TARGET_CPA (target CPA 150 JPY).');
+    await executeGoogleToolkitWrite('u', { ...args, confirm: true, preview_token: p.preview_token }, 'JPY', d);
+    expect((d.dispatch as jest.Mock).mock.calls[0][1].bidding_strategy_target).toBe(150);
+  });
+});
+
+describe('Review findings: network edits and location proof', () => {
+  const campaign = { resourceName: CAMPAIGN, name: 'Old', status: 'PAUSED', channelType: 'SEARCH', googleSearch: true, searchPartners: false, displayNetwork: false };
+  const update = { customer_id: CID, entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_resource_name: CAMPAIGN };
+  it('refuses non-boolean flags on CREATE and UPDATE', async () => {
+    const d = deps({ [`budget:${BUDGET}`]: budget, [`campaign:${CAMPAIGN}`]: campaign });
+    await expect(executeGoogleToolkitWrite('u', { ...create, target_content_network: 'true' }, 'INR', d)).rejects.toThrow(/true or false/);
+    await expect(executeGoogleToolkitWrite('u', { ...update, target_search_network: 'true' }, 'INR', d)).rejects.toThrow(/true or false/);
+  });
+  it('refuses a network edit that changes nothing', async () => {
+    await expect(executeGoogleToolkitWrite('u', { ...update, target_content_network: false }, 'INR', deps({ [`campaign:${CAMPAIGN}`]: campaign })))
+      .rejects.toThrow(/nothing to change/);
+  });
+  it('turning partners on shows Google Search and is a MISMATCH if the read-back disagrees', async () => {
+    const objects: Record<string, any> = { [`campaign:${CAMPAIGN}`]: campaign };
+    const d = deps(objects, () => { objects[`campaign:${CAMPAIGN}`] = { ...campaign, searchPartners: false }; });
+    const on = { ...update, target_search_network: true };
+    const p: any = await executeGoogleToolkitWrite('u', on, 'INR', d);
+    expect(p.preview).toContain('Google Search: on → on (search partners require it).');
+    const r: any = await executeGoogleToolkitWrite('u', { ...on, confirm: true, preview_token: p.preview_token }, 'INR', d);
+    expect(r).toMatchObject({ success: false, verification: 'MISMATCH' });
+  });
+  it('a campaign whose locations did not attach is not CONFIRMED', async () => {
+    const objects: Record<string, any> = { [`budget:${BUDGET}`]: budget };
+    const d = deps(objects, () => {
+      objects[`campaign:${CAMPAIGN}`] = { resourceName: CAMPAIGN, status: 'PAUSED', channelType: 'SEARCH', googleSearch: true };
+      objects[`campaign_locations:${CAMPAIGN}`] = [];
+    });
+    const p: any = await executeGoogleToolkitWrite('u', create, 'INR', d);
+    const r: any = await executeGoogleToolkitWrite('u', { ...create, confirm: true, preview_token: p.preview_token }, 'INR', d);
+    expect(r).toMatchObject({ success: false, verification: 'MISMATCH' });
+    expect(r.message).toContain('missing 1007753');
+    expect(r.message).toContain('every country');
+  });
+  it('maps location criteria to numeric ids', () => {
+    const { mapGoogleReadRows } = jest.requireActual('../mcp/googleToolkitWrites');
+    expect(mapGoogleReadRows('campaign_locations', [{ campaignCriterion: { location: { geoTargetConstant: 'geoTargetConstants/1007753' } } }])).toEqual([1007753]);
+  });
+});
+
+describe('Review findings: goal list is part of the approved state; policy detail', () => {
+  it('a goal list that changes between preview and confirm invalidates the token', async () => {
+    const goal = `customers/${CID}/campaignConversionGoals/22~SUBMIT_LEAD_FORM~WEBSITE`;
+    const prior = { resourceName: goal, campaign: CAMPAIGN, name: 'Spring', category: 'SUBMIT_LEAD_FORM', origin: 'WEBSITE', biddable: true };
+    const other = { ...prior, resourceName: `customers/${CID}/campaignConversionGoals/22~PURCHASE~WEBSITE`, category: 'PURCHASE' };
+    const objects: Record<string, any> = { [`campaign_conversion_goal:${goal}`]: prior, [`campaign_conversion_goals:${CAMPAIGN}`]: [prior, other] };
+    const d = deps(objects);
+    const args = { customer_id: CID, entity_type: 'CAMPAIGN_CONVERSION_GOAL', action: 'UPDATE', resource_name: goal, biddable: false };
+    const p: any = await executeGoogleToolkitWrite('u', args, 'INR', d);
+    objects[`campaign_conversion_goals:${CAMPAIGN}`] = [prior, { ...other, biddable: false }];
+    const r: any = await executeGoogleToolkitWrite('u', { ...args, confirm: true, preview_token: p.preview_token }, 'INR', d);
+    expect(r.status).toBe('PREVIEW_MISMATCH');
+    expect(d.dispatch).not.toHaveBeenCalled();
+  });
+  it('policy reasons name the failing field but never quote ad copy (it would be misread by error classifiers)', () => {
+    const reasons = googleAdsPolicyReasons({
+      details: { policyFindingDetails: { policyTopicEntries: [{ topic: 'PUNCTUATION', type: 'PROHIBITED', evidences: [{ textList: { texts: ['Save 500 today, sign in!!!'] } }] }] } },
+      trigger: { stringValue: 'Sign in for free' },
+      location: { fieldPathElements: [{ fieldName: 'operations', index: 0 }, { fieldName: 'headlines', index: 2 }] },
+    });
+    expect(reasons).toBe('PUNCTUATION (PROHIBITED), at operations[0].headlines[2]');
+    const { classifyToolErrorClass } = jest.requireActual('../utils/toolErrorClassifier');
+    const { zomaErrorNextStep } = jest.requireActual('../mcp/zomaNextStep');
+    const message = `POLICY_FINDING: The resource has been disapproved. Policy: ${reasons}.`;
+    expect(classifyToolErrorClass(new Error(message))).not.toBe('upstream_5xx');
+    expect(zomaErrorNextStep(message)).not.toMatch(/^Call zoma_status/);
+  });
+  it('a failed goal-list read keeps the preview (the warning is advisory)', async () => {
+    const goal = `customers/${CID}/campaignConversionGoals/22~SUBMIT_LEAD_FORM~WEBSITE`;
+    const prior = { resourceName: goal, campaign: CAMPAIGN, name: 'Spring', category: 'SUBMIT_LEAD_FORM', origin: 'WEBSITE', biddable: true };
+    const d = deps({ [`campaign_conversion_goal:${goal}`]: prior });
+    (d.read as jest.Mock).mockImplementation(async (_u: string, _c: string, kind: string) => { if (kind === 'campaign_conversion_goals') throw new Error('boom'); return prior; });
+    const p: any = await executeGoogleToolkitWrite('u', { customer_id: CID, entity_type: 'CAMPAIGN_CONVERSION_GOAL', action: 'UPDATE', resource_name: goal, biddable: false }, 'INR', d);
+    expect(p.status).toBe('PREVIEW');
   });
 });
