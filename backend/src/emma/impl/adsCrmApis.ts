@@ -510,6 +510,27 @@ async function runGoogleAdsTrackingGate(
   };
 }
 
+/**
+ * The policy topics (and violating text) Google attaches to a POLICY_FINDING /
+ * POLICY_VIOLATION error. Without them the caller sees only "PROHIBITED" and cannot tell
+ * which headline or rule to fix.
+ */
+export function googleAdsPolicyReasons(e: any): string | undefined {
+  const reasons: string[] = [];
+  const entries: any[] = e?.details?.policyFindingDetails?.policyTopicEntries ?? [];
+  for (const entry of entries) {
+    if (entry?.topic) reasons.push(entry.type ? `${entry.topic} (${entry.type})` : String(entry.topic));
+  }
+  const v = e?.details?.policyViolationDetails;
+  if (v?.externalPolicyName) {
+    const text = v.key?.violatingText ? ` on "${v.key.violatingText}"` : '';
+    reasons.push(`${v.externalPolicyName}${text}`);
+  }
+  const trigger = e?.trigger?.stringValue;
+  if (reasons.length && trigger) reasons.push(`triggered by "${trigger}"`);
+  return reasons.length ? [...new Set(reasons)].join(', ') : undefined;
+}
+
 export async function handleCallGoogleAdsApi(userId: string, args: {
   customer_id: string;
   entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION' | 'CAMPAIGN_CONVERSION_GOAL' | 'CUSTOMER_CONVERSION_GOAL';
@@ -689,6 +710,9 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           status: args.status || 'PAUSED',
           brandBusinessName: args.brand_business_name,
           brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
+          targetGoogleSearch: args.target_google_search,
+          targetSearchNetwork: args.target_search_network,
+          targetContentNetwork: args.target_content_network,
         });
         return { success: true, campaignResourceName: campaign.resourceName };
       }
@@ -1368,7 +1392,9 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
     const gadsError = gadsErrors.length
       ? gadsErrors.map((e: any) => {
           const code = Object.values(e.errorCode || {})[0];
-          return code ? `${code}: ${e.message}` : e.message;
+          const text = code ? `${code}: ${e.message}` : e.message;
+          const reasons = googleAdsPolicyReasons(e);
+          return reasons ? `${text} Policy: ${reasons}.` : text;
         }).join('; ')
       : undefined;
     if (args.entity_type === 'CAMPAIGN_CRITERION') {

@@ -1317,6 +1317,10 @@ export class GoogleAdsService {
     status?: 'ENABLED' | 'PAUSED';
     brandBusinessName?: string;
     brandLogoAssetResourceName?: string;
+    /** Network settings sent on create. Omitted keys keep Google's create-time default. */
+    targetGoogleSearch?: boolean;
+    targetSearchNetwork?: boolean;
+    targetContentNetwork?: boolean;
   }): Promise<{ resourceName: string }> {
 
     // DISPLAY campaigns cannot use MAXIMIZE_CONVERSIONS with a shared budget
@@ -1371,12 +1375,18 @@ export class GoogleAdsService {
     // error that actually described their mistake.
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
+    const networkSettings: Record<string, boolean> = {};
+    if (params.targetGoogleSearch !== undefined) networkSettings.targetGoogleSearch = params.targetGoogleSearch;
+    if (params.targetSearchNetwork !== undefined) networkSettings.targetSearchNetwork = params.targetSearchNetwork;
+    if (params.targetContentNetwork !== undefined) networkSettings.targetContentNetwork = params.targetContentNetwork;
+
     const campaignCreate = {
       name: params.name,
       advertisingChannelType: params.type,
       campaignBudget: params.budgetResourceName,
       status: params.status || 'PAUSED',
       containsEuPoliticalAdvertising: 'DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING',
+      ...(Object.keys(networkSettings).length ? { networkSettings } : {}),
       ...biddingField,
     };
 
