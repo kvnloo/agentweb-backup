@@ -2687,6 +2687,44 @@ async function readGoogleDriveSharedFile(kbIdentifier: string, fileName: string,
 const MATERIALIZE_ASSET_MAX_BYTES = 200 * 1024 * 1024;
 
 /**
+ * ENG-2840: the body of a download, read up to `maxBytes`. Returns null (and stops the download) as soon as more than `maxBytes` arrive.
+ * A body that is already a buffer (some transports, and tests) is measured as is.
+ */
+async function readWithByteCap(body: unknown, maxBytes: number): Promise<Buffer | null> {
+  if (Buffer.isBuffer(body)) return body.length > maxBytes ? null : body;
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    const buffer = Buffer.from(body as any);
+    return buffer.length > maxBytes ? null : buffer;
+  }
+  const stream = body as NodeJS.ReadableStream & { destroy?: (error?: Error) => void };
+  if (!stream || typeof (stream as any).on !== 'function') return Buffer.alloc(0);
+  return new Promise<Buffer | null>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let done = false;
+    stream.on('data', (chunk: Buffer | string) => {
+      if (done) return;
+      const piece = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += piece.length;
+      if (total > maxBytes) {
+        done = true;
+        chunks.length = 0;
+        stream.destroy?.();
+        resolve(null);
+        return;
+      }
+      chunks.push(piece);
+    });
+    stream.on('end', () => {
+      if (!done) { done = true; resolve(Buffer.concat(chunks)); }
+    });
+    stream.on('error', (error: Error) => {
+      if (!done) { done = true; reject(error); }
+    });
+  });
+}
+
+/**
  * Turn an image/video file from a connected Google Drive knowledge base
  * folder into a real, hosted S3 asset with a usable URL.
  *
@@ -2847,19 +2885,18 @@ export async function materializeKnowledgeBaseAsset(
       };
     }
 
+    // ENG-2840: streamed with the byte cap applied while downloading. Drive's reported `size` can be missing or stale (e.g. 0 during a
+    // virus scan); before, the whole file was buffered first and only then measured, so a large file with bad metadata was held in memory
+    // in full.
     const mediaResponse = await drive.files.get(
       { fileId: file.id!, alt: 'media', supportsAllDrives: true },
-      { responseType: 'arraybuffer' }
+      { responseType: 'stream' }
     );
-    const buffer = Buffer.from(mediaResponse.data as any);
-
-    // Drive's reported `size` can be missing/stale (e.g. 0 during virus-scan) —
-    // re-check the actual downloaded bytes so an oversized file can't slip
-    // through on bad metadata and get uploaded/reported with a wrong size.
-    if (buffer.length > MATERIALIZE_ASSET_MAX_BYTES) {
+    const buffer = await readWithByteCap(mediaResponse.data, MATERIALIZE_ASSET_MAX_BYTES);
+    if (!buffer) {
       return {
         success: false,
-        message: `"${fileName}" is ${Math.round(buffer.length / (1024 * 1024))}MB, over the ${MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        message: `"${fileName}" is over the ${MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
       };
     }
 
