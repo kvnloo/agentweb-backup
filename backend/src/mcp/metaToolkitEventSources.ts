@@ -69,7 +69,7 @@ export const META_EVENT_SOURCE_TOOL_DEFINITIONS = [
   },
   {
     name: 'meta_event_source_get_health',
-    description: 'Read-only. Health of one pixel of this ad account: whether it is available, when it last fired, and which business catalogs it is connected to.',
+    description: 'Read-only. Health of one pixel of this ad account: whether it is available, when it last fired, and which business catalogs it is connected to. If the business cannot be read, healthy and connected_catalogs are null and connected_catalogs_reason says why.',
     inputSchema: { type: 'object', properties: { ...ACCOUNT_PROP, ...PIXEL_PROP }, required: ['pixel_id'], additionalProperties: false },
   },
   {
@@ -157,6 +157,10 @@ export async function runMetaEventSourceTool(
   name: MetaEventSourceToolName, userId: string, accountId: string, rawArgs: any, deps: MetaEventSourceDeps = defaultDeps,
 ) {
   const { confirm, preview_token: previewToken, ...args } = rawArgs ?? {};
+  const rawRead = async (path: string, params: Record<string, string>) => {
+    if (!READ_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported event source read.');
+    return deps.readGraph(userId, accountId, path, params);
+  };
   const read = async (path: string, params: Record<string, string>) => {
     if (!READ_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported event source read.');
     try {
@@ -243,13 +247,15 @@ export async function runMetaEventSourceTool(
       const { state, events_last_24h: eventsLast24h } = await pixelState(pixel, deps.now());
       let catalogsUnavailable: string | null = null;
       try {
-        const business = await readBusinessCatalogs(read, accountId);
+        // rawRead: the reason carries Meta's own message, not read()'s "Nothing was changed." refusal wrapper.
+        const business = await readBusinessCatalogs(rawRead, accountId);
         if (business.businessId) catalogs = business.catalogs;
         else catalogsUnavailable = 'not in a Meta Business portfolio';
       } catch (error: any) {
-        catalogsUnavailable = /business_management/i.test(String(error?.message))
+        const message = metaMessage(error);
+        catalogsUnavailable = /business_management/i.test(message)
           ? 'missing business_management permission'
-          : `could not read the ad account's business (${String(error?.message ?? 'Meta request failed')})`;
+          : `could not read the business or its catalogs (${message})`;
       }
       const connectedCatalogs = catalogsUnavailable ? null : await catalogsOf(id);
       return {

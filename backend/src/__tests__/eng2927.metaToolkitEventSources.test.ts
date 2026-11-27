@@ -115,6 +115,24 @@ describe('ENG-2927 event sources', () => {
     await expect(runMetaEventSourceTool('meta_event_source_get_catalogs', 'u', '111', { pixel_id: '41' }, g.deps)).rejects.toThrow(/business_management/);
   });
 
+  it('get_health: non-permission business read failure → reason carries Meta\'s message without the refusal wrapper', async () => {
+    const g = graph();
+    const readGraph = g.deps.readGraph as jest.Mock;
+    const base = readGraph.getMockImplementation()!;
+    readGraph.mockImplementation(async (u: string, a: string, path: string, params: any) => {
+      if (path === 'act_111' && /business/.test(params?.fields)) {
+        throw Object.assign(new Error('(#2) Service temporarily unavailable'), { metaError: { code: 2, message: '(#2) Service temporarily unavailable' } });
+      }
+      return base(u, a, path, params);
+    });
+    const health: any = await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '41' }, g.deps);
+    expect(health).toMatchObject({
+      connected_catalogs: null, healthy: null,
+      connected_catalogs_reason: 'could not read the business or its catalogs ((#2) Service temporarily unavailable)',
+    });
+    expect(health.connected_catalogs_reason).not.toMatch(/Could not read from Meta|Nothing was changed/);
+  });
+
   it('get_health: account not in a Business portfolio → catalogs null with reason, events_last_24h kept', async () => {
     const g = graph({
       act_111: {},
