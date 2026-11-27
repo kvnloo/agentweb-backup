@@ -519,9 +519,10 @@ describe('a memory whose text looks like JSON is read back exactly as it was sav
     expect(listed.json.memories[0].content).toBe(jsonText);
   });
 
-  it('the sanitizer still removes internal ids from the tools it covers (the exemption is only for the memory tools and the own-file read)', async () => {
+  it('the sanitizer still removes internal ids from the tools it covers (the exemption is only for the memory tools and the own-file and knowledge-base file reads)', async () => {
     const { shouldSanitizePublicResponse, OWN_CONTENT_TOOL_NAMES } = await import('../mcp/server/publicResponseSanitizer');
-    expect([...OWN_CONTENT_TOOL_NAMES].sort()).toEqual(['delete_memory', 'delete_org_memory', 'list_memories', 'read_file_content', 'save_memory', 'save_org_memory']);
+    // ENG-2840 (W2-10): read_knowledge_base_files answers fixed fields only (emmaKbFileReadRoutes.ts), so it joins read_file_content.
+    expect([...OWN_CONTENT_TOOL_NAMES].sort()).toEqual(['delete_memory', 'delete_org_memory', 'list_memories', 'read_file_content', 'read_knowledge_base_files', 'save_memory', 'save_org_memory']);
     expect(shouldSanitizePublicResponse('manage_leads', {}, { externalMcp: true })).toBe(true);
     expect(shouldSanitizePublicResponse('list_memories', {}, { externalMcp: true })).toBe(false);
   });
