@@ -20,20 +20,52 @@ export function toZomaVoice(text: string): string {
 }
 
 const SETUP_NEXT = 'Call zoma_status: it returns the exact fix (with a link if one is needed), then retry this call.';
+/** Meta rejected the request itself: zoma_status reports "all set" here, so pointing at it is a dead end. */
+const META_FIX_NEXT =
+  "Meta rejected a value in this request; the setup is not the problem. Read Meta's error_user_title / error_user_msg and the code / subcode in the error above, " +
+  'correct the field they name (ads_get_errors explains a code), then preview the corrected call again. Do not retry it unchanged.';
+const OTHER_NEXT = 'Fix what the error above names, then retry once. Only if it names a connection, permission or payment problem, call zoma_status for the fix.';
+
+/** Meta's auth / permission codes: a setup problem even when Meta words it as a request error. */
+const META_AUTH_CODE = /\bcode (190|102|10|2\d\d)\b/i;
+/** Meta (or our own pre-validation) refused the request's content. */
+const META_VALIDATION = /Invalid parameter|Meta refused|PARAM_VALIDATION_ERROR|subcode \d+|\(code \d+|\bcode 100\b|error_user_msg|fbtrace_id/i;
+/** Connection / auth / onboarding: the only failures zoma_status can actually fix. */
+const SETUP_FAILURE =
+  /no usable|not connected|\breconnect|re-connect|connect (meta|google|x|linkedin)|expired|revoked|access token|invalid token|oauth|permission|ads_management|granted scope|not ready|finish setup|sign in|log in|zoma_status/i;
 
 /** Next step after a refused / failed call, from its message. */
 export function zomaErrorNextStep(message: string): string {
+  if (/Multiple LinkedIn Ads accounts/i.test(message)) {
+    return 'Ask the user which LinkedIn ad account to use, then retry with account_id set to it.';
+  }
   if (/Multiple (Meta ad accounts|Google Ads accounts)/i.test(message)) {
     return googleToolkitEnabled()
       ? 'Ask the user which account to use, then retry with account_id (Meta) or customer_id (Google) set to it.'
       : 'Ask the user which account to use, then retry with account_id set to it.';
+  }
+  // LinkedIn Ads: these messages exist only while the LinkedIn flag is on, so nothing else can match them.
+  if (/rate limiting this app|Too many LinkedIn Ads calls/i.test(message)) {
+    return 'Wait the number of seconds in retry_after_seconds (about a minute), then try once more. Do not retry in a loop.';
+  }
+  if (/LinkedIn (write access is not enabled|has not enabled the Zoma app)/i.test(message)) {
+    return 'Tell the user LinkedIn has not enabled this ad account for the Zoma app yet, so this cannot be done here; offer reporting (linkedin_ads_read GET_ANALYTICS) instead and do not retry.';
+  }
+  if (/LinkedIn Ads changes are not available yet/i.test(message)) {
+    return 'Tell the user LinkedIn changes are not available yet (they need LinkedIn Standard-tier approval); offer reading and reporting with linkedin_ads_read.';
+  }
+  if (/LinkedIn Ads account needs to be reconnected|connection has expired or was revoked/i.test(message)) {
+    return 'Tell the user their LinkedIn Ads connection needs to be reconnected; call zoma_status to see the state of the connection.';
   }
   if (/preview_token|PREVIEW/i.test(message)) {
     return 'Call again without confirm to get a fresh PREVIEW, show it to the user, and confirm only after they approve it.';
   }
   if (/payment method/i.test(message)) return 'Call zoma_status for the link to add a payment method (nothing is charged), then retry.';
   if (/read-only/i.test(message)) return 'Use a read tool here (e.g. zoma_ads_report), or make this change from Claude, ChatGPT, Codex or Cursor.';
-  return SETUP_NEXT;
+  if (META_AUTH_CODE.test(message)) return SETUP_NEXT;
+  if (META_VALIDATION.test(message)) return META_FIX_NEXT;
+  if (SETUP_FAILURE.test(message)) return SETUP_NEXT;
+  return OTHER_NEXT;
 }
 
 const isObject = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -66,5 +98,12 @@ export function zomaNextStep(toolName: string, args: any, result: unknown): stri
   if (toolName === 'zoma_usage') return 'Ask about results with zoma_ads_report, e.g. spend and ROAS by campaign for the last 7 days.';
   if (toolName === 'zoma_prepare_upload') return 'Run the upload_command with the real file path, then pass file_url to the creative upload call.';
   if (args?.confirm === true) return 'Read the object back (GET) to confirm the change, then tell the user what changed.';
+  // zoma_ads_report is Meta-only: a Google answer points at the Google report instead.
+  if (toolName === 'call_google_ads_api' || toolName === 'call_google_ads_reporting_api') {
+    return 'Summarize this for the user, then offer the next useful question (e.g. "How did my Google campaigns do this month?" via call_google_ads_reporting_api mode=dashboard) or a change — every change is previewed before it runs.';
+  }
+  if (toolName === 'x_ads_read' || toolName === 'x_ads_write') {
+    return 'Summarize this for the user, then offer the next useful question or a change — every change is previewed before it runs.';
+  }
   return 'Summarize this for the user, then offer the next useful question (e.g. "Which campaign had the best ROAS this week?" via zoma_ads_report) or a change — every change is previewed before it runs.';
 }

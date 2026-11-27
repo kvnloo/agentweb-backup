@@ -72,6 +72,30 @@ describe('ENG-2927 event sources', () => {
     expect(g.writes).toEqual([]);
   });
 
+  it('a stale last_fired_time is not NOT_FIRING when the pixel\'s event stats show events in the last 24h (Zoma/Haven)', async () => {
+    const g = graph({
+      'act_111/adspixels': { data: [{ id: '42', name: 'Haven', last_fired_time: '2026-11-01T10:00:00-0800' }] },
+      '42/stats': { data: [{ start_time: '2026-11-11T00:00:00+0000', aggregation: 'event', data: [{ value: 'PageView', count: 251 }, { value: 'Lead', count: 3 }] }] },
+    });
+    const health: any = await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '42' }, g.deps);
+    expect(health).toMatchObject({ state: 'ACTIVE', events_last_24h: 254, state_source: 'event_stats' });
+    const statsCall = g.deps.readGraph as jest.Mock;
+    const [, , path, params] = statsCall.mock.calls.find((c: any[]) => c[2] === '42/stats');
+    expect(path).toBe('42/stats');
+    expect(params).toMatchObject({ aggregation: 'event', start_time: String(Math.floor((NOW - 24 * 3600 * 1000) / 1000)) });
+    // Recommendations use the same verdict: a connected pixel with fresh events is not flagged.
+    g.nodes['501/external_event_sources'] = { data: [{ id: '42', name: 'Haven' }] };
+    const rec: any = await runMetaEventSourceTool('meta_event_source_get_recommendations', 'u', '111', { catalog_id: '501' }, g.deps);
+    expect(rec.recommendations.map((r: any) => r.type)).not.toContain('PIXEL_NOT_FIRING');
+  });
+
+  it('a stale pixel with zero recent events, or unreadable stats, stays NOT_FIRING', async () => {
+    const zero = graph({ '42/stats': { data: [{ aggregation: 'event', data: [] }] } });
+    expect(await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '42' }, zero.deps)).toMatchObject({ state: 'NOT_FIRING', events_last_24h: 0 });
+    // graph() has no 42/stats node: the read throws and the last_fired_time verdict stands.
+    expect(await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '42' }, graph().deps)).toMatchObject({ state: 'NOT_FIRING', healthy: false });
+  });
+
   it('rejects a cross-account pixel and a foreign catalog without writing', async () => {
     const g = graph();
     await expect(runMetaEventSourceTool('meta_event_source_connect', 'u', '111', { catalog_id: '502', pixel_id: '99' }, g.deps)).rejects.toThrow(/not a pixel of this ad account/);

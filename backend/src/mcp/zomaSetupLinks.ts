@@ -19,10 +19,12 @@ export const ZOMA_META_CALLBACK_PATH = '/api/zoma/meta/callback';
 export const ZOMA_META_SELECT_PATH = '/api/zoma/meta/select';
 export const ZOMA_GOOGLE_CALLBACK_PATH = '/api/zoma/google/callback';
 export const ZOMA_GOOGLE_SELECT_PATH = '/api/zoma/google/select';
+export const ZOMA_LINKEDIN_CALLBACK_PATH = '/api/zoma/linkedin/callback';
+export const ZOMA_LINKEDIN_SELECT_PATH = '/api/zoma/linkedin/select';
 export const ZOMA_CONTINUE_PATH = '/api/zoma/continue';
 export const ZOMA_DONE_PATH = '/api/zoma/done';
 
-export type ZomaLinkPurpose = 'continue' | 'pick_meta_account' | 'pick_google_account';
+export type ZomaLinkPurpose = 'continue' | 'pick_meta_account' | 'pick_google_account' | 'pick_linkedin_account';
 
 /** `zoma` value of a Meta connect state / picker link minted for an MCP-connected user (no device). */
 export const ZOMA_MCP_SETUP = 'mcp';
@@ -38,6 +40,8 @@ export interface ZomaLinkClaims {
   accounts?: Array<{ account_id: string; name: string; currency: string; account_status: number }>;
   /** pick_google_account only (ZOMA_MCP_SETUP): the token session from finalize + the ad accounts offered. */
   googleAccounts?: Array<{ customer_id: string; name: string; currency: string }>;
+  /** pick_linkedin_account only (ZOMA_MCP_SETUP): the token session from finalize + the ad accounts offered. */
+  linkedinAccounts?: Array<{ account_id: string; name: string; currency: string; status: string }>;
 }
 
 export interface ZomaLinkCodec {

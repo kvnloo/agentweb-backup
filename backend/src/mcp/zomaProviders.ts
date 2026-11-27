@@ -14,7 +14,7 @@
 import type { ConnectedAccount } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 
-export type ZomaPlatform = 'meta' | 'google_ads' | 'x_ads';
+export type ZomaPlatform = 'meta' | 'google_ads' | 'x_ads' | 'linkedin_ads';
 
 export interface ZomaProvider {
   platform: ZomaPlatform;
@@ -102,13 +102,52 @@ export const X_ADS_PROVIDER: ZomaProvider = {
   accountIds: (a) => [normalizeXAdsId((a.config as any)?.ad_account_id)].filter(Boolean),
 };
 
+/** LinkedIn ad account ids are numeric; a stored or requested `urn:li:sponsoredAccount:` prefix is not part of the id. */
+const normalizeLinkedInAdsId = (id: unknown) => String(id ?? '').trim().replace(/^urn:li:sponsoredAccount:/i, '');
+
+/**
+ * A LinkedIn Ads connection (routes/linkedInAdsAuth.ts /connect, shared with Zoma's connect page)
+ * is an ad-account row with an access token. An expired access token is refreshed with the refresh
+ * token before every call (services/linkedInAdsCredentials.ts), so expiry alone does not make it
+ * unusable; no refresh token and an expired access token does.
+ */
+export function linkedInAdsConnectionIsUsable(account: ConnectedAccount, now: number): boolean {
+  const cfg: any = account.config;
+  if (!cfg?.access_token) return false;
+  if (cfg.refresh_token) return true;
+  return !(typeof cfg.token_expires_at === 'number' && cfg.token_expires_at < now);
+}
+
+/** What a LinkedIn connection must hold for Zoma's reads (accounts, campaigns, creatives, targeting, adAnalytics). */
+export const LINKEDIN_READ_SCOPES_NEEDED: readonly string[] = ['r_ads', 'r_ads_reporting'];
+/** What changing anything needs on top of that. */
+export const LINKEDIN_WRITE_SCOPE_NEEDED = 'rw_ads';
+
+/** True when the stored connection holds every scope in `needed`; a connection that never recorded its scopes is not judged. */
+export function linkedInConnectionHolds(account: ConnectedAccount, needed: readonly string[]): boolean {
+  const scopes = (account.config as any)?.scopes;
+  return !Array.isArray(scopes) || needed.every((scope) => scopes.includes(scope));
+}
+
+export const LINKEDIN_ADS_PROVIDER: ZomaProvider = {
+  platform: 'linkedin_ads',
+  label: 'LinkedIn Ads',
+  accountNoun: 'LinkedIn Ads account',
+  accountArg: 'account_id',
+  isAdAccount: (a) => a.platform === 'linkedin_ads' && (a.config as any)?.account_type === 'ad_account',
+  isUsable: linkedInAdsConnectionIsUsable,
+  normalizeId: normalizeLinkedInAdsId,
+  accountIds: (a) => [normalizeLinkedInAdsId(a.account_id)].filter(Boolean),
+};
+
 export const ZOMA_PROVIDERS: Record<ZomaPlatform, ZomaProvider> = {
   meta: META_PROVIDER,
   google_ads: GOOGLE_ADS_PROVIDER,
   x_ads: X_ADS_PROVIDER,
+  linkedin_ads: LINKEDIN_ADS_PROVIDER,
 };
 
-export { googleToolkitEnabled, xAdsToolkitEnabled } from './zomaToolDefinitions';
+export { googleToolkitEnabled, xAdsToolkitEnabled, linkedInAdsToolkitEnabled, linkedInAdsWritesEnabled } from './zomaToolDefinitions';
 
 export type AccountResolution =
   | { ok: true; accountId: string; account: ConnectedAccount }

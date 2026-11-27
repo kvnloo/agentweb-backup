@@ -25,7 +25,7 @@ import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } fr
 import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
-import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool, xAdsToolkitEnabled } from './zomaToolDefinitions';
+import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool, linkedInAdsToolkitEnabled, xAdsToolkitEnabled } from './zomaToolDefinitions';
 import { isExperimentRead } from './metaToolkitExperiments';
 import { explainMetaError, isDiagnosticsRead } from './metaToolkitDiagnostics';
 import { getMetaHelpArticles } from './metaToolkitHelp';
@@ -482,7 +482,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
 
   // ENG-3131: the paywall sits in front of writes that make ads live (preview included, so the
   // user never approves a launch that cannot run). Reads, drafts and paused creates never reach it.
-  const assertPublishAllowed = async (platform: 'meta' | 'google_ads' | 'x_ads') => {
+  const assertPublishAllowed = async (platform: 'meta' | 'google_ads' | 'x_ads' | 'linkedin_ads') => {
     try {
       await (deps.assertPublishAllowed ?? assertZomaPublishAllowed)(caller.userId, { platform, toolName: request.toolName });
     } catch (error) {
@@ -602,6 +602,35 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       });
       if (!xWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'x_ads', toolName: request.toolName });
       return stripCredentials(xResult);
+    }
+  }
+
+  // LinkedIn Ads provider (dark until ZOMA_LINKEDIN_ADS_ENABLED is "read" or "true"), loaded lazily like Google and X.
+  // In read mode the write tool reaches this branch only to be refused (before any lookup); it is not advertised.
+  if (linkedInAdsToolkitEnabled()) {
+    const li = await import('./linkedInAdsToolkitGateway');
+    if (li.isLinkedInAdsToolkitTool(request.toolName)) {
+      const liWrite = li.isLinkedInAdsToolkitWrite(request.toolName);
+      li.refuseLinkedInWriteWhenNotOffered(request.toolName); // read mode: refused before the scope check and the paywall
+      // Shape before anything coerces an argument: a non-string action is refused here, not stringified by the paywall below.
+      li.assertLinkedInAdsToolkitCall(request.toolName, request.args ?? {});
+      assertMetaToolkitScope(caller, request.toolName, liWrite);
+      if (liWrite && isZomaPublishWrite('linkedin_ads', request.args)) await assertPublishAllowed('linkedin_ads');
+      const recordWrite = deps.recordWrite ?? recordMcpWriteExecuted;
+      const liResult = await li.handleLinkedInAdsToolkitCall(caller, request, {
+        listAccounts: deps.listAccounts,
+        now: deps.now,
+        meter: (result) => meter('linkedin_ads', result),
+        recordWrite: async (input) => {
+          const recorded = await recordWrite({ ...input, product: TOOLKIT_PRODUCT });
+          journeyAfterCall(caller.userId, 'first_write', { platform: 'linkedin_ads', toolName: request.toolName });
+          return recorded;
+        },
+        accessError: (message) => new MetaToolkitAuthError(message, 403),
+        sleep: deps.sleep,
+      });
+      if (!liWrite && liResult?.success !== false) journeyAfterCall(caller.userId, 'first_read', { platform: 'linkedin_ads', toolName: request.toolName });
+      return stripCredentials(liResult);
     }
   }
 

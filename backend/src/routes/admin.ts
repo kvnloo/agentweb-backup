@@ -19,6 +19,7 @@ import { applyZomaWaitlistDecision } from "../services/zomaAdmission";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
+import { describeStatusReport } from "../services/gtmStatusReportOutcome";
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { branchOwnMessages } from "../services/agentMode/chatBranching";
@@ -4669,17 +4670,24 @@ router.post("/gtm-plans/:planId/phases/:phaseId/send-status-report", async (req,
       });
     }
 
-    // Send status report
-    await sendPhaseStatusReport(
+    // Send status report, and answer for what happened: "sent" is only said about a send that happened
+    const result = await sendPhaseStatusReport(
       plan as any,
       phaseId,
       { ...notifications, message },
       process.env.CUSTOMER_FRONTEND_URL
     );
+    const outcome = describeStatusReport(result, `phase status report for "${phase.title}"`);
+    if (!outcome.ok) {
+      return res.status(outcome.httpStatus).json({ success: false, error: outcome.message });
+    }
 
     return res.json({
       success: true,
-      message: "Phase status report sent successfully",
+      message: outcome.message,
+      sent: result.sent,
+      failed: result.failed,
+      suppressed: result.suppressed ?? 0,
     });
   } catch (error: any) {
     console.error("Error sending phase status report:", error);
@@ -4728,16 +4736,23 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
 
     const plan = getResult.Item;
 
-    // Send status report
-    await sendPlanStatusReport(
+    // Send status report, and answer for what happened: "sent" is only said about a send that happened
+    const result = await sendPlanStatusReport(
       plan as any,
       { ...notifications, message },
       process.env.CUSTOMER_FRONTEND_URL
     );
+    const outcome = describeStatusReport(result, `plan status report for "${plan.title}"`);
+    if (!outcome.ok) {
+      return res.status(outcome.httpStatus).json({ success: false, error: outcome.message });
+    }
 
     return res.json({
       success: true,
-      message: "Plan status report sent successfully",
+      message: outcome.message,
+      sent: result.sent,
+      failed: result.failed,
+      suppressed: result.suppressed ?? 0,
     });
   } catch (error: any) {
     console.error("Error sending plan status report:", error);

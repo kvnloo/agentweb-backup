@@ -510,6 +510,37 @@ async function runGoogleAdsTrackingGate(
   };
 }
 
+/**
+ * The policy topics Google attaches to a POLICY_FINDING / POLICY_VIOLATION error, and the
+ * field that failed. Without them the caller sees only "PROHIBITED" and cannot tell which
+ * headline or rule to fix.
+ *
+ * The advertiser's own text (evidences, violatingText, trigger) is deliberately NOT quoted:
+ * this string is read by error classifiers (toolErrorClassifier, zomaErrorNextStep), and ad
+ * copy such as "Save 500 today" or "Sign in for free" would be misread as a 5xx or a
+ * setup failure. The field path already names the headline to rewrite.
+ */
+export function googleAdsPolicyReasons(e: any): string | undefined {
+  const reasons: string[] = [];
+  const entries: any[] = e?.details?.policyFindingDetails?.policyTopicEntries ?? [];
+  for (const entry of entries) {
+    if (/^[A-Z0-9_]+$/.test(String(entry?.topic ?? ''))) reasons.push(`${entry.topic}${/^[A-Z_]+$/.test(String(entry.type ?? '')) ? ` (${entry.type})` : ''}`);
+  }
+  const v = e?.details?.policyViolationDetails;
+  if (v?.key?.policyName && /^[a-z0-9_]+$/i.test(String(v.key.policyName))) reasons.push(String(v.key.policyName));
+  // Google's own policy title (no digits, so it cannot read as an HTTP status), when no key is given.
+  else if (v?.externalPolicyName && /^[A-Za-z][A-Za-z &/'-]{0,80}$/.test(String(v.externalPolicyName))) reasons.push(String(v.externalPolicyName));
+  // Which field failed, e.g. headlines[2]: tells the caller which line to rewrite.
+  const path = (e?.location?.fieldPathElements ?? [])
+    .map((p: any) => (/^[a-z_]+$/.test(String(p?.fieldName ?? '')) ? `${p.fieldName}${Number.isInteger(p.index) ? `[${p.index}]` : ''}` : ''))
+    .filter(Boolean).join('.');
+  // A policy error with no readable topic still names the field; other errors never get a "Policy:" suffix.
+  const isPolicy = !!(e?.details?.policyFindingDetails || e?.details?.policyViolationDetails
+    || e?.errorCode?.policyFindingError || e?.errorCode?.policyViolationError);
+  if (path && (reasons.length || isPolicy)) reasons.push(`at ${path}`);
+  return reasons.length ? [...new Set(reasons)].join(', ') : undefined;
+}
+
 export async function handleCallGoogleAdsApi(userId: string, args: {
   customer_id: string;
   entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION' | 'CAMPAIGN_CONVERSION_GOAL' | 'CUSTOMER_CONVERSION_GOAL';
@@ -689,6 +720,12 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           status: args.status || 'PAUSED',
           brandBusinessName: args.brand_business_name,
           brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
+          // Network settings exist on Search campaigns only (another type would be rejected by Google).
+          ...(args.type === 'SEARCH' ? {
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+          } : {}),
         });
         return { success: true, campaignResourceName: campaign.resourceName };
       }
@@ -1368,7 +1405,9 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
     const gadsError = gadsErrors.length
       ? gadsErrors.map((e: any) => {
           const code = Object.values(e.errorCode || {})[0];
-          return code ? `${code}: ${e.message}` : e.message;
+          const text = code ? `${code}: ${e.message}` : e.message;
+          const reasons = googleAdsPolicyReasons(e);
+          return reasons ? `${text} Policy: ${reasons}.` : text;
         }).join('; ')
       : undefined;
     if (args.entity_type === 'CAMPAIGN_CRITERION') {
@@ -1652,12 +1691,25 @@ export function hubspotDateFilters(args: any):
   return { filters };
 }
 
-export async function handleHubspotApi(userId: string, args: any): Promise<any> {
+/**
+ * ENG-2840 (W2-9): options for the MCP read route (`POST /api/emma/hubspot-read`). Emma's own tool passes none, and every option left
+ * out keeps the old behaviour exactly.
+ */
+export interface HubspotApiOptions {
+  /** Told which connection will serve the call, once it is resolved (the route says in its answer whose account answered). */
+  onResolved?: (svc: HubSpotService) => void;
+  /** DEALS GET_CONTACTS: read at most this many of the deal's contacts, and stop paging associations once more than this many ids are
+   * held (the answer then has `contacts_cut: true`). Default: every page and every contact, as before. */
+  maxDealContacts?: number;
+}
+
+export async function handleHubspotApi(userId: string, args: any, options: HubspotApiOptions = {}): Promise<any> {
   args = normalizeHubSpotArgs(args);
   const entityType: string = (args?.entity_type ?? '').toUpperCase();
   const action: string = (args?.action ?? '').toUpperCase();
   try {
     const svc = await resolveHubSpotService(userId, args?.account_id);
+    options.onResolved?.(svc);
 
     // Refuse a call the connection provably cannot serve, BEFORE spending a round trip
     // on a guaranteed 403 whose message does not name the real problem.
@@ -1738,10 +1790,17 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
         case 'GET_CONTACTS': {
           const dealId = args?.deal_id ?? args?.id;
           if (!dealId) return { success: false, error: 'deal_id is required for DEALS GET_CONTACTS.' };
-          const ids = await svc.getDealContactAssociations(String(dealId));
+          // Emma's call (no maxDealContacts) reads every association page, exactly as before. The MCP route's bound stops paging once
+          // more than `max` ids are held, so how many the deal has in all is not known then: the answer only says the list was cut.
+          const max = options.maxDealContacts;
+          const allIds = max !== undefined
+            ? await svc.getDealContactAssociations(String(dealId), { stopAfter: Math.max(0, max) })
+            : await svc.getDealContactAssociations(String(dealId));
+          const ids = max !== undefined && allIds.length > max ? allIds.slice(0, Math.max(0, max)) : allIds;
           const contacts = ids.length
             ? await svc.batchReadContacts(ids, mergeProps(HUBSPOT_CONTACT_ATTRIBUTION_PROPS, args?.properties))
             : [];
+          if (ids.length < allIds.length) return { success: true, deal_id: String(dealId), contacts, contacts_cut: true };
           return { success: true, deal_id: String(dealId), contacts };
         }
         default:

@@ -1,7 +1,9 @@
-import { Router } from "express";
+import { Router, Request, Response } from "express";
+import { isDeepStrictEqual } from "util";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
+import { describeStatusReport } from "../services/gtmStatusReportOutcome";
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { settingsService } from "../services/settingsService";
 import { chatbotDb } from "../services/chatbotService";
@@ -26,6 +28,77 @@ const dynamodb = new DynamoDB.DocumentClient({
 // Get table prefix based on NODE_ENV
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+// ─── overlapping writes ──────────────────────────────────────────────────────
+// A plan is one row, and most routes below read the whole plan, change one phase or item and write the whole `phases` list back. Two such
+// writes that overlap used to overwrite each other: an added work item vanished, or a deleted phase came back with its items.
+// Each of those writes is now conditional on the plan's `updatedAt` still being what it read (updatePlanIfUnchanged), and a handler whose
+// write lost the race runs again from a fresh read (retryOnPlanChange), a few times, before answering 409. No stored attribute is added:
+// `updatedAt` is already on every plan. Not covered: the attachment and start-session routes, which write the plan without the guard.
+const MAX_PLAN_WRITE_ATTEMPTS = 8;
+
+class PlanChangedError extends Error {
+  constructor() {
+    super("The plan was changed by someone else while this was being saved");
+    this.name = "PlanChangedError";
+  }
+}
+
+async function updatePlanIfUnchanged<
+  P extends { ExpressionAttributeNames?: Record<string, string>; ExpressionAttributeValues?: Record<string, any> },
+>(params: P, readPlan: { updatedAt?: string }) {
+  const unchangedSinceRead = Boolean(readPlan.updatedAt);
+  const guarded = {
+    ...params,
+    ExpressionAttributeNames: { ...params.ExpressionAttributeNames, "#readUpdatedAt": "updatedAt" },
+    ExpressionAttributeValues: { ...params.ExpressionAttributeValues, ...(unchangedSinceRead && { ":readUpdatedAt": readPlan.updatedAt }) },
+    // the plan must still exist (one deleted since it was read must not come back as a row with no owner) and be as it was read
+    ConditionExpression: `attribute_exists(planId) AND ${unchangedSinceRead ? "#readUpdatedAt = :readUpdatedAt" : "attribute_not_exists(#readUpdatedAt)"}`,
+  };
+  try {
+    return await dynamodb.update(guarded as unknown as DynamoDB.DocumentClient.UpdateItemInput).promise();
+  } catch (error: any) {
+    if (error?.code !== "ConditionalCheckFailedException") throw error;
+    // The SDK resends a request whose answer it never received. If the first copy had been applied, the resend fails its own condition: that
+    // is not someone else's write, and running the handler again would add the item twice or find the deleted phase gone. It is our own
+    // write when the plan holds exactly what this request meant to write (the same updatedAt AND the same phases: the stamp alone could be
+    // another writer's, in the same millisecond). Writes that do not set phases (scalar plan updates) are idempotent and simply run again.
+    const intended = params.ExpressionAttributeValues?.[":phases"];
+    const intendedStamp = params.ExpressionAttributeValues?.[":updatedAt"];
+    if (intended !== undefined && intendedStamp !== undefined) {
+      try {
+        const stored = await dynamodb
+          .get({ TableName: (params as any).TableName, Key: (params as any).Key, ConsistentRead: true })
+          .promise();
+        if (stored.Item && stored.Item.updatedAt === intendedStamp && isDeepStrictEqual(stored.Item.phases, JSON.parse(JSON.stringify(intended)))) {
+          return { Attributes: stored.Item };
+        }
+      } catch {
+        // the check itself failed (throttled, timed out): treat the write as someone else's and run the handler again, as before the check existed
+      }
+    }
+    throw new PlanChangedError();
+  }
+}
+
+function retryOnPlanChange(handler: (req: Request, res: Response) => Promise<unknown>) {
+  return async (req: Request, res: Response) => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await handler(req, res);
+      } catch (error) {
+        if (!(error instanceof PlanChangedError)) throw error;
+        if (attempt >= MAX_PLAN_WRITE_ATTEMPTS) {
+          return res.status(409).json({
+            success: false,
+            error: "The plan is being changed by someone else right now. Nothing was lost; please try again.",
+          });
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 20 * attempt)));
+      }
+    }
+  };
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -195,7 +268,7 @@ router.post("/", authenticateToken, async (req, res) => {
 });
 
 // Update a GTM plan (title, description, dri, dueDate, or phases)
-router.put("/:planId", authenticateToken, async (req, res) => {
+router.put("/:planId", authenticateToken, retryOnPlanChange(async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId } = req.params;
@@ -209,6 +282,7 @@ router.put("/:planId", authenticateToken, async (req, res) => {
     const getResult = await dynamodb
       .get({
         TableName: TABLE_NAME,
+        ConsistentRead: true,
         Key: {
           planId: planId,
         },
@@ -321,7 +395,7 @@ router.put("/:planId", authenticateToken, async (req, res) => {
       ReturnValues: "ALL_NEW",
     };
 
-    const result = await dynamodb.update(updateParams).promise();
+    const result = await updatePlanIfUnchanged(updateParams, existingPlan);
 
     return res.json({
       success: true,
@@ -329,16 +403,17 @@ router.put("/:planId", authenticateToken, async (req, res) => {
       message: "GTM Plan updated successfully",
     });
   } catch (error) {
+    if (error instanceof PlanChangedError) throw error;
     console.error("Error in PUT /gtm-plan/:planId:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
     });
   }
-});
+}));
 
 // Update a specific work item in a GTM plan (with notification support)
-router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken, async (req, res) => {
+router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken, retryOnPlanChange(async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId, phaseId, workItemId } = req.params;
@@ -352,6 +427,7 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
     const getResult = await dynamodb
       .get({
         TableName: TABLE_NAME,
+        ConsistentRead: true,
         Key: {
           planId: planId,
         },
@@ -489,7 +565,7 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
       ReturnValues: "ALL_NEW",
     };
 
-    const result = await dynamodb.update(updateParams).promise();
+    const result = await updatePlanIfUnchanged(updateParams, plan);
 
     // Handle notifications if requested
     if (notifications && (notifications.notifyUser || notifications.notifyItemPoc || notifications.notifyPhasePoc || notifications.notifyPlanPoc)) {
@@ -521,16 +597,17 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
       message: "Work item updated successfully",
     });
   } catch (error: any) {
+    if (error instanceof PlanChangedError) throw error;
     console.error("Error updating GTM plan work item:", error);
     return res.status(500).json({
       success: false,
       error: error?.message || "Internal server error",
     });
   }
-});
+}));
 
 // Create a new phase in a GTM plan
-router.post("/:planId/phases", authenticateToken, async (req, res) => {
+router.post("/:planId/phases", authenticateToken, retryOnPlanChange(async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId } = req.params;
@@ -551,6 +628,7 @@ router.post("/:planId/phases", authenticateToken, async (req, res) => {
     const getResult = await dynamodb
       .get({
         TableName: TABLE_NAME,
+        ConsistentRead: true,
         Key: {
           planId: planId,
         },
@@ -625,7 +703,7 @@ router.post("/:planId/phases", authenticateToken, async (req, res) => {
       ReturnValues: "ALL_NEW",
     };
 
-    const result = await dynamodb.update(updateParams).promise();
+    const result = await updatePlanIfUnchanged(updateParams, plan);
 
     return res.json({
       success: true,
@@ -633,16 +711,119 @@ router.post("/:planId/phases", authenticateToken, async (req, res) => {
       message: "Phase created successfully",
     });
   } catch (error: any) {
+    if (error instanceof PlanChangedError) throw error;
     console.error("Error creating phase:", error);
     return res.status(500).json({
       success: false,
       error: error?.message || "Internal server error",
     });
   }
-});
+}));
+
+// Update a phase's own fields (title, description, DRI, due date). Its status is derived from its work items, so it is not settable here.
+router.put("/:planId/phases/:phaseId", authenticateToken, retryOnPlanChange(async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId } = req.params;
+    const { title, description, dri, dueDate } = req.body ?? {};
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (title === undefined && description === undefined && dri === undefined && dueDate === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: "Nothing to update: send at least one of title, description, dri, dueDate",
+      });
+    }
+
+    if (title !== undefined && (typeof title !== "string" || title.trim() === "")) {
+      return res.status(400).json({
+        success: false,
+        error: "Phase title cannot be empty",
+      });
+    }
+
+    for (const [field, value] of [["description", description], ["dri", dri], ["dueDate", dueDate]] as const) {
+      if (value !== undefined && value !== null && typeof value !== "string") {
+        return res.status(400).json({
+          success: false,
+          error: `${field} must be text`,
+        });
+      }
+    }
+
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        ConsistentRead: true,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const phases = getResult.Item.phases || [];
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    phases[phaseIndex] = {
+      ...phase,
+      ...(title !== undefined && { title: title.trim() }),
+      ...(description !== undefined && { description: description || null }),
+      ...(dri !== undefined && { dri: dri || null }),
+      ...(dueDate !== undefined && { dueDate: dueDate && String(dueDate).trim() !== "" ? String(dueDate).trim() : null }),
+    };
+
+    const result = await updatePlanIfUnchanged(
+      {
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#phases": "phases",
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":phases": phases,
+          ":updatedAt": new Date().toISOString(),
+        },
+        ReturnValues: "ALL_NEW",
+      },
+      getResult.Item,
+    );
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Phase updated successfully",
+    });
+  } catch (error: any) {
+    if (error instanceof PlanChangedError) throw error;
+    console.error("Error updating phase:", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Internal server error",
+    });
+  }
+}));
 
 // Create a new work item in a phase
-router.post("/:planId/phases/:phaseId/work-items", authenticateToken, async (req, res) => {
+router.post("/:planId/phases/:phaseId/work-items", authenticateToken, retryOnPlanChange(async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId, phaseId } = req.params;
@@ -663,6 +844,7 @@ router.post("/:planId/phases/:phaseId/work-items", authenticateToken, async (req
     const getResult = await dynamodb
       .get({
         TableName: TABLE_NAME,
+        ConsistentRead: true,
         Key: {
           planId: planId,
         },
@@ -755,7 +937,7 @@ router.post("/:planId/phases/:phaseId/work-items", authenticateToken, async (req
       ReturnValues: "ALL_NEW",
     };
 
-    const result = await dynamodb.update(updateParams).promise();
+    const result = await updatePlanIfUnchanged(updateParams, plan);
 
     return res.json({
       success: true,
@@ -763,16 +945,17 @@ router.post("/:planId/phases/:phaseId/work-items", authenticateToken, async (req
       message: "Work item created successfully",
     });
   } catch (error: any) {
+    if (error instanceof PlanChangedError) throw error;
     console.error("Error creating work item:", error);
     return res.status(500).json({
       success: false,
       error: error?.message || "Internal server error",
     });
   }
-});
+}));
 
 // Delete a phase from a GTM plan
-router.delete("/:planId/phases/:phaseId", authenticateToken, async (req, res) => {
+router.delete("/:planId/phases/:phaseId", authenticateToken, retryOnPlanChange(async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId, phaseId } = req.params;
@@ -785,6 +968,7 @@ router.delete("/:planId/phases/:phaseId", authenticateToken, async (req, res) =>
     const getResult = await dynamodb
       .get({
         TableName: TABLE_NAME,
+        ConsistentRead: true,
         Key: {
           planId: planId,
         },
@@ -813,23 +997,31 @@ router.delete("/:planId/phases/:phaseId", authenticateToken, async (req, res) =>
     phases.splice(phaseIndex, 1);
 
     // Update the plan
-    await dynamodb
-      .update({
+    const updatedAt = new Date().toISOString();
+    await updatePlanIfUnchanged(
+      {
         TableName: TABLE_NAME,
         Key: {
           planId: planId,
         },
-        UpdateExpression: "SET phases = :phases",
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#phases": "phases",
+          "#updatedAt": "updatedAt",
+        },
         ExpressionAttributeValues: {
           ":phases": phases,
+          ":updatedAt": updatedAt,
         },
-      })
-      .promise();
+      },
+      plan,
+    );
 
     // Return the updated plan
     const updatedPlan = {
       ...plan,
       phases: phases,
+      updatedAt,
     };
 
     return res.json({
@@ -838,16 +1030,17 @@ router.delete("/:planId/phases/:phaseId", authenticateToken, async (req, res) =>
       message: "Phase deleted successfully",
     });
   } catch (error) {
+    if (error instanceof PlanChangedError) throw error;
     console.error("Error in DELETE /gtm-plan/:planId/phases/:phaseId:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
     });
   }
-});
+}));
 
 // Delete a work item from a phase
-router.delete("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken, async (req, res) => {
+router.delete("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken, retryOnPlanChange(async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId, phaseId, workItemId } = req.params;
@@ -860,6 +1053,7 @@ router.delete("/:planId/phases/:phaseId/work-items/:workItemId", authenticateTok
     const getResult = await dynamodb
       .get({
         TableName: TABLE_NAME,
+        ConsistentRead: true,
         Key: {
           planId: planId,
         },
@@ -903,23 +1097,31 @@ router.delete("/:planId/phases/:phaseId/work-items/:workItemId", authenticateTok
     };
 
     // Update the plan
-    await dynamodb
-      .update({
+    const updatedAt = new Date().toISOString();
+    await updatePlanIfUnchanged(
+      {
         TableName: TABLE_NAME,
         Key: {
           planId: planId,
         },
-        UpdateExpression: "SET phases = :phases",
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#phases": "phases",
+          "#updatedAt": "updatedAt",
+        },
         ExpressionAttributeValues: {
           ":phases": phases,
+          ":updatedAt": updatedAt,
         },
-      })
-      .promise();
+      },
+      plan,
+    );
 
     // Return the updated plan
     const updatedPlan = {
       ...plan,
       phases: phases,
+      updatedAt,
     };
 
     return res.json({
@@ -928,13 +1130,14 @@ router.delete("/:planId/phases/:phaseId/work-items/:workItemId", authenticateTok
       message: "Work item deleted successfully",
     });
   } catch (error) {
+    if (error instanceof PlanChangedError) throw error;
     console.error("Error in DELETE /gtm-plan/:planId/phases/:phaseId/work-items/:workItemId:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
     });
   }
-});
+}));
 
 // Delete a GTM plan
 router.delete("/:planId", authenticateToken, async (req, res) => {
@@ -1036,17 +1239,24 @@ router.post("/:planId/phases/:phaseId/send-status-report", authenticateToken, as
       });
     }
 
-    // Send status report
-    await sendPhaseStatusReport(
+    // Send status report, and answer for what happened (the service no longer hides a send that did not occur)
+    const result = await sendPhaseStatusReport(
       plan as any,
       phaseId,
       { ...notifications, message },
       process.env.CUSTOMER_FRONTEND_URL
     );
+    const outcome = describeStatusReport(result, "phase status report");
+    if (!outcome.ok) {
+      return res.status(outcome.httpStatus).json({ success: false, error: outcome.message });
+    }
 
     return res.json({
       success: true,
-      message: "Phase status report sent successfully",
+      message: outcome.message,
+      sent: result.sent,
+      failed: result.failed,
+      suppressed: result.suppressed ?? 0,
     });
   } catch (error: any) {
     console.error("Error sending phase status report:", error);
@@ -1097,16 +1307,23 @@ router.post("/:planId/send-status-report", authenticateToken, async (req, res) =
       });
     }
 
-    // Send status report
-    await sendPlanStatusReport(
+    // Send status report, and answer for what happened (the service no longer hides a send that did not occur)
+    const result = await sendPlanStatusReport(
       plan as any,
       { ...notifications, message },
       process.env.CUSTOMER_FRONTEND_URL
     );
+    const outcome = describeStatusReport(result, "plan status report");
+    if (!outcome.ok) {
+      return res.status(outcome.httpStatus).json({ success: false, error: outcome.message });
+    }
 
     return res.json({
       success: true,
-      message: "Plan status report sent successfully",
+      message: outcome.message,
+      sent: result.sent,
+      failed: result.failed,
+      suppressed: result.suppressed ?? 0,
     });
   } catch (error: any) {
     console.error("Error sending plan status report:", error);
@@ -1119,7 +1336,7 @@ router.post("/:planId/send-status-report", authenticateToken, async (req, res) =
 });
 
 // Add common items to a GTM plan (batch)
-router.post("/:planId/add-common-items", authenticateToken, async (req, res) => {
+router.post("/:planId/add-common-items", authenticateToken, retryOnPlanChange(async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId } = req.params;
@@ -1148,6 +1365,7 @@ router.post("/:planId/add-common-items", authenticateToken, async (req, res) => 
     const getResult = await dynamodb
       .get({
         TableName: TABLE_NAME,
+        ConsistentRead: true,
         Key: { planId },
       })
       .promise();
@@ -1252,7 +1470,7 @@ router.post("/:planId/add-common-items", authenticateToken, async (req, res) => 
       ReturnValues: "ALL_NEW",
     };
 
-    const result = await dynamodb.update(updateParams).promise();
+    const result = await updatePlanIfUnchanged(updateParams, plan);
 
     return res.json({
       success: true,
@@ -1260,13 +1478,14 @@ router.post("/:planId/add-common-items", authenticateToken, async (req, res) => 
       message: "Common items added successfully",
     });
   } catch (error: any) {
+    if (error instanceof PlanChangedError) throw error;
     console.error("Error adding common items:", error);
     return res.status(500).json({
       success: false,
       error: error?.message || "Internal server error",
     });
   }
-});
+}));
 
 // Upload an attachment to a work item
 router.post("/:planId/phases/:phaseId/work-items/:workItemId/attachments", authenticateToken, upload.single("file"), async (req, res) => {
