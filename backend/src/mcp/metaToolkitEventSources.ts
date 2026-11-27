@@ -262,7 +262,7 @@ export async function runMetaEventSourceTool(
         account_id: accountId, pixel_id: id, name: pixel?.name ?? null, state,
         last_fired_time: pixel?.last_fired_time ?? null,
         ...(eventsLast24h !== null ? { events_last_24h: eventsLast24h } : {}),
-        ...(state === 'ACTIVE' && firingState(pixel, deps.now()) !== 'ACTIVE'
+        ...(state === 'ACTIVE' && eventsLast24h !== null && eventsLast24h > 0 && firingState(pixel, deps.now()) !== 'ACTIVE'
           ? { state_source: 'event_stats', note: `Meta's last_fired_time is stale, but its event stats show ${eventsLast24h} events in the last 24 hours, so the pixel is firing.` }
           : {}),
         connected_catalogs: connectedCatalogs,
