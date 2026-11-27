@@ -60,6 +60,7 @@ import {
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
 import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
+import { annotateCreativeCta, ctaNoteForRequested, withAnnotatedCreativeCta } from '../utils/metaCtaAliases';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
@@ -12378,7 +12379,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           message: creative?.name
             ? `Fetched the requested ad creative "${creative.name}".`
             : `Fetched the requested ad creative.`,
-          creative,
+          creative: annotateCreativeCta(creative),
         };
       }
       case 'PREVIEW': {
@@ -12413,7 +12414,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         if (!ad_id) throw new Error('ad_id is required for AD GET (use LIST to read every ad).');
         const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
         try {
-          const ad = await metaService.getAd(accessToken, ad_id, accountId);
+          const ad = withAnnotatedCreativeCta(await metaService.getAd(accessToken, ad_id, accountId));
           return { success: true, message: `Ad ${ad_id}`, ad } as any;
         } catch (error: any) {
           if (error?.isMetaAuthError) throw error;
@@ -13481,7 +13482,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
-      const creatives = result?.creatives ?? [];
+      const creatives = (result?.creatives ?? []).map(annotateCreativeCta);
 
       return buildListResult({
         payloadKey: 'creatives',
@@ -13638,12 +13639,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             err instanceof Error ? err.message : err);
         }
       }
+      // Meta rewrites some CTAs on video creatives (BOOK_NOW → BOOK_TRAVEL); say so up front so a
+      // later read-back showing the stored type is not mistaken for a wrong write.
+      const isVideoCreative = !!resolvedParams.video_id && !resolvedParams.placement_assets?.length
+        && !MetaService.isMultiVariantCreative(resolvedParams);
+      const ctaNote = isVideoCreative ? ctaNoteForRequested('video_data', resolvedParams.call_to_action_type) : undefined;
       if (unappliedFields.length > 0) {
         return {
           success: true,
           verified: false,
           unapplied_fields: unappliedFields,
           message: buildUnappliedFieldsMessage(creative, requestedFields, unappliedFields),
+          ...(ctaNote ? { cta_note: ctaNote } : {}),
           creative: creative
         };
       }
@@ -13653,6 +13660,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: `Ad creative "${creative.name}" created successfully` +
           (readbackUnavailable ? ' (could not read it back to confirm description / instagram_user_id were stored)' : ''),
         ...(readbackUnavailable ? { readback_unavailable: true } : {}),
+        ...(ctaNote ? { cta_note: ctaNote } : {}),
         creative: creative
       };
     } catch (error: any) {
@@ -13673,7 +13681,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
-      const ads = result?.ads ?? [];
+      const ads = (result?.ads ?? []).map(withAnnotatedCreativeCta);
 
       // Message shape and field order both live in agentMode/metaListScope.ts — see that module
       // for why completeness must precede the payload (the S3 preview cut).
