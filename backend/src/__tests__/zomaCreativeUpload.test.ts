@@ -99,6 +99,19 @@ describe('zoma_prepare_upload', () => {
     expect(r.upload_command).toContain("-H 'Content-Type: image/png'");
   });
 
+  it('offers Google ASSET UPLOAD (with name) for PNG/JPG/GIF only, and only while Google is enabled', async () => {
+    const prev = process.env.ZOMA_GOOGLE_ENABLED;
+    try {
+      process.env.ZOMA_GOOGLE_ENABLED = 'true';
+      expect((await prepareZomaUpload(USER, { filename: 'a.png' }, deps())).next_step).toContain('asset_type IMAGE or LOGO, name (required), data = file_url');
+      expect((await prepareZomaUpload(USER, { filename: 'a.webp' }, deps())).next_step).not.toContain('call_google_ads_api');
+      process.env.ZOMA_GOOGLE_ENABLED = 'false';
+      expect((await prepareZomaUpload(USER, { filename: 'a.png' }, deps())).next_step).not.toContain('call_google_ads_api');
+    } finally {
+      if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED; else process.env.ZOMA_GOOGLE_ENABLED = prev;
+    }
+  });
+
   it('refuses unknown types, oversize, and unready accounts', async () => {
     await expect(prepareZomaUpload(USER, { filename: 'x.exe' }, deps())).rejects.toBeInstanceOf(MetaToolkitRefusal);
     await expect(prepareZomaUpload(USER, { filename: 'x.png', size_bytes: 31 * 1024 * 1024 }, deps())).rejects.toThrow(/size_bytes/);

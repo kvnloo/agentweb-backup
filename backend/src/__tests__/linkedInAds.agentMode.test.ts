@@ -49,6 +49,19 @@ jest.mock('../services/linkedInAdsService', () => ({
 }));
 
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
+// ENG-2840: upload files are fetched through the SSRF-guarded helper (any URL) or read from our bucket after the storage rule (own files).
+const mockFetchCallerUrlBuffer = jest.fn();
+jest.mock('../utils/callerUrlFetch', () => {
+  class CallerUrlTooLargeError extends Error {}
+  return { fetchCallerUrlBuffer: (...a: any[]) => mockFetchCallerUrlBuffer(...a), CallerUrlTooLargeError };
+});
+const mockGetS3ObjectAsBuffer = jest.fn();
+jest.mock('../utils/s3Utils', () => ({ ...jest.requireActual('../utils/s3Utils'), getS3ObjectAsBuffer: (...a: any[]) => mockGetS3ObjectAsBuffer(...a) }));
+const mockCheckKey = jest.fn();
+jest.mock('../emma/impl/toolStorageAccess', () => ({
+  ...jest.requireActual('../emma/impl/toolStorageAccess'),
+  checkOurBucketKeyRead: (...a: any[]) => mockCheckKey(...a),
+}));
 
 jest.mock('../config/integrations', () => ({
   // INTEGRATION_CONFIG is read at module-load time by linkedInAdsService (via requireActual below)
@@ -558,11 +571,7 @@ describe('callLinkedInMarketingApi — MEDIA', () => {
   });
 
   it('UPLOAD_IMAGE downloads and uploads image, returns image_urn', async () => {
-    const mockAxios = require('axios');
-    mockAxios.get = jest.fn().mockResolvedValue({
-      data: Buffer.from('image-bytes'),
-      headers: { 'content-type': 'image/png' },
-    });
+    mockFetchCallerUrlBuffer.mockResolvedValueOnce({ buffer: Buffer.from('image-bytes'), contentType: 'image/png', finalUrl: 'https://example.com/image.png' });
     const result = await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, {
       image_url: 'https://example.com/image.png',
     });
@@ -746,11 +755,8 @@ describe('callLinkedInAdsInsightsApi', () => {
 
 describe('callLinkedInMarketingApi — MEDIA/UPLOAD_VIDEO', () => {
   beforeEach(() => {
-    const mockAxios = require('axios');
-    mockAxios.get = jest.fn().mockResolvedValue({
-      data: Buffer.alloc(100, 'x'),
-      headers: { 'content-type': 'video/mp4' },
-    });
+    mockFetchCallerUrlBuffer.mockReset();
+    mockFetchCallerUrlBuffer.mockResolvedValue({ buffer: Buffer.alloc(100, 'x'), contentType: 'video/mp4', finalUrl: 'https://example.com/video.mp4' });
   });
 
   it('UPLOAD_VIDEO auto-downloads, inits upload, uploads parts, finalizes, returns video_urn', async () => {
@@ -778,11 +784,8 @@ describe('callLinkedInMarketingApi — MEDIA/UPLOAD_VIDEO', () => {
 
 describe('callLinkedInMarketingApi — MEDIA/UPLOAD_DOCUMENT', () => {
   beforeEach(() => {
-    const mockAxios = require('axios');
-    mockAxios.get = jest.fn().mockResolvedValue({
-      data: Buffer.alloc(200, 'y'),
-      headers: { 'content-type': 'application/pdf' },
-    });
+    mockFetchCallerUrlBuffer.mockReset();
+    mockFetchCallerUrlBuffer.mockResolvedValue({ buffer: Buffer.alloc(200, 'y'), contentType: 'application/pdf', finalUrl: 'https://example.com/brochure.pdf' });
   });
 
   it('UPLOAD_DOCUMENT auto-downloads, inits upload, uploads binary, returns document_urn', async () => {
@@ -938,5 +941,53 @@ describe('ENG-3064 read-back failures at the tool boundary', () => {
     (linkedInAdsService.updateCampaign as jest.Mock).mockResolvedValue({ success: false, error: 'LinkedIn said no' });
     await expect(service.callLinkedInMarketingApi(USER_ID, 'CAMPAIGN', 'UPDATE', ACCOUNT_ID, { campaign_id: 'c-1', status: 'PAUSED' }))
       .rejects.toThrow('LinkedIn said no');
+  });
+});
+
+// ── callLinkedInMarketingApi — MEDIA downloads are guarded (ENG-2840) ─────────
+
+describe('callLinkedInMarketingApi — MEDIA downloads', () => {
+  const OUR = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/other-user/files/1/abc/secret.png';
+  beforeEach(() => {
+    mockFetchCallerUrlBuffer.mockReset();
+    mockGetS3ObjectAsBuffer.mockReset();
+    mockCheckKey.mockReset();
+  });
+
+  it('a web URL goes through the SSRF-guarded fetch with a byte ceiling and a time limit', async () => {
+    mockFetchCallerUrlBuffer.mockResolvedValueOnce({ buffer: Buffer.from('img'), contentType: 'image/png', finalUrl: 'x' });
+    await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, { image_url: 'https://example.com/a.png' });
+    expect(mockFetchCallerUrlBuffer).toHaveBeenCalledWith('https://example.com/a.png', expect.objectContaining({ tool: 'call_linkedin_marketing_api', userId: USER_ID, maxBytes: 20 * 1024 * 1024, timeoutMs: 60_000 }));
+  });
+
+  it('a blocked address (the guard refuses) uploads nothing', async () => {
+    mockFetchCallerUrlBuffer.mockRejectedValueOnce(new Error('That URL cannot be fetched.'));
+    (linkedInAdsService.uploadImageBinary as jest.Mock).mockClear();
+    await expect(service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, { image_url: 'http://169.254.169.254/latest/meta-data' })).rejects.toThrow();
+    expect(linkedInAdsService.uploadImageBinary).not.toHaveBeenCalled();
+  });
+
+  it('a file of our bucket that the caller may not read is refused before any read; one they may read is read with a ceiling', async () => {
+    mockCheckKey.mockResolvedValueOnce('refuse');
+    await expect(service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_DOCUMENT', ACCOUNT_ID, { document_url: OUR })).rejects.toThrow('File not found or you do not have access to it.');
+    expect(mockCheckKey).toHaveBeenCalledWith('call_linkedin_marketing_api', USER_ID, 'users/other-user/files/1/abc/secret.png');
+    expect(mockGetS3ObjectAsBuffer).not.toHaveBeenCalled();
+    expect(mockFetchCallerUrlBuffer).not.toHaveBeenCalled();
+    mockCheckKey.mockResolvedValueOnce('allow');
+    mockGetS3ObjectAsBuffer.mockResolvedValueOnce({ buffer: Buffer.from('%PDF'), contentType: 'application/pdf' });
+    await service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_DOCUMENT', ACCOUNT_ID, { document_url: OUR });
+    expect(mockGetS3ObjectAsBuffer).toHaveBeenCalledWith('users/other-user/files/1/abc/secret.png', undefined, 100 * 1024 * 1024);
+  });
+
+  it('a file of our bucket over the ceiling is refused in plain words', async () => {
+    mockCheckKey.mockResolvedValueOnce('allow');
+    mockGetS3ObjectAsBuffer.mockRejectedValueOnce(new Error('decoded image exceeds the 20 MB limit'));
+    await expect(service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_IMAGE', ACCOUNT_ID, { image_url: OUR })).rejects.toThrow(/larger than 20 MB/);
+  });
+
+  it('a file over the ceiling is refused in plain words', async () => {
+    const { CallerUrlTooLargeError } = jest.requireMock('../utils/callerUrlFetch');
+    mockFetchCallerUrlBuffer.mockRejectedValueOnce(new CallerUrlTooLargeError('big'));
+    await expect(service.callLinkedInMarketingApi(USER_ID, 'MEDIA', 'UPLOAD_VIDEO', ACCOUNT_ID, { video_url: 'https://example.com/v.mp4' })).rejects.toThrow(/larger than 200 MB/);
   });
 });

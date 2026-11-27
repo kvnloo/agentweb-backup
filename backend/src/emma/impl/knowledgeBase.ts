@@ -2686,6 +2686,7 @@ async function readGoogleDriveSharedFile(kbIdentifier: string, fileName: string,
 // Maximum bytes materialize_knowledge_base_asset will download/upload for one file.
 const MATERIALIZE_ASSET_MAX_BYTES = 200 * 1024 * 1024;
 
+
 /**
  * Turn an image/video file from a connected Google Drive knowledge base
  * folder into a real, hosted S3 asset with a usable URL.
@@ -2847,19 +2848,26 @@ export async function materializeKnowledgeBaseAsset(
       };
     }
 
-    const mediaResponse = await drive.files.get(
-      { fileId: file.id!, alt: 'media', supportsAllDrives: true },
-      { responseType: 'arraybuffer' }
-    );
-    const buffer = Buffer.from(mediaResponse.data as any);
-
-    // Drive's reported `size` can be missing/stale (e.g. 0 during virus-scan) —
-    // re-check the actual downloaded bytes so an oversized file can't slip
-    // through on bad metadata and get uploaded/reported with a wrong size.
-    if (buffer.length > MATERIALIZE_ASSET_MAX_BYTES) {
+    // ENG-2840: streamed with the byte cap applied while downloading. Drive's reported `size` can be missing or stale (e.g. 0 during a
+    // virus scan); before, the whole file was buffered first and only then measured, so a large file with bad metadata was held in memory
+    // in full.
+    const abort = new AbortController();
+    let mediaResponse: any;
+    try {
+      mediaResponse = await drive.files.get(
+        { fileId: file.id!, alt: 'media', supportsAllDrives: true },
+        { responseType: 'stream', signal: abort.signal }
+      );
+    } catch (err) {
+      const { normalizeStreamedDriveError } = await import('./shared/googleDriveErrors');
+      throw normalizeStreamedDriveError(err);
+    }
+    const { readWithByteCap } = await import('../../utils/readWithByteCap');
+    const buffer = await readWithByteCap(mediaResponse.data, MATERIALIZE_ASSET_MAX_BYTES, () => abort.abort());
+    if (!buffer) {
       return {
         success: false,
-        message: `"${fileName}" is ${Math.round(buffer.length / (1024 * 1024))}MB, over the ${MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        message: `"${fileName}" is over the ${MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
       };
     }
 
@@ -2880,7 +2888,7 @@ export async function materializeKnowledgeBaseAsset(
       url: uploadResult.url,
       file_name: file.name || fileName,
       mime_type: mimeType,
-      size,
+      size: buffer.length, // the bytes actually stored (Drive's reported size can be 0)
       kb_identifier: kbIdentifier
     };
   } catch (error: any) {

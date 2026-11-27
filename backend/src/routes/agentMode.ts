@@ -318,6 +318,14 @@ router.post('/conversable-share', asyncHandler(agentModeController.createConvers
 // Stop conversable sharing
 router.delete('/session/:sessionId/conversable-share', asyncHandler(agentModeController.stopConversableShare));
 
+// GET /api/agent-mode/session/:sessionId/conversable-share
+// ENG-3170: read whether sensitive actions are allowed on this session's interactive link (owner only)
+router.get('/session/:sessionId/conversable-share', asyncHandler(agentModeController.getConversableShareSettings));
+
+// PATCH /api/agent-mode/session/:sessionId/conversable-share
+// ENG-3170: the owner turns sensitive actions on or off for the link that already exists
+router.patch('/session/:sessionId/conversable-share', asyncHandler(agentModeController.updateConversableShareSettings));
+
 
 // POST /api/agent-mode/scheduled-chats
 // Create scheduled chat

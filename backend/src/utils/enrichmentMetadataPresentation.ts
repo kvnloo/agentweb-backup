@@ -87,9 +87,12 @@ export function sanitizeLeadForResponse<T extends { enrichmentMetadata?: any; cu
 ): T | null | undefined {
   if (!lead) return lead;
   const hideCardRevenue = shouldHideCardRevenueForViewer(viewerUserId);
-  if (!lead.enrichmentMetadata && !hideCardRevenue) return lead;
+  if (!lead.enrichmentMetadata && !hideCardRevenue && !('emailDraftSendClaimedAt' in lead)) return lead;
+  // ENG-2984: the send lease is server-only; preserve the raw row for claim checks.
+  const publicLead = { ...lead };
+  delete (publicLead as T & { emailDraftSendClaimedAt?: unknown }).emailDraftSendClaimedAt;
   return {
-    ...lead,
+    ...publicLead,
     ...(lead.enrichmentMetadata ? { enrichmentMetadata: sanitizeEnrichmentMetadataForResponse(lead.enrichmentMetadata) } : {}),
     ...(hideCardRevenue ? {
       customFields: stripCardRevenueKeys(lead.customFields) ?? lead.customFields,

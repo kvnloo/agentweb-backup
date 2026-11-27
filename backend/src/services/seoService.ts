@@ -1,5 +1,7 @@
 import { userDb } from "./db";
 import { resolveAnalyticsConfig, ResolvedAnalyticsConfig } from "./analyticsConfigResolver";
+import { auditSharedGoogleRead } from "./sharedGoogleAudit";
+import { createLandingAnalyticsScope, gscScopeFilter, scopeGaClient } from "./landingAnalyticsScope";
 import { getSecret } from "../utils/secretsManager";
 import { JWT } from "google-auth-library";
 import { BetaAnalyticsDataClient } from "@google-analytics/data";
@@ -144,6 +146,7 @@ export async function fetchGa4KeyEvents(
 
   const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
   const gaProperties = resolved.properties;
+  auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user?.orgId, configSource: resolved?.source, ids: (gaProperties ?? []).map((p: any) => p?.propertyId), source: 'fetchGa4KeyEvents' });
   if (gaProperties.length === 0) {
     return { message: "Google Analytics (GA4) is not configured. Guide the user to connect it in Settings → Analytics & SEO (/settings/analytics-seo) by granting the AgentWeb service account Viewer access and adding the numeric GA4 Property ID." };
   }
@@ -360,6 +363,8 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   }
 
   const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  auditSharedGoogleRead({ kind: 'gsc', userId, orgId: user?.orgId, configSource: resolved?.source, ids: resolved?.seoDomains ?? [], source: 'fetchSearchConsoleMetrics' });
+  const landingScope = createLandingAnalyticsScope(user);
   if (!resolved.seoDomains || resolved.seoDomains.length === 0) {
     return { message: "Google Search Console is not configured. This is a self-serve setup, not a product bug — do not file a product issue. Guide the user to connect it in Settings → Analytics & SEO (/settings/analytics-seo): (1) in Google Search Console, open Settings → Users and permissions and add the AgentWeb service account email (shown on that page) with \"Full\" permission; (2) back in AgentWeb, add their domain (e.g. example.com, or https://example.com/ for a URL-prefix property) under \"SEO Domains\" and save. (If they belong to an organization and can't see that page, their org owner or an analytics editor must set it up.) You can use the search_user_guide tool for more detail." };
   }
@@ -387,6 +392,9 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
       const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
       console.log('[GSC Debug] Formatted siteUrl:', siteUrl);
       const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
+      // The platform's own landing-page domain holds every customer's pages: keep only the caller's own (landingAnalyticsScope.ts).
+      const scopeFilter = await gscScopeFilter(landingScope, siteUrl);
+      const scopeGroups = scopeFilter ? { dimensionFilterGroups: [{ filters: [scopeFilter] }] } : {};
 
       // Fetch daily data
       const dailyDataResponse = await fetch(searchAnalyticsUrl, {
@@ -398,6 +406,7 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
         body: JSON.stringify({
           startDate: startDateStr,
           endDate: endDateStr,
+          ...scopeGroups,
           dimensions: ["date"],
           rowLimit: 25000,
         }),
@@ -435,6 +444,7 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
         body: JSON.stringify({
           startDate: startDateStr,
           endDate: endDateStr,
+          ...scopeGroups,
         }),
       });
 
@@ -473,6 +483,7 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
         body: JSON.stringify({
           startDate: startDateStr,
           endDate: endDateStr,
+          ...scopeGroups,
           dimensions: ["query"],
           rowLimit: 25000,
         }),
@@ -521,6 +532,7 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
         body: JSON.stringify({
           startDate: startDateStr,
           endDate: endDateStr,
+          ...scopeGroups,
           dimensions: ["page"],
           rowLimit: 25000,
         }),
@@ -616,6 +628,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
 
   const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
   const gaProperties = resolved.properties;
+  auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user?.orgId, configSource: resolved?.source, ids: (gaProperties ?? []).map((p: any) => p?.propertyId), source: 'fetchGoogleAnalyticsMetrics' });
   if (gaProperties.length === 0) {
     return { message: "Google Analytics (GA4) is not configured. This is a self-serve setup, not a product bug — do not file a product issue. Guide the user to connect it in Settings → Analytics & SEO (/settings/analytics-seo): (1) in GA4, open Admin → Property Access Management and grant the AgentWeb service account email (shown on that page) \"Viewer\" access; (2) back in AgentWeb, add their numeric GA4 Property ID (e.g. 123456789) under \"Google Analytics\" and save, using \"Test\" to verify access. (If they belong to an organization and can't see that page, their org owner or an analytics editor must set it up.) You can use the search_user_guide tool for more detail." };
   }
@@ -629,7 +642,8 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
     }
   }
 
-  const gaClient = await getGoogleAnalyticsDataClient();
+  // Reads of the platform's own landing-page property keep only the caller's own pages (landingAnalyticsScope.ts).
+  const gaClient = scopeGaClient(await getGoogleAnalyticsDataClient(), createLandingAnalyticsScope(user));
   if (!gaClient) {
     return { error: "Google Analytics API not configured. Please contact support." };
   }

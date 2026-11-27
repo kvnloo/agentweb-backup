@@ -34,7 +34,9 @@ import { getJwtSecret } from '../config/jwt';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
+import { campaignBidStrategyDefault } from '../utils/metaCampaignBidStrategyDefault';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { flattenNestedCampaignCreate } from '../services/agentMode/metaCampaignCreateParams';
 import { metaPageAccessRefusalText } from './metaPageAccessRefusal';
 import { getAccessiblePageIds, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import { assertOptimisationEventConfigured, type ConversionLookup } from './metaToolkitConversionGate';
@@ -143,7 +145,17 @@ function targetId(entity: string, args: any): string | undefined {
 /** Shape checks that need no I/O. Returns the params to preview/dispatch. */
 function validateWriteShape(entity: string, action: string, args: any): any {
   if (args.client_id !== undefined) throw new MetaToolkitRefusal('client_id is not available to external Meta Toolkit callers.');
-  const params = args.params && typeof args.params === 'object' && !Array.isArray(args.params) ? { ...args.params } : {};
+  let params = args.params && typeof args.params === 'object' && !Array.isArray(args.params) ? { ...args.params } : {};
+  // The campaign's fields may arrive nested as params.campaign; lifted before anything reads them
+  // (the objective line, money normalization, the preview binding).
+  if (entity === 'CAMPAIGN' && action === 'CREATE') {
+    const flat = flattenNestedCampaignCreate(
+      params,
+      'Zoma creates one entity per call: create the campaign, then AD_SET CREATE with its campaign_id, then AD CREATE with the ad set id — each with its own preview and approval.',
+    );
+    if (flat.error !== undefined) throw new MetaToolkitRefusal(flat.error);
+    params = flat.params;
+  }
   for (const key of FORBIDDEN_PARAMS) {
     if (params[key] !== undefined) {
       throw new MetaToolkitRefusal(`params.${key} is not available to external Meta Toolkit callers. Use the top-level confirm + preview_token flow.`);
@@ -392,6 +404,16 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   const priorId = targetId(entity, args);
   const prior = action === 'UPDATE' && priorId ? await deps.readBack(userId, accountId, entity, priorId).catch(() => null) : null;
   const diff = action === 'UPDATE' ? fieldDiffLines(params, money.params, prior) : [];
+  // ENG-2364: updateCampaign adds the no-cap bid strategy when a budget lands on a campaign
+  // with no strategy; the preview names it so what is approved is what is written.
+  if (action === 'UPDATE' && entity === 'CAMPAIGN') {
+    const added = campaignBidStrategyDefault(params, prior);
+    if (added) {
+      diff.push(prior
+        ? `- bid_strategy: ${show(prior.bid_strategy)} → ${added}`
+        : `- bid_strategy: (current value unavailable) → ${added} if the campaign has no bid strategy`);
+    }
+  }
   if (action === 'UPDATE' && params.creative_id !== undefined) {
     try {
       await deps.assertCreativeOwned(userId, accountId, String(params.creative_id));

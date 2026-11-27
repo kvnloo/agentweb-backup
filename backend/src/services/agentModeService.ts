@@ -3,7 +3,7 @@ import { personOnlyApprovalsIn } from './personOnlyApprovals';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
-import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
+import { classifyMetaBudgetChange, priorBudgetForComparison } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
@@ -12,8 +12,10 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isServerSideBrowserCodeTool, browserCallTouchesServerFiles, sensitiveActionScheduleRefusal, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
+import { normalizeEmailList } from '../utils/validation';
+import { describeMetaError } from '../utils/metaErrorDetail';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -30,6 +32,12 @@ import OpenAI from 'openai';
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
+import { interactiveShareControl } from '../utils/interactiveShare';
+import { AsyncLocalStorage } from 'async_hooks';
+import { isShareVisitorTurn } from './shareVisitorTurnMarker';
+
+/** The restriction profile of the tool call being run, for the calls that tool makes itself (see `executeTool`). */
+const toolCallRestrictionStore = new AsyncLocalStorage<{ restrictionProfile: string; withinVisitorCall: boolean }>();
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -43,13 +51,16 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
+import { requiredToolsBudgetNote, uncalledRequiredTools } from './agentMode/core/stepBudgetRequiredTools';
 import { recordSessionBreakerShadowTurn, shadowTurnCostUsd } from './sessionBreakerShadow';
+import { startSessionLimitForRun, sessionLimitWarningMessage } from './sessionLimit';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
 import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
+import { annotateCreativeCta, ctaNoteForRequested, requestedCtaForStored, withAnnotatedCreativeCta } from '../utils/metaCtaAliases';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
@@ -3586,7 +3597,7 @@ export class AgentModeService {
     // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
     // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
     modelRouting?: MessageModelRouting,
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; pausedBySessionLimit?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3676,6 +3687,22 @@ export class AgentModeService {
       // truncates the tool list to the model's maxTools. Read once per turn; a failed
       // read only loses the prioritisation, never the turn.
       const requiredToolNamesForTurn = await this.resolveScheduledRequiredToolNames(currentSession);
+
+      // ENG-2812: persisted per-session turn/spend limit. Null when off, mocked, or unreadable (fail open).
+      // Notices are in-app chat only: shown on runs from the chat controller (persistIncrementally), never on
+      // unattended runs or Slack sessions, whose replies leave the app.
+      const sessionLimit = mockMode ? null : await startSessionLimitForRun({
+        sessionId,
+        userId,
+        messageContent,
+        isUnattendedRun,
+        warningsAllowed: persistIncrementally && !(currentSession?.pageIdentifier || '').toLowerCase().includes('slack'),
+        // A share-link visitor's "continue" is not the owner's word. This flag reaches the forked worker (an in-process marker
+        // would not) and is false for the owner on their own link.
+        isShareVisitor: isInteractiveShare === true,
+      });
+      const sessionLimitUnattended = isUnattendedRun === true;
+      let pausedBySessionLimit = false;
 
       let content = '';
       const toolCalls: any[] = [];
@@ -3957,15 +3984,28 @@ export class AgentModeService {
           break;
         }
 
+        // ENG-2812: the session's limit window is used up — stop before another model call and wait for
+        // the person to reply "continue" (an unattended run stays paused until someone does).
+        // `content` is emptied so the post-loop reply rewriters leave it alone; the pause text is set
+        // just before the reply is persisted.
+        if (sessionLimit?.reached()) {
+          content = '';
+          pausedBySessionLimit = true;
+          break;
+        }
+
         iteration++;
 
         // Step budget awareness: inject a reminder when approaching the limit so the LLM
         // can self-regulate (prefer batch ops, skip unnecessary pages, wrap up early).
         const remaining = maxIterations - iteration;
         if (remaining <= 10 && remaining > 0) {
-          const urgency = remaining <= 3
+          const urgency = (remaining <= 3
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
-            : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
+            : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`) +
+            // ENG-3147: name the scheduled run's still-uncalled required tools (in both the
+            // urgent and normal reminder) so the remaining steps go to the deliverable.
+            requiredToolsBudgetNote(uncalledRequiredTools(requiredToolNamesForTurn, toolCalls));
           // Opslane 2026-10-13: in-turn control text is role 'system' (as ENG-763 did for
           // the cross-turn loop-breaker) — as 'user' the model attributes it to the user.
           (messages as any[]).push({ role: 'system', content: urgency });
@@ -4381,6 +4421,19 @@ export class AgentModeService {
         // This prevents blocking the main thread during long-running generateResponse operations
         await new Promise(resolve => setImmediate(resolve));
 
+        // ENG-2812: what this completed call cost, by the ledger's rule with the metering path's usage
+        // normalization (cache reads reported only in prompt_tokens_details are not priced as fresh input).
+        const turnCostUsd = () => {
+          const usage: any = (response as any)?.usage;
+          if (!usage) return 0;
+          const n = normalizeCallUsageTokens(usage, 'openrouter');
+          return shadowTurnCostUsd(usage, this.estimateCost(
+            llmModel, n.inputTokens, n.outputTokens, n.cacheReadTokens, n.cacheWriteTokens, usage.cache_creation_by_ttl,
+          ));
+        };
+        // ENG-2812: count the call against the session's persisted limit before any post-call exit (Stop included).
+        if (sessionLimit) await sessionLimit.recordTurn(turnCostUsd());
+
         // Check cancellation after the LLM returns — for single-shot responses the pre-iteration
         // check fires before the LLM call starts, so a Stop that arrives mid-call is only visible here.
         if (isCancelled?.()) {
@@ -4413,18 +4466,7 @@ export class AgentModeService {
           userId,
           billingUserId,
           isScheduled: isScheduledSession,
-          costUsd: () => {
-            const usage: any = (response as any)?.usage;
-            if (!usage) return 0;
-            return shadowTurnCostUsd(usage, this.estimateCost(
-              llmModel,
-              Number(usage.prompt_tokens) || 0,
-              Number(usage.completion_tokens) || 0,
-              Number(usage.cache_read_input_tokens) || 0,
-              Number(usage.cache_creation_input_tokens) || 0,
-              usage.cache_creation_by_ttl,
-            ));
-          },
+          costUsd: turnCostUsd,
         });
 
         // Extract content - handle both string and array formats (Claude returns array)
@@ -5672,6 +5714,15 @@ export class AgentModeService {
         content = buildIterationLimitReport(content, toolCalls);
       }
 
+      if (pausedBySessionLimit && sessionLimit) {
+        content = sessionLimit.pauseMessage(sessionLimitUnattended);
+      }
+      // ENG-2812: a one-time 75%/90% notice claimed during this run, appended to the reply (in-app chat only).
+      const sessionLimitWarning = !wasCancelled && !pausedBySessionLimit ? sessionLimit?.dueWarning() : undefined;
+      if (sessionLimitWarning) {
+        content = `${content}\n\n${sessionLimitWarningMessage(sessionLimitWarning)}`;
+      }
+
       // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
       // content-filter and time-budget texts are assigned to `content` after the
       // model's own (often empty) message was already appended, so the transcript
@@ -5688,7 +5739,8 @@ export class AgentModeService {
           && lastResponse.role === 'assistant'
           && !(Array.isArray(lastResponse.tool_calls) && lastResponse.tool_calls.length > 0)
           && persistedTail.length > persistedResponseCount;
-        if (lastIsUnflushedTextAnswer) {
+        // ENG-2812: a session-limit pause is always its own message, never written over the model's text.
+        if (lastIsUnflushedTextAnswer && !pausedBySessionLimit) {
           if (lastResponse.content !== content) lastResponse.content = content;
         } else {
           (messages as any[]).push({
@@ -5731,6 +5783,9 @@ export class AgentModeService {
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
             ...(truncatedByStepBudget && !wasCancelled ? { iterationLimitReached: true } : {}),
+            // ENG-2812: machine-readable marks for the session-limit pause and notices.
+            ...(pausedBySessionLimit && sessionLimit ? { sessionLimitPaused: { ...sessionLimit.usage(), ...sessionLimit.caps } } : {}),
+            ...(sessionLimitWarning ? { sessionLimitWarning } : {}),
             ...(citations.length > 0 ? { citations } : {}),
             // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
             // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
@@ -5776,6 +5831,8 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
+        // ENG-2812: the run stopped at the session limit; callers must not auto-continue it.
+        ...(pausedBySessionLimit ? { pausedBySessionLimit: true } : {}),
         ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
         ...(pendingApprovalDeck ? { pendingApprovalDeck } : {})
       };
@@ -6213,7 +6270,7 @@ export class AgentModeService {
         // flow at /onboarding/v2. That flow is a separate brand-build status machine (a
         // "regular" session with NO work plan) and never reaches this code. An earlier
         // hypothesis that this guard could stall onboarding was based on that wrong premise.
-        workPlanContent += `⚠️ AUTOCOMPLETE MODE: This plan runs hands-off — do NOT pause to ask the user to approve or confirm a step. After performing a step's work, immediately call set_work_plan_status to complete it and move on. If information is missing, recover it using your tools (e.g. read_brand_guidelines, read_market_strategy) or earlier session content; if it is still missing, proceed with reasonable defaults rather than blocking. Never leave a step pending waiting on the user.\n\n`;
+        workPlanContent += `⚠️ AUTOCOMPLETE MODE: This plan runs hands-off — do NOT pause to ask the user to approve or confirm a step. After performing a step's work, immediately call set_work_plan_status to complete it and move on. If information is missing, recover it using your tools (e.g. read_brand_guidelines, read_market_strategy) or earlier session content; if it is still missing, proceed with reasonable defaults rather than blocking. Exception: a missing required API key cannot be defaulted; keep the affected step pending, call set_work_plan_status to record reason=no_key in notes, and report the prerequisite without claiming completion. Never leave a step pending waiting on the user except for this explicit prerequisite failure.\n\n`;
       } else {
         // Production-parity path (Emma): the ORIGINAL autocomplete wording, unchanged
         // from origin/main, so Emma's output does not drift.
@@ -7713,6 +7770,16 @@ export class AgentModeService {
     socketEmit?: ToolDispatchPorts['socketEmit'];
   }): ToolDispatchPorts {
     return {
+      // ENG-3170: the early refusal of a share-link visitor asks whether the link has FULL CONTROL (an explicit choice, on a link that is still
+      // live); any failure to read means no.
+      shareLinkFullControl: async (sessionId: string) => {
+        try {
+          const record = await chatbotDb.getChatSessionRecord(sessionId, true);
+          return interactiveShareControl(record?.interactiveShareMetadata).full;
+        } catch {
+          return false;
+        }
+      },
       evaluateAgentToolPolicy,
       validateAndRepairToolArgs,
       getToolInputSchema: (toolName: string) => {
@@ -10111,19 +10178,55 @@ export class AgentModeService {
   private async scheduledRunRestriction(
     toolName: string,
     sessionId: string,
-    extraContext?: Record<string, any>
+    extraContext?: Record<string, any>,
+    args?: unknown,
+    nameOnly: boolean = false,
   ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
+    // ENG-3170: a browser step of an unattended run asks whether its schedule is marked; a run makes many such steps, so a settled answer is kept for a
+    // minute (an unreadable schedule is never kept). Only the browser question is kept: the schedule-write and sensitive-call questions are asked every time.
+    const browserQuestion = extraContext?.isUnattendedRun === true && isBrowserAutomationTool(toolName) && !SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    if (browserQuestion && sessionId) {
+      const kept = this.browserProvenanceAnswers.get(sessionId);
+      if (kept && kept.until > Date.now()) return kept.answer;
+    }
+    const answer = await this.scheduledRunRestrictionRead(toolName, sessionId, extraContext, args, nameOnly);
+    if (browserQuestion && sessionId && !answer.unsettled && answer.refusal === null) {
+      this.browserProvenanceAnswers.set(sessionId, { until: Date.now() + 60_000, answer });
+      while (this.browserProvenanceAnswers.size > 500) {
+        const oldest = this.browserProvenanceAnswers.keys().next().value;
+        if (oldest === undefined) break;
+        this.browserProvenanceAnswers.delete(oldest);
+      }
+    }
+    return answer;
+  }
+
+  private browserProvenanceAnswers = new Map<string, { until: number; answer: { refusal: string | null; profile?: RestrictionProfileId } }>();
+
+  private async scheduledRunRestrictionRead(
+    toolName: string,
+    sessionId: string,
+    extraContext?: Record<string, any>,
+    args?: unknown,
+    nameOnly: boolean = false,
+  ): Promise<{ refusal: string | null; profile?: RestrictionProfileId; unsettled?: boolean }> {
     const unrestricted = { refusal: null };
     if (!sessionId) return unrestricted;
     // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
     if (extraContext?.restrictionProfile) return unrestricted;
-    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) !== null;
-    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) !== null;
+    // ENG-3170: a browser tool of an UNATTENDED run is asked too, because the browser starts from the owner's saved logins: a schedule a visitor wrote
+    // must not borrow them. Only the cookie rule listens (browser tools are not refused by this profile), so a schedule that cannot be read still gets its
+    // browser step, just without the owner's logins.
+    const browserOfUnattendedRun = extraContext?.isUnattendedRun === true && isBrowserAutomationTool(toolName);
+    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName) || browserOfUnattendedRun;
     if (!refusedByProfile && !carriesClaim) return unrestricted;
 
     const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
     // What "could not be verified" means for THIS caller: refused if it is an unattended run, otherwise left alone.
-    const whenUnverifiable = extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
+    const browserOnly = browserOfUnattendedRun && !refusedByProfile && !SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    const withoutOwnerLogins = { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE as RestrictionProfileId, unsettled: true };
+    const whenUnverifiable = extraContext?.isUnattendedRun === true ? (browserOnly ? withoutOwnerLogins : unverifiable) : unrestricted;
 
     let session: any;
     try {
@@ -10159,7 +10262,7 @@ export class AgentModeService {
       } catch (scheduleError) {
         // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
         console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
-        return unverifiable;
+        return browserOnly ? withoutOwnerLogins : unverifiable;
       }
     }
     // A deleted schedule: an unattended run cannot be shown to be the owner's; an owner reopening the old session is not a run.
@@ -10168,24 +10271,128 @@ export class AgentModeService {
     if (readScheduleProvenance(schedule.provenance).length === 0) return unrestricted;
 
     if (refusedByProfile) {
+      // ENG-3170: publishing from a visitor-made schedule is already withheld, with its own wording (and the instruction not to send the
+      // owner to a setting that cannot lift it), by blockedByScheduledPublishApproval further down executeTool. A tool that is refused
+      // ONLY by the sensitive rule and is a publish call is left to that answer, so its guidance is not replaced by the general one.
+      if (isExternalContentPublish(toolName, args) && !isRefusedByScheduleBlockList(toolName, ADMIN_SKILL_TOOL_NAMES)) return unrestricted;
       console.warn(`AgentMode ENG-2816: refused ${toolName} in session ${sessionId}: schedule ${scheduleId} carries visitor provenance [${readScheduleProvenance(schedule.provenance).join(', ')}].`);
-      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) };
+      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) };
     }
     return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
   }
 
+  /** ENG-3170: does this schedule email results to anyone (the recipients stored on it)? Consistent read, one retry; a schedule that cannot be read counts as yes. A schedule that is not there counts as no (the tool answers not found). */
+  private async scheduleEmailsOthers(scheduleId: string, ownerUserId?: string): Promise<boolean> {
+    let schedule: any;
+    try {
+      schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+    } catch (firstError) {
+      try {
+        schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      } catch (retryError) {
+        console.error(`AgentMode ENG-3170: could not read schedule ${scheduleId} to see who it emails; refusing the edit:`, retryError);
+        return true;
+      }
+    }
+    // Every stored format (a list, a bare address, a JSON list in text), and not the owner's own address: new schedules default to it, and results that go
+    // to the owner reach nobody else.
+    const recipients = normalizeEmailList(schedule?.emailNotifications).map((address) => address.toLowerCase());
+    if (recipients.length === 0) return false;
+    let ownerEmail = '';
+    try {
+      ownerEmail = String((ownerUserId ? await userDb.getUserById(ownerUserId) : undefined)?.email ?? '').trim().toLowerCase();
+    } catch (userError) {
+      console.warn(`AgentMode ENG-3170: could not read the owner's address to tell their own results from others':`, userError);
+    }
+    return recipients.some((address) => address !== ownerEmail);
+  }
+
+  /**
+   * ENG-3170: did the owner turn on FULL CONTROL for the share link this session belongs to? (A visitor-made schedule has no link and
+   * is judged in `restrictionRefusal`.) Only a call under the `share_visitor` profile to a tool that depends on it pays for the read;
+   * the owner, an ordinary session and every other tool are untouched. The read is consistent, so an owner switching a link off
+   * takes effect on the next call, and it fails closed: a session that cannot be read (after one retry) or is gone refuses, because
+   * running one of these as the owner on an unverified link is the hole this closes.
+   */
+  private async readShareLinkControl(toolName: string, sessionId: string): Promise<{ sensitive: boolean; full: boolean }> {
+    let session: any;
+    if (sessionId) {
+      try {
+        session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      } catch (firstError) {
+        try {
+          session = await chatbotDb.getChatSessionRecord(sessionId, true);
+        } catch (retryError) {
+          console.error(`AgentMode ENG-3170: could not read session ${sessionId} to check the share link setting for ${toolName}; refusing:`, retryError);
+          throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
+        }
+      }
+    }
+    if (!session) throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
+    return interactiveShareControl(session.interactiveShareMetadata);
+  }
+
+  /**
+   * ENG-3170: the restriction a tool call runs under reaches the calls that tool makes ITSELF. A tool that drives the browser for the model
+   * (open_site_signin, solve_captcha, coding_agent) calls `executeTool` again for each browser step, with no extra context, so the nested
+   * call used to look like the owner's. Chat turns run in a forked worker, so a per-process marker of "a visitor's turn" cannot see this;
+   * a call-scoped store can, in any process and for voice. A nested call with no restriction of its own inherits the one it was made
+   * from; one that carries its own keeps it.
+   */
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    const own = normalizeRestrictionClaim(extraContext?.restrictionProfile);
+    const outer = toolCallRestrictionStore.getStore();
+    const inherited = own ? undefined : outer?.restrictionProfile;
+    const profile = own ?? inherited;
+    // A call made while another restricted call is running is NESTED (a tool acting for the visitor with code of its own, such as solve_captcha); a call the
+    // model or the visitor makes directly is not. Set here and never taken from the caller's context.
+    const nested = outer !== undefined;
+    // The flag is never taken from the caller: with no profile it is dropped, with one it is set from the call stack.
+    const { nestedInRestrictedCall: _callerClaim, ...callerContext } = (extraContext ?? {}) as Record<string, any>;
+    const context = profile ? { ...callerContext, ...(inherited ? { restrictionProfile: inherited } : {}), nestedInRestrictedCall: nested } : (extraContext ? callerContext : extraContext);
+    if (!profile) return this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context);
+    // `withinVisitorCall` stays true for everything nested under a visitor's call, even when a nested call carries a profile of its own.
+    const withinVisitorCall = profile === 'share_visitor' || outer?.withinVisitorCall === true;
+    return toolCallRestrictionStore.run({ restrictionProfile: profile, withinVisitorCall }, () =>
+      this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context));
+  }
+
+  private async executeToolUnderProfile(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
     // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
     // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
-    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
+    // ENG-3170: before argument repair only what depends on the tool NAME is judged (the block list, and a tool that is sensitive whatever
+    // its arguments). A tool judged by an argument (an email's action, a HubSpot action) is judged below, on the arguments it will run
+    // with, so a read that the model spelled in a shape repair understands is not refused for looking like something else.
+    const isShareVisitor = normalizeRestrictionClaim(extraContext?.restrictionProfile) === 'share_visitor';
+    // A visitor's call to a tool that depends on the link (the sensitive tools, the block list, connect_account) reads the link once.
+    const linkControl = isShareVisitor && isFullControlGatedWholeTool(toolName) ? await this.readShareLinkControl(toolName, sessionId) : { sensitive: false, full: false };
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, undefined, { nameOnly: true, linkAllowsFullControl: linkControl.full });
     if (restricted) throw new ToolRestrictionDenied(restricted);
+    // ENG-3170: a visitor may run a SENSITIVE tool (delete data, send or post outside the account, change ad spend, disconnect an
+    // account, use saved logins) only on a link whose owner turned on full control. Never taken from the request.
+    if (isShareVisitor && isSensitiveWholeTool(toolName) && !linkControl.sensitive) {
+      console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
+      throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+    }
     // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
     // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
-    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext);
+    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext, undefined, true);
     if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
     if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
+    // ENG-3170: a visitor who may not run the sensitive tools may not call the tool that runs their code on the server (see isServerSideBrowserCodeTool). A
+    // nested call by a tool with fixed code is allowed; a link that allows the sensitive tools (ON, legacy dialog link) keeps it, as the owner has it.
+    if (isServerSideBrowserCodeTool(toolName) && extraContext?.nestedInRestrictedCall !== true) {
+      const inVisitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+      if (isShareVisitor || inVisitorSchedule) {
+        const linkAllows = isShareVisitor && await this.readShareLinkControl(toolName, sessionId).then((control) => control.sensitive, () => false);
+        if (!linkAllows) {
+          console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: it runs the caller's code on the server, and the owner has not turned on full control.`);
+          throw new ToolRestrictionDenied(inVisitorSchedule ? sensitiveActionScheduleRefusal(toolName) : sensitiveActionRefusal(toolName));
+        }
+      }
+    }
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -10214,6 +10421,49 @@ export class AgentModeService {
     }
 
     const preparedArgs = contractResult.args;
+    // ENG-3170: a direct browser call by a visitor who may not run the sensitive tools may not name a file to write or to upload (see browserCallTouchesServerFiles).
+    if (isBrowserAutomationTool(toolName) && extraContext?.nestedInRestrictedCall !== true && (browserCallTouchesServerFiles(preparedArgs) || browserCallTouchesServerFiles(args))) {
+      const inVisitorScheduleNow = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+      if (isShareVisitor || inVisitorScheduleNow) {
+        const linkAllows = isShareVisitor && await this.readShareLinkControl(toolName, sessionId).then((control) => control.sensitive, () => false);
+        if (!linkAllows) {
+          console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: it names a file on the server, and the owner has not turned on full control.`);
+          throw new ToolRestrictionDenied(inVisitorScheduleNow ? sensitiveActionScheduleRefusal(toolName) : sensitiveActionRefusal(toolName));
+        }
+      }
+    }
+    // ENG-3170: a tool judged by an argument is judged here, on the arguments the tool will actually run with (repair hoists a nested
+    // wrapper, renames an alias, turns a GET shape into an action), as the publish-approval check below does. The checks above ran by
+    // name; for a sensitive call they run again with the arguments. A tool that is sensitive whatever its arguments was settled above.
+    if (!isFullControlGatedWholeTool(toolName)) {
+      const sensitiveCall = isSensitiveToolCall(toolName, preparedArgs);
+      // A Meta write is sensitive only in a run of a schedule a visitor wrote (an unattended run stages it for an approver who is not the owner):
+      // in a visitor's own chat it halts into a deck only the owner can answer, so the link is not asked about it.
+      if (sensitiveCall || isSensitiveInVisitorScheduleCall(toolName, preparedArgs)) {
+        if (sensitiveCall) {
+          const refusedByArgument = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
+          if (refusedByArgument) throw new ToolRestrictionDenied(refusedByArgument);
+          if (isShareVisitor && !(await this.readShareLinkControl(toolName, sessionId)).sensitive) {
+            console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
+            throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+          }
+        }
+        const scheduledByArgument = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
+        if (scheduledByArgument.refusal) throw new ToolRestrictionDenied(scheduledByArgument.refusal);
+      }
+    }
+    // ENG-3170: a visitor rewriting the prompt, keywords or variables of one of the owner's schedules that already emails OTHER people would have AgentWeb
+    // send their text to those people (the visitor mark limits the tools a run may use, not who receives its output). Only on a link that may not run the
+    // sensitive tools; a schedule that emails nobody else stays editable. An unreadable schedule refuses.
+    // This also holds for a run of a schedule a visitor wrote (it carries the schedule profile, and has no link that could allow it).
+    const inVisitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+    if (isShareVisitor || inVisitorSchedule) {
+      const editedScheduleId = scheduleContentEditTarget(toolName, preparedArgs);
+      if (editedScheduleId && !(isShareVisitor && (await this.readShareLinkControl(toolName, sessionId)).sensitive) && await this.scheduleEmailsOthers(editedScheduleId, userId)) {
+        console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: schedule ${editedScheduleId} emails other people and the link has not been given full control.`);
+        throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+      }
+    }
     const policyDecision = evaluateAgentToolPolicy({
       toolName,
       args: preparedArgs,
@@ -10255,10 +10505,25 @@ export class AgentModeService {
         const autoDeps = {
           runTool: (name: string, toolArgs: any) => this.toolRegistry.execute(name, toolArgs ?? {}, cookieCtx),
         };
-        await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
-        const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
+        // ENG-3170: the owner's saved browser sessions are saved logins. A share-link visitor's browser starts from them (and writes its own
+        // cookies back over them) only on a link the owner has let run the sensitive tools; otherwise it browses as nobody. A link that
+        // cannot be read counts as not allowed: the browser tool itself still runs, it just does not borrow the owner's logins.
+        // "Visitor" is decided from the TURN as well as from the caller's claim: a tool that drives the browser for the model (open_site_signin,
+        // solve_captcha, coding_agent) calls executeTool without forwarding the claim, and that nested call is still the visitor's turn.
+        // A nested call that carries a profile of its own, inside a visitor's scope, is still inside that visitor's call (`withinVisitorCall`).
+        // A scheduled run of a schedule a visitor wrote (scheduledRunRestriction hands back its profile for a browser tool of an unattended run) has no
+        // link to ask: it never borrows the owner's logins until the owner adopts the schedule.
+        const visitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+        const visitorCall = isShareVisitor || visitorSchedule || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
+        const borrowOwnerLogins = !visitorCall || (!visitorSchedule && await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false));
+        // A visitor who may not use the owner's logins also gets a BROWSER of their own. A chat session's browser is pooled for the whole session (an hour idle)
+        // under the owner's id, so a shared one would be driven by the visitor with the cookies the owner's turn loaded (browser_evaluate can read them), and
+        // any hand-over between the two has a window. Their own pool (`<session>::visitor`) has no owner's logins in it, ever, and nothing to hand over.
+        const browserCtx = borrowOwnerLogins ? cookieCtx : { ...cookieCtx, browserPoolSessionId: `${sessionId}::visitor` };
+        if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
+        const result = await this.toolRegistry.execute(toolName, preparedArgs, browserCtx);
         const toolFailed = result && (result as any).success === false;
-        if (!toolFailed && shouldPersistAfterBrowserTool(toolName)) {
+        if (!toolFailed && borrowOwnerLogins && shouldPersistAfterBrowserTool(toolName)) {
           await autoSaveCookies(this.browserCookieAutoState, sessionId, autoDeps);
         }
         await recordToolReliabilityEvent({
@@ -10802,8 +11067,8 @@ export class AgentModeService {
     return leadsImpl.searchLeads(listId, filters, userId, limit, options);
   }
 
-  public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
-    return leadsImpl.getLeadDetails(listId, leadId, userId);
+  public async getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number; recoverStaleList?: boolean }): Promise<any> {
+    return options ? leadsImpl.getLeadDetails(listId, leadId, userId, options) : leadsImpl.getLeadDetails(listId, leadId, userId);
   }
 
   public async getLeadsNeedingFollowup(listId: string, userId: string, options: {
@@ -10877,15 +11142,18 @@ export class AgentModeService {
     return leadsImpl.deleteLeadList(listId, userId);
   }
 
-  public async getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number): Promise<any> {
-    return leadsImpl.getLeadEngagements(listId, leadId, userId, limit);
+  public async getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number, options?: { maxContentFetches?: number }): Promise<any> {
+    return options ? leadsImpl.getLeadEngagements(listId, leadId, userId, limit, options) : leadsImpl.getLeadEngagements(listId, leadId, userId, limit);
   }
 
   public async addLeadEngagement(
     listId: string, leadId: string, eventType: string,
-    userId: string, eventData?: any, eventDate?: string
+    userId: string, eventData?: any, eventDate?: string,
+    agentLimits?: leadsImpl.AgentEngagementLimits,
   ): Promise<any> {
-    return leadsImpl.addLeadEngagement(listId, leadId, eventType, userId, eventData, eventDate);
+    return agentLimits
+      ? leadsImpl.addLeadEngagement(listId, leadId, eventType, userId, eventData, eventDate, agentLimits)
+      : leadsImpl.addLeadEngagement(listId, leadId, eventType, userId, eventData, eventDate);
   }
 
   public async sendEmailToLead(listId: string, leadId: string, userId: string): Promise<any> {
@@ -11980,8 +12248,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   // --- Unified Meta Ads Manager Methods ---
-  public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
+      case 'GET':
+        // GET is advertised (the Zoma toolkit's read actions include it) but had no case here, so a
+        // single-campaign read threw "Invalid action: GET" and reached the caller as a bare
+        // "Meta Toolkit call failed.". A GET is the id-scoped LIST read.
+        if (!campaign_id) throw new Error('campaign_id is required for CAMPAIGN GET (use LIST to read every campaign).');
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: AgentModeService.optionalScopeId(campaign_id, 'campaign_id'), fields: params?.fields });
       case 'LIST':
         // Thread the campaign_id filter and any explicit fields selection so the caller can
         // read budget/bid config and target a single campaign (ENG-398).
@@ -12000,8 +12274,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
-  public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
+      case 'GET':
+        // Same gap as CAMPAIGN GET: the id-scoped LIST read.
+        if (!ad_set_id) throw new Error('ad_set_id is required for AD_SET GET (use LIST to read every ad set).');
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: AgentModeService.optionalScopeId(ad_set_id, 'ad_set_id'), fields: params?.fields });
       case 'LIST':
         // Thread the ad_set_id target and any explicit fields selection so the caller can
         // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
@@ -12101,7 +12379,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           message: creative?.name
             ? `Fetched the requested ad creative "${creative.name}".`
             : `Fetched the requested ad creative.`,
-          creative,
+          creative: annotateCreativeCta(creative),
         };
       }
       case 'PREVIEW': {
@@ -12129,8 +12407,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'GET' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
+      case 'GET': {
+        // Same gap as CAMPAIGN GET: GET had no case, so it threw "Invalid action: GET".
+        if (!ad_id) throw new Error('ad_id is required for AD GET (use LIST to read every ad).');
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        try {
+          const ad = withAnnotatedCreativeCta(await metaService.getAd(accessToken, ad_id, accountId));
+          return { success: true, message: `Ad ${ad_id}`, ad } as any;
+        } catch (error: any) {
+          if (error?.isMetaAuthError) throw error;
+          const detail = describeMetaError(error, `Could not read ad ${ad_id}.`);
+          return { success: false, message: detail, error: detail } as any;
+        }
+      }
       case 'LIST':
         // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
         // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
@@ -12236,7 +12527,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           body: params.body || vd.message || creativeData.body || '',
           title: params.title || vd.title || creativeData.title || '',
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
-          call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+          call_to_action_type: params.call_to_action_type || requestedCtaForStored('video_data', vd.call_to_action?.type),
           url_tags: carriedUrlTags,
           ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
@@ -12346,7 +12637,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'copy Meta ad'),
-        error: error.message,
+        error: this.metaFailureText(error, 'copy Meta ad'),
         details: error.structuredError,
         code: error?.status ?? error?.response?.status
       };
@@ -12713,7 +13004,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad campaign'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad campaign'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -12906,7 +13197,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
 
       // 4. Bidding Strategy rules
-      const strategy = args.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
+      // Under Advantage Campaign Budget (CBO) the bid strategy lives on the CAMPAIGN (ENG-2364 sets
+      // it there) and the ad set inherits it. Injecting our own default on the ad set sent a second,
+      // possibly conflicting strategy that Meta answers with a bare "Invalid parameter" at create
+      // time — after a preview that never calls Meta looked fine. So under CBO the ad set only
+      // carries a bid_strategy the caller explicitly chose; validation uses the effective one.
+      const sendBidStrategy = !campaignHasBudget || args.bid_strategy !== undefined;
+      const strategy = args.bid_strategy || (campaignHasBudget && campaign.bid_strategy) || 'LOWEST_COST_WITHOUT_CAP';
       if (strategy === 'LOWEST_COST_WITH_MIN_ROAS') {
         throw new Error('ROAS bidding (LOWEST_COST_WITH_MIN_ROAS) is not yet supported.');
       }
@@ -12920,8 +13217,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       if (strategy === 'LOWEST_COST_WITHOUT_CAP' && args.bid_amount !== undefined) {
         throw new Error('bid_amount must not be provided for LOWEST_COST_WITHOUT_CAP strategy.');
       }
-      if ((strategy === 'LOWEST_COST_WITH_BID_CAP' || strategy === 'COST_CAP') && args.bid_amount === undefined) {
-        throw new Error(`bid_amount is required for ${strategy} strategy.`);
+      // A cap inherited from a CBO campaign carries its own bid on the campaign; only a cap the
+      // caller set on this ad set needs an ad-set bid_amount.
+      if ((args.bid_strategy === 'LOWEST_COST_WITH_BID_CAP' || args.bid_strategy === 'COST_CAP') && args.bid_amount === undefined) {
+        throw new Error(`bid_amount is required for ${args.bid_strategy} strategy.`);
       }
 
       // Bid amount min/max guard
@@ -12992,7 +13291,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
 
       const money = await this.normalizeMetaMoneyParams(accountId, accessToken, args);
-      const normalizedParams: MetaAdsAdSetParams = { ...money.params, bid_strategy: strategy };
+      const normalizedParams: MetaAdsAdSetParams = { ...money.params };
+      if (sendBidStrategy) normalizedParams.bid_strategy = strategy;
+      else delete normalizedParams.bid_strategy;
 
       const optimisationEventWarning = await this.buildMetaOptimisationEventWarning(
         accessToken,
@@ -13034,7 +13335,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
 
       const expected: Array<[string, any]> = [
-        ['bid_strategy', strategy],
+        ['bid_strategy', normalizedParams.bid_strategy],
         ['bid_amount', normalizedParams.bid_amount],
         ['daily_budget', normalizedParams.daily_budget],
         ['lifetime_budget', normalizedParams.lifetime_budget],
@@ -13063,7 +13364,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           applied: asComparable(readBack?.[parameter])
         }))
         .filter(m => m.requested !== m.applied &&
-          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)));
+          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)) &&
+          // Under a campaign budget (CBO) the bid strategy lives on the campaign, so the
+          // ad set reads it back as null even when Meta applied it: not a mismatch.
+          !(m.parameter === 'bid_strategy' && campaignHasBudget && m.applied === null));
 
       if (readBackMismatches.length > 0) {
         const detail = readBackMismatches
@@ -13094,7 +13398,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad set'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad set'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -13181,7 +13485,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
-      const creatives = result?.creatives ?? [];
+      const creatives = (result?.creatives ?? []).map(annotateCreativeCta);
 
       return buildListResult({
         payloadKey: 'creatives',
@@ -13338,12 +13642,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             err instanceof Error ? err.message : err);
         }
       }
+      // Meta has been observed rewriting some CTAs on video creatives (BOOK_NOW → BOOK_TRAVEL); say so up front so a
+      // later read-back showing the stored type is not mistaken for a wrong write.
+      const isVideoCreative = !!resolvedParams.video_id && !resolvedParams.placement_assets?.length
+        && !MetaService.isMultiVariantCreative(resolvedParams);
+      const ctaNote = isVideoCreative ? ctaNoteForRequested('video_data', resolvedParams.call_to_action_type) : undefined;
       if (unappliedFields.length > 0) {
         return {
           success: true,
           verified: false,
           unapplied_fields: unappliedFields,
           message: buildUnappliedFieldsMessage(creative, requestedFields, unappliedFields),
+          ...(ctaNote ? { cta_note: ctaNote } : {}),
           creative: creative
         };
       }
@@ -13353,6 +13663,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: `Ad creative "${creative.name}" created successfully` +
           (readbackUnavailable ? ' (could not read it back to confirm description / instagram_user_id were stored)' : ''),
         ...(readbackUnavailable ? { readback_unavailable: true } : {}),
+        ...(ctaNote ? { cta_note: ctaNote } : {}),
         creative: creative
       };
     } catch (error: any) {
@@ -13361,7 +13672,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad creative'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad creative'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -13373,7 +13684,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
-      const ads = result?.ads ?? [];
+      const ads = (result?.ads ?? []).map(withAnnotatedCreativeCta);
 
       // Message shape and field order both live in agentMode/metaListScope.ts — see that module
       // for why completeness must precede the payload (the S3 preview cut).
@@ -13423,7 +13734,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -13504,7 +13815,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad campaign'),
-        error: error.message,
+        error: this.metaFailureText(error, 'update Meta ad campaign'),
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
       };
@@ -13562,7 +13873,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad set'),
-        error: error.message,
+        error: this.metaFailureText(error, 'update Meta ad set'),
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
       };
@@ -13693,7 +14004,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad'),
-        error: error.message,
+        error: this.metaFailureText(error, 'update Meta ad'),
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
       };
@@ -13771,7 +14082,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
         title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
         link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || requestedCtaForStored('video_data', vd.call_to_action?.type) || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
@@ -13788,7 +14099,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+        call_to_action_type: params.call_to_action_type || requestedCtaForStored('video_data', vd.call_to_action?.type),
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
@@ -14369,11 +14680,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         if (code === 10) {
           return `Permission error: ${error.structuredError?.error_user_msg || originalMsg} — check that the entity IDs were obtained via LIST operations and not manually provided.`;
         }
-        if (error.structuredError?.error_user_msg) {
-          return `${error.structuredError.error_user_msg} (Meta code ${code}${subcode ? `, subcode ${subcode}` : ''})`;
-        }
-        return originalMsg;
+        // Meta's top-level message is often a bare "Invalid parameter"; the field at fault is only
+        // named in error_user_title / error_user_msg / error_subcode, so all of them are kept.
+        return describeMetaError(error, originalMsg);
     }
+  }
+
+  /**
+   * The `error` text of a failed Meta write result — the field the model and the Zoma toolkit
+   * actually read (utils/toolResultError reads `error` before `message`). It used to be the
+   * SDK's bare `error.message` ("Invalid parameter"), dropping every field that says what to fix.
+   */
+  private metaFailureText(error: any, context: string): string {
+    const enriched = this.enrichMetaError(error, context);
+    const detail = describeMetaError(error, enriched);
+    return enriched === detail || enriched.includes(detail) ? enriched : `${enriched} [Meta: ${detail}]`;
   }
 
   /**
@@ -14400,6 +14721,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           MetaService.assertValidSpendCap(params?.spend_cap);
         } else if (action === 'DELETE' && !campaign_id) {
           throw new Error('CAMPAIGN DELETE requires "campaign_id".');
+        } else if (action === 'GET' && !campaign_id) {
+          throw new Error('CAMPAIGN GET requires "campaign_id" (use LIST to read every campaign).');
         }
         break;
 
@@ -14410,6 +14733,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           throw new Error('AD_SET UPDATE requires "ad_set_id".');
         } else if (action === 'DELETE' && !ad_set_id) {
           throw new Error('AD_SET DELETE requires "ad_set_id".');
+        } else if (action === 'GET' && !ad_set_id) {
+          throw new Error('AD_SET GET requires "ad_set_id" (use LIST to read every ad set).');
         }
         break;
 
@@ -14439,6 +14764,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         } else if (action === 'RETAG_UTM' && !ad_id) {
           throw new Error('AD RETAG_UTM requires "ad_id".');
+        } else if (action === 'GET' && !ad_id) {
+          throw new Error('AD GET requires "ad_id" (use LIST to read every ad).');
         } else if (action === 'PREVIEW' && !ad_id) {
           throw new Error('AD PREVIEW requires "ad_id".');
         } else if (action === 'PREVIEW' && !params.ad_format) {
@@ -15633,7 +15960,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           const capped = classifyMetaBudgetChange(proposed, proposed);
           if (capped.severity !== 'unknown') return [{ field, severity: 'normal' as const, ratio: null, prior: undefined, proposed: capped.proposed }];
         }
-        return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
+        // No budget at all on a successfully read object is 0 -> new (still classified and
+        // confirmed like any increase), not unverifiable — see priorBudgetForComparison.
+        return [{ field, ...classifyMetaBudgetChange(priorBudgetForComparison(prior, field), proposed) }];
       });
       if (changes.some(change => change.severity === 'unknown')) return { blocked };
       const text = sessionId ? await this.getLastUserMessageText(sessionId) : undefined;
@@ -15970,8 +16299,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   ): Promise<any> {
     // ENG-2925 adds a bare numeric node (product / product-set read-back and parent-catalog
     // lookup) and the account's adsets edge (product-set in-use check) for the catalog writes.
-    // ENG-2927 adds the account's adspixels edge (event-source pixel ownership).
-    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules))?)$/.test(path)) {
+    // ENG-2927 adds the account's adspixels edge (event-source pixel ownership), and a pixel's
+    // stats edge (its recent event counts — fresher than last_fired_time).
+    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules|stats))?)$/.test(path)) {
       throw new Error('Unsupported catalog path.');
     }
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);

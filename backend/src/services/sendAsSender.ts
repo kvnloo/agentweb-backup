@@ -11,6 +11,7 @@
  * know which provider a sender resolves to.
  */
 
+import { recordSuccessfulSend } from './sentMessageShadow';
 import { resendService } from './resendService';
 import { getEmailProvider, bootstrapEmailProviders, type IEmailService, type SentEmailResult } from './emailProviderService';
 import { CrmSender, SenderProvider, PROVIDER_TO_PLATFORM } from './crmSenderTypes';
@@ -126,6 +127,7 @@ export async function sendAsSender(
     if (!result || !result.id) {
       throw new SenderSendError(sender, 'Resend did not return a message id — the send may have failed.');
     }
+    recordSuccessfulSend({ channel: 'email', userId, recipients: [params.to, params.cc, params.bcc].flat().filter((v): v is string => !!v), providerId: result.id, adapter: 'sendAsSender:resend' });
     return { provider: 'resend', messageId: result.id };
   }
 
@@ -142,6 +144,7 @@ export async function sendAsSender(
     headers: params.headers,
   });
 
+  recordSuccessfulSend({ channel: 'email', userId, recipients: [params.to, params.cc, params.bcc].flat().filter((v): v is string => !!v), providerId: result.messageId, adapter: `sendAsSender:${sender.senderProvider}` });
   return { provider: sender.senderProvider, messageId: result.messageId, threadId: result.threadId };
 }
 
