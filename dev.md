@@ -1,3 +1,288 @@
+## ENG-3196: Pure campaign-change risk classifier for Emma action engine (2026-11-26)
+
+Adds `backend/src/services/campaignChangeRiskPolicy.ts`, a deterministic, fail-closed, tenant-scoped classifier (execute / stage_for_approval / reject). Shadow library only; not wired into any execution path. First slice of ENG-1970.
+
+## ENG-3195: zoma_status no longer claims a card is on file when none is required (2026-11-26)
+
+`ZOMA_REQUIRE_PAYMENT_METHOD` is unset in prod by design (ENG-3131 asks for the card at first publish), and while unset `hasPaymentMethod` returns true without looking for a card. `formatZomaStatus` therefore ticked "[x] Payment method on file" for brand-new accounts with no card (seen in the Nov 26 prod signup test, relayed by Claude as "Payment: on file"). The checklist now omits the line while no card is required, and readiness carries `payment.required: false`. Card-required mode and the write gate are unchanged. Note for test runs: jest path patterns match the absolute path, so a worktree named after the ticket matches every suite; anchor patterns on `__tests__/(...)`.
+
+## ENG-2840: Log-only audit of reads through the shared Google service account (2026-11-26)
+
+- Where a caller names a Google resource that nothing proves they own, and AgentWeb's OWN Google service account then reads it:
+  `readGoogleFileById` (a `gdoc:<id>` / `gsheet:<id>` knowledge-base identifier, the `read_knowledge_base_files` MCP tool, Emma's Google file
+  reader) falls back to the service account when the caller has no Google Drive login or their own login is refused (401/403), with no check
+  that the caller owns or registered the file; the analytics readers read the GA4 property ids and Search Console domains SAVED in a user's or
+  organization's analytics config, which `analyticsConfigValidator.ts` checks for format only (GA4 property ids are plain numbers); and
+  registered Google Drive folders (`POST /api/settings/google-drive/folders` checks only that the service account can see the folder) are read
+  with the service account by the knowledge-base search, listing, reading and materializing code and by the folder-files route.
+- This change is step 1 of a two-step fix and changes nothing a customer can do: it writes one structured `shared_google_read` line per
+  configured resource per call to the application log (`services/sharedGoogleAudit.ts`): `kind` (`drive-file`, `ga4`, `gsc`), `userId`, `idHash`
+  (12 hex characters of a SHA-256 of the id; a Search Console property is first lowercased and stripped of its scheme, trailing slash and
+  `sc-domain:` prefix, so the forms of one site share a hash; this also merges an http and an https URL-prefix property and a domain property
+  of the same site, which Google treats as separate, erring toward more matches), `source` (the function or route), then when known `orgId` (analytics lines only: the
+  Drive reader does not know the caller's organization), `configSource` (`self`: the caller's
+  own config; `org`: the organization's, shared with a member), `platform` (true when the id is one of the platform's own landing-page GA4
+  properties or Search Console domains from `getLandingPagesConfig`, which deploying a landing page adds to the deployer's config; the list is
+  loaded in the background at most every 10 minutes whether or not the load works; until a load works, lines carry no `platform`, never
+  `false`), for Drive `reason` (`no_oauth`,
+  `oauth_denied`) and `outcome` (`ok`, `failed`), and `ofIds` when one call read several. Hooked in `readGoogleFileById`, the three `seoService`
+  readers, the portal's `GET /api/seo/metrics` (including the platform landing-page property it adds for a host named in `?domain=`),
+  `GET /api/seo/product-metrics`, and the GA4 probe `POST /api/seo/config/ga/test` (any numeric property id the caller names; not hooked:
+  `GET /api/seo/debug`, which reads the first configured domain that `/metrics` already logs). It never throws and never changes what a read returns or asks Google.
+- Reading the numbers: CloudWatch Logs Insights on `/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log`. The lines carry
+  a syslog prefix, so fields are parsed from `@message` (a plain `filter audit = ...` matches nothing). Resources read by several accounts,
+  the platform's own ids left out:
+  `fields @message | filter @message like /"audit":"shared_google_read"/ and @message not like /"platform":true/ | parse @message /"kind":"(?<kind>[^"]+)","userId":"(?<userId>[^"]+)","idHash":"(?<idHash>[0-9a-f]+)"/ | stats count_distinct(userId) as users, count(*) as lines by kind, idHash | sort users desc`.
+  Lines written before the platform list loaded carry no mark, so take the platform hashes out by hash as well: list them with
+  `fields @message | filter @message like /"platform":true/ | parse @message /"idHash":"(?<idHash>[0-9a-f]+)"/ | stats count(*) by idHash`.
+  A hash with several users is legitimate when they are all members of one organization: list them with
+  `fields @message | filter @message like /"idHash":"<hash>"/ | parse @message /"userId":"(?<userId>[^"]+)"/ | parse @message /"orgId":"(?<orgId>[^"]+)"/ | stats count(*) by userId, orgId`.
+  Drive lines have no `orgId`; join their userIds to organizations offline. Drive fallback use:
+  `fields @message | filter @message like /"audit":"shared_google_read"/ and @message like /"kind":"drive-file"/ | parse @message /"userId":"(?<userId>[^"]+)"/ | parse @message /"reason":"(?<reason>[^"]+)","outcome":"(?<outcome>[^"]+)"/ | stats count(*) as reads, count_distinct(userId) as users by reason, outcome`.
+  Registered Drive folders are counted from the stored registrations (user and organization `googleDriveFolders`), not from this log.
+- Known limits: a line is written per CONFIGURED id per call, also when a filter narrows the read to one id, when the read then fails, and
+  for a portal request answered 400, so `users` counts are right and `lines` overstate reads; `no_oauth` also covers a failure to build the
+  caller's Drive client, and `oauth_denied`/`failed` also covers a failure to build the service-account client; the hash keeps raw Drive file
+  ids out of the log but is not secret for GA4 property ids and domains (raw domains are already logged by the Search Console reader); the
+  line records the id used, not who owns the resource. Step 2 (enforcement: only ids the caller registered or can open with their own Google
+  login; a property or domain saved only when the customer's own Google login can see it; folders likewise) waits for these numbers, and its
+  refusal text is customer-facing copy for Harsha to review.
+- Found while auditing, pre-existing and reported separately (not changed here): the platform landing-page GA4 property and Search Console
+  domain are read without a limit to the caller's own landing-page hosts (for a host named in `?domain=`, and for every user whose config
+  received them on deploy).
+
+## ENG-2840: Provider reads for outside agents over MCP: HubSpot, Fathom, Luma, LinkedIn Ads, link scan, email lookup (2026-11-26)
+
+- Nine of Emma's tools on the MCP server for outside agents on their own account, under Emma's names. Each is a read-only subset:
+  - `call_hubspot_api`: an explicit list of 30 (entity, action) read pairs (`utils/hubspotReadArgs.ts`, shared by the tool and its route).
+  - `fathom_get_meetings` and `fathom_get_transcript`: the caller's own Fathom only.
+  - `luma_list_events` and `luma_get_guests`.
+  - `call_linkedin_ads_insights_api`: the whole ad account, broken down by `pivot` (campaign group, campaign, ad, ...).
+  - `call_linkedin_marketing_api`: AD_ACCOUNT LIST, CAMPAIGN_GROUP LIST, CAMPAIGN LIST, CREATIVE LIST, and TARGETING LIST_FACETS / SEARCH / ESTIMATE_REACH.
+  - `scan_website_links`: in-process, Emma's crawler.
+  - `find_or_lookup_email`: one email to a profile only, through the portal's own `POST /api/crm/leads/lookup-by-email` and its 50-a-day quota.
+- Same pattern as the other wave-2 tools:
+  - Arguments are checked by name and by value. Ids go raw into provider URLs (HubSpot paths, LinkedIn query strings, the Fathom path), so every id, cursor, date and enum is checked strictly.
+  - Each tool calls a new metered `/api/emma/*` route as the key's own user: `/hubspot-read`, `/fathom-meetings`, `/fathom-transcript`, `/luma-events`, `/luma-guests`, `/linkedin-ads/insights`, `/linkedin-ads/read`.
+  - The route checks the arguments again and calls Emma's own code with `req.user.userId` only.
+  - A 4xx passes through; a 5xx or no answer gets a fixed text.
+  - Answers are fixed fields, cut to about 60 KB (`truncated`).
+  - Every tool has a per-caller `CallGuard`: one call at a time, a process cap and an hourly cap.
+- Annotations: every provider read is a `write`, because it can refresh and store the owner's OAuth token or write a reconnect flag; `find_or_lookup_email` records quota use. `scan_website_links` is a `read`. None runs the agent. These tools are not exempt from the outside-content sanitizer: HubSpot records, transcripts and guest answers are third-party content.
+- No new opt-in key scopes. A `tools:execute` key can already have Emma call every one of these tools, writes included, through `emma_send_message`, so direct reads add nothing that key could not reach.
+- Bounds Emma does not have:
+  - Over MCP, HubSpot deal contacts stop at 100 (paging stops there too, `contacts_cut`), and the route applies Emma's sandbox check.
+  - LinkedIn reads are limited to 30 s per request, 5 pages, 500 elements and 10 referenced posts expanded.
+  - AD_ACCOUNT LIST over MCP returns only ad accounts the caller has connected or shared. The token alone can see every account its owner manages, including an agency's clients. When the 500-element bound cut that list, the answer says `truncated`.
+  - Over MCP the insights tool takes no campaign, creative or campaign-group filter, and there is no POST GET. On an org-shared connection
+    the owner's token can read accounts and posts that were never shared, and LinkedIn does not document that such a filter is intersected
+    with the account, so a filter id from another account could have returned that account's numbers. Breakdowns come from `pivot`.
+  - The link scan is capped at 100 pages, 500 links and 60 s, 10 an hour per caller.
+  - `include_phone` is not an input of `luma_get_guests`.
+- Shared services take new optional arguments. The default keeps Emma exactly as before:
+  - `handleHubspotApi(userId, args, options?)`.
+  - `HubSpotService.ownerUserId`.
+  - `linkedInAdsService` reads take `bounds?` (timeout, page and element caps); `callLinkedInMarketingApi` / `callLinkedInAdsInsightsApi` take a last `bounds?`.
+- Changed for Emma too:
+  - Fathom requests and the Fathom token refresh time out after 30 s with no data (they had no timeout).
+  - The link crawler's requests end at their time limit even while data still trickles in (an abort signal). Before, a slow site kept the
+    socket, and up to 1 MB, open after the scan had given up on it.
+- Not exposed:
+  - `fathom_get_onboarding_context`: AgentWeb's internal sales notes about the customer.
+  - `fathom_route_action_items`.
+  - Every HubSpot and LinkedIn write.
+  - The `find_or_lookup_email` find path: it spends AgentWeb's provider credits outside the 50-a-day gate.
+  - `/api/crm/leads/find-email`: it pools other tenants' stored emails, by its locked design.
+- Known, not changed here (Emma, pre-existing):
+  - HubSpotService puts ids raw into URL paths on writes too. A crafted `../` id could reach another object in the same portal; this is not cross-tenant.
+  - Emma's LinkedIn reads have no timeout or page cap.
+  - Emma's `find_or_lookup_email` never applies the 50-a-day gate, and its `quotaHit` flag catches the wrong error class.
+  - Luma has a per-caller budget, not a per-calendar one.
+  - A self-call wait (2 to 4 minutes) can end before a slow provider read finishes. The route then keeps running; the hourly cap still bounds it.
+- Proof: these tests, plus the inventory, annotation, route-budget and plan-route limit gates:
+  - `hubspotReadTool.test.ts`, `meetingEventReadTools.test.ts`, `linkedInAdsReadTools.test.ts`, `siteScanAndLookupTools.test.ts`.
+  - `emmaHubspotReadRoutes.test.ts`, `emmaMeetingEventRoutes.test.ts`, `emmaLinkedInAdsReadRoutes.test.ts`.
+  - `linkedInAdsReadBounds.test.ts`: the route's bounds checked through Emma's real code down to the HTTP calls.
+
+## ENG-2840: Platform landing-page analytics are read only for the caller's own pages (2026-11-26)
+
+- The problem (pre-existing, found while auditing the shared Google service account): landing pages deploy onto platform domains, and
+  their traffic is tracked in the platform's OWN GA4 properties and Search Console domain properties (`getLandingPagesConfig`: the
+  `agentwebforms.com` mapping and `additionalDomains`). Two ways let a customer read other customers' landing-page traffic through the shared
+  service account: `GET /api/seo/metrics?domain=<any managed landing host>` added the platform property and filtered GA4 (and, through the
+  "parent domain" fallback, Search Console) to the host NAMED in the request, with no check that the host was the caller's; and deploying a
+  landing page adds the platform property and root domain to the deployer's analytics config (`v0Service.ts`, auto-configure), so the
+  deployer's unfiltered analytics (the portal's Analytics & SEO page, Emma's `get_website_analytics` / `get_seo_metrics`, the product and
+  funnel reports) included every customer's landing-page sessions, pages, sources and search queries, minus only their own `gaFilteredDomains`.
+- The fix (`services/landingAnalyticsScope.ts`): every read of the managed base's platform property or domain keeps only the caller's own
+  locations. Only the config mappings for the managed base (`agentwebforms.com`, customDomainService `SUBDOMAIN_BASE`, and its
+  subdomains) are scoped: the other entry (audit pages on `agentweb.pro`, AgentWeb's own domain, where customers cannot deploy) holds
+  AgentWeb's own pages, and scoping it would cut AgentWeb's own site analytics (the founders' SEO page, Emma for them, the admin business
+  funnel's `agentweb.pro` read). A customer who saves `agentweb.pro` or its property in their own config is the broader "any property the
+  service account can open" gap, handled by the shared-account audit and its enforcement step.
+  GA4: `scopeGaClient` wraps the Data API client at every place one is created for a customer read (`/metrics` and its funnel,
+  `/product-metrics`, `fetchGoogleAnalyticsMetrics`); a `runReport` on a platform property gets the own-locations dimension filter ANDed to
+  its own. Search Console: `gscScopeFilter` adds a `page` `includingRegex` filter for a platform domain property or any subdomain property of
+  it (`/metrics`, `/debug`, `fetchSearchConsoleMetrics`). `?domain=` adds the platform property only for a host where the caller has a page.
+  A caller with no own location gets an impossible filter (an empty answer of the usual shape), never the whole property. Customer-owned
+  properties and domains are untouched.
+- Own locations: the ACTIVE domains the caller and the members of the caller's organization own in AW-CustomDomains (managed subdomains
+  and verified custom domains: whole host; a pending custom-domain row can be written for any host nobody has attached yet, even one of
+  AgentWeb's own, so it is not ownership), plus each own non-archived landing page's URL: a project's own `*.vercel.app` host whole; on a platform
+  domain host not owned in AW-CustomDomains, only that host AND the page path (`/acme` and below, never `/acme-2`); the root of such a
+  host is never claimed. A read failure of these lists fails closed (no location) and is not cached. Cached 5 minutes per caller; at most
+  100 locations. GA4 ids are compared without `properties/`, padding or leading zeros (a padded id saved in a config is the same property).
+  Platform ids are cached 10 minutes; the managed base's Search Console domain is always recognised, but its GA4 property id comes only
+  from the config: if the config has never loaded, that property cannot be recognised (reads of it behave as before) and
+  `[landingAnalyticsScope] the platform landing-page GA4 property could not be loaded` is logged on every attempt (one a minute).
+- What a customer sees change: only their own landing pages' traffic on the platform property (before: every customer's). Their own
+  GA4 properties and Search Console domains are read exactly as before. GA4 key-event configuration of a platform property (event names,
+  no traffic) is not filtered. Not changed: the GA4 probe `POST /api/seo/config/ga/test` (it reports only whether the service account can
+  open a property).
+- Changed for AgentWeb's own accounts: `?domain=audit.agentweb.pro` (or another host of the unscoped `agentweb.pro` mapping) no longer adds
+  the audit property unless the account owns that host (a domain row or a page path there); the founders' normal reads of their own
+  config are unchanged.
+- Residual risks, known: a managed subdomain released by one customer and later taken by another gives the new owner the old owner's
+  history for that host (ownership has no start date); a page on a managed host with no domain row ("rowless" pages) gets no root-page
+  traffic, since the root of a host the caller does not own is never claimed; more than 100 own locations are cut (fewer of the caller's
+  own pages, never another's). A new GA4 or Search Console read of customer analytics must go through `scopeGaClient` / `gscScopeFilter`
+  (the client factory itself is not scoped; only `runReport` is wrapped).
+- Proof: `landingAnalyticsScope.test.ts` (filters, regex boundaries, own-location rules, org members, fail-closed, caching, the client
+  wrapper), `seoRoutes.landingScope.test.ts` (a deployer, `?domain=` another customer's host, the caller's own host, product metrics) and
+  `seoService.landingScope.test.ts` (Emma's readers). Removing the GA wrapper or the Search Console filter from `/metrics` fails the route
+  tests; removing the funnel wrapper or the `/debug` filter fails theirs.
+
+## ENG-2840: File read, lead event and status note for outside agents over MCP (2026-11-26)
+
+- `read_file_content` (`mcp/server/fileReadTool.ts`): the text of ONE file in the caller's own AgentWeb storage (chat attachments, files
+  saved with `save_file`, Emma's outputs), through `POST /api/emma/read-file`. Emma's reader also fetches any public web URL from AgentWeb's
+  servers with no size limit; over MCP that would be an open fetch proxy, so the tool always sends `own_storage_only: true` (any URL that
+  `extractS3KeyFromUrl` does not claim is refused before anything else is answered or fetched) and `max_bytes` 10 MB (`readFileContent`
+  refuses a larger stored file from its stored size before reading, and stops the stream past the limit, aborting the S3 request so its
+  connection is freed). Both are new optional route fields (`max_bytes` only together with `own_storage_only`: it limits stored files only);
+  without them the route and Emma's tool behave as before. "Own" is `readFileContent`'s rule: `users/<caller>/` or `sandbox/<caller>/`
+  of the bucket; task results and knowledge-base files are not readable here. One read per caller at a time, 4 per process. The answer is
+  built from fixed fields (content, truncated, file_type, file_size, content_length, content_hash; never the URL echo, the route message or a
+  raw error), so it is exempt from the public sanitizer like the memory tools (`OWN_CONTENT_TOOL_NAMES`): a JSON file comes back as stored.
+  Read-only (a `tools:read` key may call it; it is in the inventory gate's proven-read-only list, the name contains "file"). Emma's image and
+  video refusals name her own describe tools, which outside agents lack, and are reworded; Emma's truncation message (which offers a
+  byte range her tool does not take) is unchanged and not relayed: the tool writes its own note. Known limits, as in Emma: the 10 MB counts
+  stored (compressed) bytes, so a crafted Office file can unpack much larger in the parser; the 4-reads-per-process pool is shared by all
+  callers (one each).
+- `add_lead_engagement` (`mcp/server/leadEngagementTool.ts`): one event on a lead, through a new thin route `POST /api/emma/add-lead-engagement`
+  (metered) over Emma's own handler and list check (list owner, organization owner, listed CRM editors; not the CRM route, which alerts the
+  list owner by email/Slack/WhatsApp). Checked in the tool: `custom.` + 1 to 53 of [a-z0-9_.-]; `event_data` at most 20 keys of simple values
+  (text up to 500 characters, numbers, true/false, null), 2 KB, keys other code reads (`smartleadEventKey`, `from`, `to`, `subject`, `message`,
+  `content`, `platform`, `reason`, `source`, `linkedin`, `campaignId`, `accountId`, `invitationId`) and the server's own (`channel`,
+  `idempotencyKey`, `eventId`, `eventType`, `createdAt`) refused, as are the public-schema privacy names (transcripts, locations, IP); `event_date`
+  ISO with a zone, at most 5 minutes ahead and a year back; `idempotency_key` without the words clicked, replied or received (it is stored in
+  the event's data, which the engaged rule scans); 120 events an hour per caller (in-process). In Emma's handler, only for this route
+  (`AgentEngagementLimits`): the event is stamped `channel: 'mcp'` (a caller's own `channel`/`idempotencyKey` data is dropped), a lead takes at
+  most 50 such events and none when its stored record is 300 KB or more (`utils/agentEngagementLimits.ts`; the item limit is 400 KB and a full
+  lead breaks every other writer on it), an `idempotency_key` already on the lead records nothing (`recorded: false, duplicate: true`), and the
+  append is conditional on the lead's `updatedAt` (re-read and re-decided up to 3 times). A lead without `updatedAt` is appended without the
+  condition, so two simultaneous calls with the same key could both record there. A 5xx or no answer says the event may or may not have been
+  recorded and how to check. Events containing "clicked", "replied" or "received" mark the lead engaged (Emma's rule). No CRM sync, no alert,
+  no conversion relay; the portal's live CRM view is not refreshed.
+- `manage_leads update` takes `status_note` (with `updates.status` only, refused on every other action; 1 to 500 characters, checked
+  before trimming): sent as `statusNote` to
+  the lead update route, which takes it out of the body before anything else reads it, stores it as `notes` in the `status.changed` event only
+  when the status really changes, and answers `statusNoteRecorded` (absent when no note was sent). It never touches the lead's own `notes`.
+  Same shape as Emma's `update_lead_status` note. The route still writes that event before the lead update (unchanged), so a failed update can
+  leave the event and its note.
+- Not exposed, and why: see brain `eng-2840-w27-scope-and-findings-2026-11-25.md` (`search_user_assets`, `materialize_knowledge_base_asset`,
+  `attach_knowledge_base_files`, the follow-up and conversation-status reads, `update_email_draft_for_lead`, `ask_crm`, `analyze_crm_data`).
+- Proof: unit tests of both tools (`mcp/server/__tests__/fileReadTool.test.ts`, `leadEngagementTool.test.ts`), the reader's limits
+  (`readFileContent.ownStorageLimits.test.ts`), both routes (`emmaApi.readFileAndEngagement.test.ts`), the handler's limits
+  (`leads.addLeadEngagement.agentLimits.test.ts`), the status note on the route and in the MCP update (`crm.statusNote.test.ts`,
+  `mcp.manageLeads.statusNote.test.ts`), and two tenants end to end through the real MCP server, routes and handlers on the in-memory
+  database (`mcp.leadEngagement.twoTenant.test.ts`): another tenant's list is refused and its lead unchanged, the stamp, the duplicate key, the
+  per-lead cap, and the status note stored in the event and not on the lead.
+
+## ENG-2840: Three security fixes in Emma's tools: lead lookup ownership, LinkedIn upload downloads, HubSpot write labels (2026-11-26)
+
+- `find_or_lookup_email` (`emma/emailLookupTool.ts`): with `leadId` + `listId` it loaded the lead by key with no ownership check, so any
+  caller holding both ids (including through text an agent was fed) got another tenant's lead email, name, company and LinkedIn. The lead
+  is now read only from a list the caller may read (`canAccessCrmList`); otherwise it is treated like a missing lead.
+- `call_linkedin_marketing_api` MEDIA uploads (`emma/impl/adsApis.ts`): any key of our bucket was presigned for any caller, and any other
+  URL was downloaded with a plain GET (no SSRF guard, no size cap, no timeout). Now a file of our bucket is read only when the storage rule
+  lets this caller read that key (`checkOurBucketKeyRead`), through the SDK with a byte ceiling; any other URL goes through the
+  SSRF-guarded caller-URL fetch with a byte ceiling and a time limit (`LINKEDIN_UPLOAD_MAX_BYTES`: image 20 MB, document 100 MB, video
+  200 MB; 60 s, 120 s, 180 s).
+- The Meta seed-audience CSV fetch (`fetchAndParseCsvRows`, used when a targeted campaign is launched from a `csv_url`) had the SSRF guard
+  but no size cap and no timeout: an endless or very slow body was held in memory. It is now bounded at 50 MB and 60 s for the whole download (an abort signal, not only an idle timeout).
+- Emma's tool gateway (`services/agentToolGatewayService.ts`) labelled `call_hubspot_api` SUBMIT, ENABLE, UNPUBLISH, DISABLE, ADD_ASSET and
+  REMOVE_ASSET as reads (safe to repeat, no confirmation flag). They are now writes (ENABLE external_publish, SUBMIT external_send,
+  UNPUBLISH destructive, the others internal_write), only the known reads are reads, and an unknown action is a write.
+- Found in the W2-9 research (brain `eng-2840-w29-research-2026-11-26.md`). Not changed here: the portal's `/api/crm/leads/find-email`
+  pools other tenants' stored emails by its locked design; it is not exposed over MCP.
+- Proof: `emma.emailLookupTool.test.ts` (another tenant's list is never read), `linkedInAds.agentMode.test.ts` (guarded fetch with
+  ceilings, own-bucket rule, refusals), `agentToolGateway.hubspotEffects.test.ts`. Known unrelated failure on main:
+  `emmaToolArgContracts.test.ts` "leaves unknown endpoints..." fails on origin/main 345ef0983 without this change.
+
+## ENG-2840: Content tools for outside agents over MCP, and five security fixes (2026-11-26)
+
+- Six of Emma's content tools on the MCP server (`mcp/server/contentTools.ts`), chosen by 30-day Emma usage among tools with no MCP twin:
+  `list_html_templates` (read), `create_html_file`, `create_html_from_template`, `update_html_file`, `describe_image` (read),
+  `perform_data_analysis`. Same pattern as the other wave-2 tools (arguments by name and value, the portal's own `/api/emma/*` route as
+  the key's own user, refusals as errors with the route's short message only, fixed text for a 5xx or a timeout, answers built from fixed
+  fields). Bounds Emma does not have: one call at a time per caller, at most 8 callers at once per process (4 for analysis) and a number
+  an hour per caller for each tool (`GUARDS`); self-call waits of at most 9 minutes (`TIMEOUTS_MS`), because the outside request is cut at
+  600 s by the load balancer and nginx (a longer run answers "did not answer in time"; a file may still appear); the model is never the
+  caller's choice and no session is attached; `update_html_file`, `describe_image` and `perform_data_analysis` take only files of the
+  caller's own AgentWeb storage, because Emma's versions fetch any public URL (an open fetch proxy over MCP). The owner of the named file
+  is checked by Emma's code: `update_html_file` writes only for the owner, `describe_image` asks the storage rule (below), and analysis
+  files are sent as `s3://<bucket>/<key>` (the URL path decoded once), the path where the analysis asks the storage rule before reading.
+  Text: control characters are refused everywhere; zero-width and direction characters only in single-line fields (titles, ids, URLs),
+  since content legitimately holds them (joined emoji, Persian, Hebrew, Arabic). Not exposed: Slack reads (one AgentWeb bot token for every tenant, privacy question open), `convert_to_pdf` (renders any URL in a
+  browser), `create_html_template` (overwrites by name, fetches URLs; later). Known: files these tools create sit in the caller's folder of
+  a bucket that serves an object to anyone holding its URL (the descriptions say so); `update_html_file`'s `_v2` name is deterministic, so
+  editing the same original twice writes the same name (said in the description, unchanged in Emma).
+- Fix: custom domains. `addCustomDomain` refuses AgentWeb's own domains and their subdomains (`RESERVED_PLATFORM_DOMAINS`: agentweb.pro,
+  agentwebforms.com, hireemma.ai) before any Vercel call (400 from `POST /api/domains/custom`), and the reconcile cron skips them. Every
+  customer project is in AgentWeb's own Vercel team, so Vercel reported such a host verified with no proof from the customer, and the
+  API's CORS list trusts those domains. Managed subdomains (`addSubdomain`) and page subdomains are unaffected. Re-attaching one of these
+  domains is done by hand in Vercel. Production on 2026-11-26 holds one such custom row, `hireemma.ai` (active: AgentWeb's own site).
+  Not covered: a subdomain of another customer's custom domain held in the same Vercel team.
+- Fix: Slack. Emma's `slack_get_thread_replies` had no user check (any session could read any thread in any channel the bot is in); it is
+  now scoped like `slack_get_recent_messages`. A non-admin naming a channel that does not exist and one that is not theirs now gets the
+  same answer (the name lookup covers every bot channel: it was a list of which clients' channels exist). A Slack tool call with no user
+  attached now reads, lists and posts nothing (it used to act as an admin; every tool call passes a user today). `GET /api/slack/channels` gave a
+  user with no personal channel every bot channel (other clients' names); it now lists, for anyone but a real (non-delegated) admin, only
+  the channels `POST /send-approval` would accept for them (own, else the organization's, none on WhatsApp).
+- Fix: knowledge-base links. These MCP tools' answers no longer carry Google Cloud Storage signed links (minted to expire in 2500, stored in task
+  records, unrevocable): `withoutSignedStorageLinks` (`mcp/server/knowledgeBaseParams.ts`) removes them from `list_knowledge_bases`,
+  `emma_get_brand_profile`, `list_tasks` and `manage_task`. Files are read with `read_knowledge_base_files` (by id and name). Not
+  covered: such a link quoted in Emma's own chat text (`emma_send_message`, chat history).
+- Fix: `describe_image` read any object of our bucket with the server's credentials (presigned) for any caller. It now asks the storage
+  rule the other storage tools ask (`checkOurBucketKeyRead`; like them it never carries admin power, so an admin's own Emma session cannot
+  describe a client's private file, while a delegated session can) first, for every model and before any read (harmless today only
+  because the bucket still serves objects by URL). `POST /api/emma/describe-media` without a model now uses the vision model, as Emma
+  does (it defaulted to `gpt-4o`, not a registered model, which also skipped the image download).
+- Proof: `mcp/server/__tests__/contentTools.test.ts` (requests, refusals, answers, errors, guards), tests of the domain refusal and cron
+  skip, the Slack scoping and channel list, the signed-link stripping through the four tools, and the describe_image owner check; the
+  inventory, classification, route-budget and plan-route limit gates.
+
+## ENG-3187: stdio MCP children get an allowlisted env, not process.env (2026-11-25)
+
+`createStdioTransport` spread `process.env` into every stdio MCP child since 2026-01-22, so a customer-driven server (Playwright `browser_run_code`) could read JWT_SECRET, AWS keys, Stripe/Slack tokens. Children now get `buildStdioChildEnv` (`backend/src/mcp/client/stdioChildEnv.ts`): PATH/HOME/locale/temp/proxy/CA plus the server's own config `env`. If a stdio server needs a secret, declare it in that server's `env` (`${VAR}` placeholders resolve), never rely on inheritance. Note: this does not stop vm-escape code reading `/proc/<backend pid>/environ` as the same OS user; process isolation is a separate step.
+
+## ENG-3187: the browser server no longer inherits the backend's secrets or working folder, a browser call carries no `_meta`, and the navigate tool opens public pages only (2026-11-25)
+
+**The problem.** The agent's browser is a Playwright MCP server that runs as a child process of the backend. `McpClientService.createStdioTransport` started it with `env: { ...process.env, ...resolvedEnv }` (since 2026-01-22) and no working folder, so the child had the backend's whole environment (login-token signing secret, AWS keys, Stripe and Slack keys) and the backend's own folder as its file root. Its `browser_run_code` tool runs the caller's code in a Node `vm`, which is not a security boundary: `page.constructor.constructor('return process')()` returns the host `process`. Any signed-in customer can drive that tool from their own chat. Chrome also runs with `--no-sandbox` (2026-03-12) and with site isolation switched off (2026-04-26, anti-detection work).
+
+**What this change does (code only: `backend/src/mcp/client/playwrightContainment.ts`, `mcpClientService.ts`, `utils/toolFailureType.ts`).**
+- The browser server gets an allow-list environment (`PATH`, `HOME`, locale and temp variables, proxy and certificate variables, `PLAYWRIGHT_BROWSERS_PATH`, font settings, `LC_*`, `XDG_*`) plus whatever its own configuration sets. Nothing else. The Windows basics are allowed too, for local development. There is no switch back to the backend's whole environment.
+- Every browser server runs in a fresh folder of its own under `/tmp/playwright-mcp-work/<pid>-<pool>-<random>` (mode 0700, made with `mkdtemp`; the root must be a real folder owned by the process), also passed as `--output-dir`. Playwright confines the browser's file tools to its working folder. The folder is found again by its transport and removed exactly when that browser server ends: the client is closed (pool release, eviction, failed connect, a direct call finishing), the child process exits by itself (the transport's own close handlers remove the folder; the SDK client forgets its transport on that event, so the callers that close a client hand over the transport they hold, and pool release and eviction, which still read it from the client, rely on that handler having run), or the backend shuts down. A new pool of the same session is never touched. A startup sweep removes folders whose owning process is gone, and folders of an earlier run that reused this process id (a container restart); a live process's folders are never swept. The sweep assumes every process that shares `/tmp` also shares the process-id space (true on one host).
+- A browser tool call is sent without `_meta`. Playwright reads `arguments._meta.cwd` as the folder it resolves `browser_file_upload` paths against when it checks them, while `setFiles` resolves the same raw paths against its own working folder, so a model-supplied `_meta.cwd` made the check pass for a path that reads any file the backend's user can read (found by the blind review of this change; it worked before this change too).
+- `browser_navigate` is checked before the call, on every path a tool is called by: only `http:`/`https:`, `about:blank` and `data:` are opened; the host must pass `assertPublicHostname` (5 s limit, and at most 8 checks waiting at once; this bounds the queued work, it does not protect the process's few lookup threads, which a lookup holds until the resolver returns); IPv6 literals and names that are local by convention (`localhost`, `*.localhost`, `*.local`, `*.internal`, `*.localdomain`, `*.lan`, `*.home.arpa`) are refused; a name that cannot be resolved gets its own message. The check also runs before `callToolDirect` connects. The refusals are worded for the model, are not retried, are logged with user and session (never the address), and are classified `by_design`, not `bug`.
+- Every other stdio MCP server keeps the shared allow-list that #4251 (`stdioChildEnv.ts`, ENG-3187) put on main on 2026-11-26; this change does not touch it. The browser server keeps its own list, which allows every name the shared one does (a test fails if the two drift apart) plus `TERM` and the `ALL_PROXY` pair.
+- `--blocked-origins` was tried and dropped: it turns on request interception and disables the HTTP cache for every browser session of every user, and Playwright documents it as not a boundary.
+
+**What it does NOT do (tracked in ENG-3187).** `browser_run_code` hands the caller Playwright's raw `page`. Through it, without any escape from the `vm`, a caller can still `page.goto('file:///proc/<backend pid>/environ')` (the navigate check and `file:` block are only on `browser_navigate`), and `page.request` sends Node-side HTTP that nothing routes or checks, to loopback or to the cloud metadata address (an IMDSv2 token request with a header works, so "IMDSv2 required" is not a protection against this). Code that escapes the `vm` runs as the same OS user as the backend and can read `/proc/<backend pid>/environ` and the backend's files. The navigate check does not see redirects, links, `location=`, meta refresh or DNS rebinding (Chrome resolves the name again). `browser_run_code` is about 43% of browser-tool calls in the production log on 2026-11-25 and five internal tools depend on it (cookie persistence and tools, site sign-in, the reCAPTCHA solver, the X.com typing rule). The real fix is the browser server under its own OS user or container with the metadata address and loopback blocked for it, or `browser_run_code` withdrawn from model-driven callers.
+
+**Rollback.** Revert the PR. The browser server then gets #4251's shared allow-list again, never the backend's whole environment.
+
 ## ENG-2964: permanent sent-message records, production shadow (2026-11-25)
 
 - Created production AW-SentMessages via standalone CloudFormation, us-west-2, PITR/SSE/Retain.

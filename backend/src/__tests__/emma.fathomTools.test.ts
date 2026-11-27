@@ -456,3 +456,16 @@ describe('fathom_get_onboarding_context', () => {
     expect(result.message).toContain('Authentication required');
   });
 });
+
+describe('ENG-2840 (W2-9): every Fathom request is bounded in time', () => {
+  it('the meetings and transcript requests both give up after 30 s', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    mockedAxios.get = jest.fn()
+      .mockResolvedValueOnce({ data: { items: [], next_cursor: null } })
+      .mockResolvedValueOnce({ data: { transcript: [] } });
+    await executeTool('fathom_get_meetings', {}, { userId: 'user-1' });
+    await executeTool('fathom_get_transcript', { recording_id: 101 }, { userId: 'user-1' });
+    expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+    for (const [, options] of (mockedAxios.get as jest.Mock).mock.calls) expect(options.timeout).toBe(30_000);
+  });
+});

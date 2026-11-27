@@ -28,7 +28,9 @@ import { approvalDb } from '../services/approvalDb';
 import { getWorkspaceAssets, resolveWorkspaceMembers, getWorkspaceApprovalStatusByUrl, WorkspaceCaller } from '../utils/workspaceAssets';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { isS3Url, uploadFileToS3 } from '../utils/s3Utils';
+import { fetchCallerUrlText } from '../utils/callerUrlFetch';
+import { htmlToSearchableText } from '../utils/htmlSearchableText';
 import { classifyReport, ReportType } from '../services/reportClassificationService';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -2330,9 +2332,16 @@ export async function getExecutionsWithAssets(
   // writes it back to the owner's records (and bills the classifier call). Only the
   // owner's own read may do that; teammate reads in the shared workspace must be
   // read-only so they never rewrite another member's result_files or incur their LLM cost.
-  options: { backfill?: boolean } = {},
+  // ENG-2840 (W2-10): `warm: false` writes no session asset cache either (no background warm
+  // of uncached sessions, no incremental cache update), so with `backfill: false` the call is
+  // a pure read (search_user_assets over MCP). Default true: unchanged.
+  // `sessions: false` reads only the task-run files: no agent-mode session is read at all (a caller that lists session assets another
+  // way, like the MCP asset search, would otherwise pay a full scan of every uncached session's messages for nothing).
+  options: { backfill?: boolean; warm?: boolean; sessions?: boolean } = {},
 ): Promise<Record<string, any>> {
   const backfill = options.backfill !== false;
+  const warm = options.warm !== false;
+  const includeSessions = options.sessions !== false;
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
 
@@ -2448,7 +2457,7 @@ export async function getExecutionsWithAssets(
 
   // Search Agent Mode sessions for assets using incremental caching
   const chatbotDbForEnrich = new ChatbotDB();
-  try {
+  if (includeSessions) try {
     const chatbotDb = chatbotDbForEnrich;
     // Load sessions metadata only (no messages) — single DynamoDB query
     const agentSessions = await chatbotDb.getSessionsWithoutMessages(userId, 'agent');
@@ -2469,7 +2478,7 @@ export async function getExecutionsWithAssets(
       // Background-warm uncached sessions (fire-and-forget).
       // Cap at 50 per request to avoid thundering-herd on large accounts.
       const MAX_WARM_PER_REQUEST = 50;
-      if (uncachedSessions.length > 0) {
+      if (warm && uncachedSessions.length > 0) {
         const sessionsToWarm = uncachedSessions.slice(0, MAX_WARM_PER_REQUEST);
         (async () => {
           try {
@@ -2539,7 +2548,7 @@ export async function getExecutionsWithAssets(
         }, 0);
         const newScanIndex = maxIndex + 1;
 
-        chatbotDb.updateAssetCache(session.sessionId, existingCache, newScanIndex);
+        if (warm) chatbotDb.updateAssetCache(session.sessionId, existingCache, newScanIndex);
       }
 
       const sessionKey = `agent-mode-${session.sessionId}`;
@@ -2574,7 +2583,7 @@ export async function getExecutionsWithAssets(
   // cached values are already populated so this only runs for brand-new reports).
   if (assetType === 'html-reports' && backfill) {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
-    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
+    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich, userId)
       .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
       .catch(() => {/* non-fatal */});
   }
@@ -2582,13 +2591,18 @@ export async function getExecutionsWithAssets(
   return result;
 }
 
+/** Total time for reading one HTML report for its searchable text (ENG-2840; the old per-read idle timeout was 5 s). */
+const HTML_REPORT_FETCH_TIMEOUT_MS = 15_000;
+/** Largest HTML report read for its searchable text (ENG-2840; only the first 3,000 characters of text are kept). */
+const HTML_REPORT_MAX_BYTES = 5 * 1024 * 1024;
+
 /**
  * Fetch HTML content for report files that lack searchableText and attach extracted plain text.
  * Persists newly-fetched searchableText back to DynamoDB (session assetCache or task execution
  * result_files) so subsequent loads skip the S3 fetch entirely.
  * Runs concurrently (up to 10 at a time) so it doesn't block the response for long.
  */
-async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, chatbotDb: ChatbotDB): Promise<void> {
+async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, chatbotDb: ChatbotDB, userId?: string): Promise<void> {
   const CONCURRENCY = 10;
   const MAX_TEXT_LENGTH = 3000;
 
@@ -2609,17 +2623,18 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, 
     const batch = filesToEnrich.slice(i, i + CONCURRENCY);
     await Promise.all(batch.map(async ({ file }) => {
       try {
-        const response = await axios.get(file.url, { timeout: 5000, responseType: 'text' });
-        const html: string = typeof response.data === 'string' ? response.data : '';
-        // Strip tags, collapse whitespace, truncate
-        const text = html
-          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, MAX_TEXT_LENGTH);
-        file.searchableText = text;
+        // ENG-2840: a session's report URLs are scraped from chat message text, so the URL is effectively the user's choice. Only a
+        // report in our own bucket is read, and only through the SSRF-guarded fetch (public address pinned, redirects re-checked, size
+        // and total time bounded). Before, any URL that matched the scrape pattern was fetched with plain axios.
+        if (!isS3Url(file.url)) return;
+        const html = await fetchCallerUrlText(file.url, {
+          tool: 'html_report_backfill',
+          userId,
+          maxBytes: HTML_REPORT_MAX_BYTES,
+          timeoutMs: HTML_REPORT_FETCH_TIMEOUT_MS,
+        });
+        // Strip tags, collapse whitespace, truncate (in time linear in the input: see utils/htmlSearchableText.ts)
+        file.searchableText = htmlToSearchableText(html, MAX_TEXT_LENGTH);
       } catch {
         // Non-fatal — leave searchableText absent if fetch fails
       }
