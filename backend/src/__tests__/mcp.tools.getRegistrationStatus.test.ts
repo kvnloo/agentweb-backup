@@ -127,6 +127,8 @@ describe('get_registration_status', () => {
       ['comma-separated string', 'a@x.com, b@x.com'],
       ['JSON-encoded array string', '["a@x.com","b@x.com"]'],
       ['newline/semicolon separated string', 'a@x.com;\nb@x.com'],
+      // Gateway string_wrap repair turns the comma string into a one-item list.
+      ['gateway-wrapped comma list', ['a@x.com, b@x.com']],
     ])('accepts a %s', async (_label, raw) => {
       await mcpToolRegistry.execute('get_registration_status', { emails: raw }, context);
       expect(mockMcpFetch).toHaveBeenCalledWith(
