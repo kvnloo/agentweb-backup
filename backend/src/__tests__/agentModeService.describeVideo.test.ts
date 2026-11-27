@@ -127,6 +127,26 @@ describe('AgentModeService - describeVideo', () => {
       expect(result.message).toBe('Video file too large for analysis: it exceeds the limit of 100 MB');
     });
 
+    it('says plainly when the download hits its time limit', async () => {
+      mockedFetch.mockRejectedValue(Object.assign(new Error('canceled'), { name: 'CanceledError', code: 'ERR_CANCELED' }));
+      const result = await service.describeVideo('https://example.com/slow.mp4');
+      expect(result).toEqual({ success: false, message: 'The video did not download within 180 s. Use a smaller file or a faster host.' });
+    });
+
+    it('keeps the 100 MB cap when MAX_DOWNLOADED_VIDEO_SIZE_MB is not a number', async () => {
+      const saved = process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB;
+      process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB = 'lots';
+      try {
+        mockVideoDownload();
+        mockGemini('A short clip.');
+        await service.describeVideo('https://example.com/video.mp4');
+        expect(mockedFetch).toHaveBeenCalledWith('https://example.com/video.mp4', expect.objectContaining({ maxBytes: 100 * 1024 * 1024 }));
+      } finally {
+        if (saved === undefined) delete process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB;
+        else process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB = saved;
+      }
+    });
+
     it('refuses an empty download', async () => {
       mockVideoDownload('video/mp4', '');
       mockGemini('unused');
