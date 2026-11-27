@@ -35,7 +35,7 @@ import { getJwtSecret } from '../config/jwt';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import { xAdsListAll, xAdsRequest, XAdsApiError, type XAdsRequestOptions } from '../services/xAdsClient';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
-import { formatMicros, googleSpendCeilingPolicyFromEnv, majorToMicros } from './googleToolkitWrites';
+import { formatMicros, googleSpendCeilingPolicyFromEnv, majorToMicros, spendCeilingRefusalMessage } from './googleToolkitWrites';
 import { assertXAdsToolkitCall, X_ADS_LINE_ITEM_OBJECTIVES, X_ADS_WRITE_TOOL, type XAdsSession } from './xAdsToolkitManifest';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
@@ -377,11 +377,11 @@ export async function executeXAdsWrite(
   if (policy && v.fields.daily_budget_amount_local_micro !== undefined) {
     const prior = (state.prior as any)?.daily_budget_amount_local_micro;
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: v.fields.daily_budget_amount_local_micro, prior });
-    if (!verdict.allowed) throw new MetaToolkitRefusal(verdict.message.replace('(minor units)', '(micros)'));
+    if (!verdict.allowed) throw new MetaToolkitRefusal(spendCeilingRefusalMessage(verdict, policy, v.fields.daily_budget_amount_local_micro, prior, currency));
   }
   if (policy && v.fields.entity_status === 'ACTIVE') {
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: activateBudgetMicros });
-    if (!verdict.allowed) throw new MetaToolkitRefusal(`Activating would start spend at its daily budget. ${verdict.message.replace('(minor units)', '(micros)')}`);
+    if (!verdict.allowed) throw new MetaToolkitRefusal(`Activating would start spend at its daily budget. ${spendCeilingRefusalMessage(verdict, policy, activateBudgetMicros, undefined, currency)}`);
   }
 
   const fingerprint = previewFingerprint({ platform: 'x_ads', userId, accountId: session.accountId, op: v.op, fields: v.fields, targeting: v.targeting, state, currency });
