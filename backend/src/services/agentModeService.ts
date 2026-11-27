@@ -3,7 +3,7 @@ import { personOnlyApprovalsIn } from './personOnlyApprovals';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
-import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
+import { classifyMetaBudgetChange, priorBudgetForComparison } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
@@ -15,6 +15,7 @@ import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace
 import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isServerSideBrowserCodeTool, browserCallTouchesServerFiles, sensitiveActionScheduleRefusal, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { normalizeEmailList } from '../utils/validation';
+import { describeMetaError } from '../utils/metaErrorDetail';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -59,6 +60,7 @@ import {
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
 import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
+import { annotateCreativeCta, ctaNoteForRequested, requestedCtaForStored, withAnnotatedCreativeCta } from '../utils/metaCtaAliases';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
@@ -12246,8 +12248,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   // --- Unified Meta Ads Manager Methods ---
-  public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
+      case 'GET':
+        // GET is advertised (the Zoma toolkit's read actions include it) but had no case here, so a
+        // single-campaign read threw "Invalid action: GET" and reached the caller as a bare
+        // "Meta Toolkit call failed.". A GET is the id-scoped LIST read.
+        if (!campaign_id) throw new Error('campaign_id is required for CAMPAIGN GET (use LIST to read every campaign).');
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: AgentModeService.optionalScopeId(campaign_id, 'campaign_id'), fields: params?.fields });
       case 'LIST':
         // Thread the campaign_id filter and any explicit fields selection so the caller can
         // read budget/bid config and target a single campaign (ENG-398).
@@ -12266,8 +12274,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
-  public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
+      case 'GET':
+        // Same gap as CAMPAIGN GET: the id-scoped LIST read.
+        if (!ad_set_id) throw new Error('ad_set_id is required for AD_SET GET (use LIST to read every ad set).');
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: AgentModeService.optionalScopeId(ad_set_id, 'ad_set_id'), fields: params?.fields });
       case 'LIST':
         // Thread the ad_set_id target and any explicit fields selection so the caller can
         // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
@@ -12367,7 +12379,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           message: creative?.name
             ? `Fetched the requested ad creative "${creative.name}".`
             : `Fetched the requested ad creative.`,
-          creative,
+          creative: annotateCreativeCta(creative),
         };
       }
       case 'PREVIEW': {
@@ -12395,8 +12407,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'GET' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
+      case 'GET': {
+        // Same gap as CAMPAIGN GET: GET had no case, so it threw "Invalid action: GET".
+        if (!ad_id) throw new Error('ad_id is required for AD GET (use LIST to read every ad).');
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        try {
+          const ad = withAnnotatedCreativeCta(await metaService.getAd(accessToken, ad_id, accountId));
+          return { success: true, message: `Ad ${ad_id}`, ad } as any;
+        } catch (error: any) {
+          if (error?.isMetaAuthError) throw error;
+          const detail = describeMetaError(error, `Could not read ad ${ad_id}.`);
+          return { success: false, message: detail, error: detail } as any;
+        }
+      }
       case 'LIST':
         // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
         // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
@@ -12502,7 +12527,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           body: params.body || vd.message || creativeData.body || '',
           title: params.title || vd.title || creativeData.title || '',
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
-          call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+          call_to_action_type: params.call_to_action_type || requestedCtaForStored('video_data', vd.call_to_action?.type),
           url_tags: carriedUrlTags,
           ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
@@ -12612,7 +12637,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'copy Meta ad'),
-        error: error.message,
+        error: this.metaFailureText(error, 'copy Meta ad'),
         details: error.structuredError,
         code: error?.status ?? error?.response?.status
       };
@@ -12979,7 +13004,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad campaign'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad campaign'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -13172,7 +13197,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
 
       // 4. Bidding Strategy rules
-      const strategy = args.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
+      // Under Advantage Campaign Budget (CBO) the bid strategy lives on the CAMPAIGN (ENG-2364 sets
+      // it there) and the ad set inherits it. Injecting our own default on the ad set sent a second,
+      // possibly conflicting strategy that Meta answers with a bare "Invalid parameter" at create
+      // time — after a preview that never calls Meta looked fine. So under CBO the ad set only
+      // carries a bid_strategy the caller explicitly chose; validation uses the effective one.
+      const sendBidStrategy = !campaignHasBudget || args.bid_strategy !== undefined;
+      const strategy = args.bid_strategy || (campaignHasBudget && campaign.bid_strategy) || 'LOWEST_COST_WITHOUT_CAP';
       if (strategy === 'LOWEST_COST_WITH_MIN_ROAS') {
         throw new Error('ROAS bidding (LOWEST_COST_WITH_MIN_ROAS) is not yet supported.');
       }
@@ -13186,8 +13217,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       if (strategy === 'LOWEST_COST_WITHOUT_CAP' && args.bid_amount !== undefined) {
         throw new Error('bid_amount must not be provided for LOWEST_COST_WITHOUT_CAP strategy.');
       }
-      if ((strategy === 'LOWEST_COST_WITH_BID_CAP' || strategy === 'COST_CAP') && args.bid_amount === undefined) {
-        throw new Error(`bid_amount is required for ${strategy} strategy.`);
+      // A cap inherited from a CBO campaign carries its own bid on the campaign; only a cap the
+      // caller set on this ad set needs an ad-set bid_amount.
+      if ((args.bid_strategy === 'LOWEST_COST_WITH_BID_CAP' || args.bid_strategy === 'COST_CAP') && args.bid_amount === undefined) {
+        throw new Error(`bid_amount is required for ${args.bid_strategy} strategy.`);
       }
 
       // Bid amount min/max guard
@@ -13258,7 +13291,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
 
       const money = await this.normalizeMetaMoneyParams(accountId, accessToken, args);
-      const normalizedParams: MetaAdsAdSetParams = { ...money.params, bid_strategy: strategy };
+      const normalizedParams: MetaAdsAdSetParams = { ...money.params };
+      if (sendBidStrategy) normalizedParams.bid_strategy = strategy;
+      else delete normalizedParams.bid_strategy;
 
       const optimisationEventWarning = await this.buildMetaOptimisationEventWarning(
         accessToken,
@@ -13300,7 +13335,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
 
       const expected: Array<[string, any]> = [
-        ['bid_strategy', strategy],
+        ['bid_strategy', normalizedParams.bid_strategy],
         ['bid_amount', normalizedParams.bid_amount],
         ['daily_budget', normalizedParams.daily_budget],
         ['lifetime_budget', normalizedParams.lifetime_budget],
@@ -13360,7 +13395,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad set'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad set'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -13447,7 +13482,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
-      const creatives = result?.creatives ?? [];
+      const creatives = (result?.creatives ?? []).map(annotateCreativeCta);
 
       return buildListResult({
         payloadKey: 'creatives',
@@ -13604,12 +13639,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             err instanceof Error ? err.message : err);
         }
       }
+      // Meta rewrites some CTAs on video creatives (BOOK_NOW → BOOK_TRAVEL); say so up front so a
+      // later read-back showing the stored type is not mistaken for a wrong write.
+      const isVideoCreative = !!resolvedParams.video_id && !resolvedParams.placement_assets?.length
+        && !MetaService.isMultiVariantCreative(resolvedParams);
+      const ctaNote = isVideoCreative ? ctaNoteForRequested('video_data', resolvedParams.call_to_action_type) : undefined;
       if (unappliedFields.length > 0) {
         return {
           success: true,
           verified: false,
           unapplied_fields: unappliedFields,
           message: buildUnappliedFieldsMessage(creative, requestedFields, unappliedFields),
+          ...(ctaNote ? { cta_note: ctaNote } : {}),
           creative: creative
         };
       }
@@ -13619,6 +13660,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: `Ad creative "${creative.name}" created successfully` +
           (readbackUnavailable ? ' (could not read it back to confirm description / instagram_user_id were stored)' : ''),
         ...(readbackUnavailable ? { readback_unavailable: true } : {}),
+        ...(ctaNote ? { cta_note: ctaNote } : {}),
         creative: creative
       };
     } catch (error: any) {
@@ -13627,7 +13669,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad creative'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad creative'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -13639,7 +13681,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
-      const ads = result?.ads ?? [];
+      const ads = (result?.ads ?? []).map(withAnnotatedCreativeCta);
 
       // Message shape and field order both live in agentMode/metaListScope.ts — see that module
       // for why completeness must precede the payload (the S3 preview cut).
@@ -13689,7 +13731,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad'),
-        error: error.message,
+        error: this.metaFailureText(error, 'create Meta ad'),
         details: error.structuredError,
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
@@ -13770,7 +13812,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad campaign'),
-        error: error.message,
+        error: this.metaFailureText(error, 'update Meta ad campaign'),
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
       };
@@ -13828,7 +13870,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad set'),
-        error: error.message,
+        error: this.metaFailureText(error, 'update Meta ad set'),
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
       };
@@ -13959,7 +14001,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad'),
-        error: error.message,
+        error: this.metaFailureText(error, 'update Meta ad'),
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
       };
@@ -14037,7 +14079,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
         title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
         link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || requestedCtaForStored('video_data', vd.call_to_action?.type) || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
@@ -14054,7 +14096,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+        call_to_action_type: params.call_to_action_type || requestedCtaForStored('video_data', vd.call_to_action?.type),
         url_tags: carriedUrlTags,
         ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
@@ -14635,11 +14677,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         if (code === 10) {
           return `Permission error: ${error.structuredError?.error_user_msg || originalMsg} — check that the entity IDs were obtained via LIST operations and not manually provided.`;
         }
-        if (error.structuredError?.error_user_msg) {
-          return `${error.structuredError.error_user_msg} (Meta code ${code}${subcode ? `, subcode ${subcode}` : ''})`;
-        }
-        return originalMsg;
+        // Meta's top-level message is often a bare "Invalid parameter"; the field at fault is only
+        // named in error_user_title / error_user_msg / error_subcode, so all of them are kept.
+        return describeMetaError(error, originalMsg);
     }
+  }
+
+  /**
+   * The `error` text of a failed Meta write result — the field the model and the Zoma toolkit
+   * actually read (utils/toolResultError reads `error` before `message`). It used to be the
+   * SDK's bare `error.message` ("Invalid parameter"), dropping every field that says what to fix.
+   */
+  private metaFailureText(error: any, context: string): string {
+    const enriched = this.enrichMetaError(error, context);
+    const detail = describeMetaError(error, enriched);
+    return enriched === detail || enriched.includes(detail) ? enriched : `${enriched} [Meta: ${detail}]`;
   }
 
   /**
@@ -14666,6 +14718,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           MetaService.assertValidSpendCap(params?.spend_cap);
         } else if (action === 'DELETE' && !campaign_id) {
           throw new Error('CAMPAIGN DELETE requires "campaign_id".');
+        } else if (action === 'GET' && !campaign_id) {
+          throw new Error('CAMPAIGN GET requires "campaign_id" (use LIST to read every campaign).');
         }
         break;
 
@@ -14676,6 +14730,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           throw new Error('AD_SET UPDATE requires "ad_set_id".');
         } else if (action === 'DELETE' && !ad_set_id) {
           throw new Error('AD_SET DELETE requires "ad_set_id".');
+        } else if (action === 'GET' && !ad_set_id) {
+          throw new Error('AD_SET GET requires "ad_set_id" (use LIST to read every ad set).');
         }
         break;
 
@@ -14705,6 +14761,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         } else if (action === 'RETAG_UTM' && !ad_id) {
           throw new Error('AD RETAG_UTM requires "ad_id".');
+        } else if (action === 'GET' && !ad_id) {
+          throw new Error('AD GET requires "ad_id" (use LIST to read every ad).');
         } else if (action === 'PREVIEW' && !ad_id) {
           throw new Error('AD PREVIEW requires "ad_id".');
         } else if (action === 'PREVIEW' && !params.ad_format) {
@@ -15899,7 +15957,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           const capped = classifyMetaBudgetChange(proposed, proposed);
           if (capped.severity !== 'unknown') return [{ field, severity: 'normal' as const, ratio: null, prior: undefined, proposed: capped.proposed }];
         }
-        return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
+        // No budget at all on a successfully read object is 0 -> new (still classified and
+        // confirmed like any increase), not unverifiable — see priorBudgetForComparison.
+        return [{ field, ...classifyMetaBudgetChange(priorBudgetForComparison(prior, field), proposed) }];
       });
       if (changes.some(change => change.severity === 'unknown')) return { blocked };
       const text = sessionId ? await this.getLastUserMessageText(sessionId) : undefined;
@@ -16236,8 +16296,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   ): Promise<any> {
     // ENG-2925 adds a bare numeric node (product / product-set read-back and parent-catalog
     // lookup) and the account's adsets edge (product-set in-use check) for the catalog writes.
-    // ENG-2927 adds the account's adspixels edge (event-source pixel ownership).
-    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules))?)$/.test(path)) {
+    // ENG-2927 adds the account's adspixels edge (event-source pixel ownership), and a pixel's
+    // stats edge (its recent event counts — fresher than last_fired_time).
+    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules|stats))?)$/.test(path)) {
       throw new Error('Unsupported catalog path.');
     }
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
