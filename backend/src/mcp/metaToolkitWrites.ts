@@ -35,6 +35,7 @@ import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '..
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { flattenNestedCampaignCreate } from '../services/agentMode/metaCampaignCreateParams';
 import { metaPageAccessRefusalText } from './metaPageAccessRefusal';
 import { getAccessiblePageIds, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import { assertOptimisationEventConfigured, type ConversionLookup } from './metaToolkitConversionGate';
@@ -143,7 +144,17 @@ function targetId(entity: string, args: any): string | undefined {
 /** Shape checks that need no I/O. Returns the params to preview/dispatch. */
 function validateWriteShape(entity: string, action: string, args: any): any {
   if (args.client_id !== undefined) throw new MetaToolkitRefusal('client_id is not available to external Meta Toolkit callers.');
-  const params = args.params && typeof args.params === 'object' && !Array.isArray(args.params) ? { ...args.params } : {};
+  let params = args.params && typeof args.params === 'object' && !Array.isArray(args.params) ? { ...args.params } : {};
+  // The campaign's fields may arrive nested as params.campaign; lifted before anything reads them
+  // (the objective line, money normalization, the preview binding).
+  if (entity === 'CAMPAIGN' && action === 'CREATE') {
+    const flat = flattenNestedCampaignCreate(
+      params,
+      'Zoma creates one entity per call: create the campaign, then AD_SET CREATE with its campaign_id, then AD CREATE with the ad set id — each with its own preview and approval.',
+    );
+    if (flat.error !== undefined) throw new MetaToolkitRefusal(flat.error);
+    params = flat.params;
+  }
   for (const key of FORBIDDEN_PARAMS) {
     if (params[key] !== undefined) {
       throw new MetaToolkitRefusal(`params.${key} is not available to external Meta Toolkit callers. Use the top-level confirm + preview_token flow.`);

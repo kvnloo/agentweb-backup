@@ -103,6 +103,21 @@ function narrowDefinition(definition: any): any {
       };
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;
+      // CREATE_PAUSED_BUNDLE is not on this surface, so its child props only advertised a one-call
+      // campaign + ad set + ads create that CAMPAIGN CREATE then refused. The nested campaign
+      // shape is accepted (flattenNestedCampaignCreate); the rest is one entity per call.
+      const pp = props.params?.properties;
+      if (pp) {
+        delete pp.ad_set;
+        delete pp.ads;
+        delete pp.requested_ad_count;
+        if (pp.campaign) {
+          pp.campaign = {
+            type: 'object',
+            description: 'CAMPAIGN CREATE only: the campaign fields (name, objective, special_ad_categories, ...) may be nested here instead of directly in params. Creates the campaign only; create the ad set and ads with their own calls.',
+          };
+        }
+      }
     }
   }
   if (Array.isArray(def?.inputSchema?.required)) {
