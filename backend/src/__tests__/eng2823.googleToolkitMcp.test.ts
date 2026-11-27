@@ -210,11 +210,16 @@ describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)',
   });
 
   it('with GOOGLE_TOOLKIT_SPEND_CEILING unset, the built-in default refuses a >2x raise before any mutate (ENG-3212)', async () => {
+    const saved = process.env.GOOGLE_TOOLKIT_SPEND_CEILING;
     delete process.env.GOOGLE_TOOLKIT_SPEND_CEILING;
-    const r = await call('call_google_ads_api', { customer_id: CID, entity_type: 'BUDGET', action: 'UPDATE', budget_resource_name: BUDGET, amount: 50 });
-    expect(r.isError).toBe(true);
-    expect(JSON.stringify(r)).toMatch(/ceiling/i);
-    expect(mutates()).toHaveLength(0);
+    try {
+      const r = await call('call_google_ads_api', { customer_id: CID, entity_type: 'BUDGET', action: 'UPDATE', budget_resource_name: BUDGET, amount: 50 });
+      expect(r.isError).toBe(true);
+      expect(JSON.stringify(r)).toMatch(/ceiling/i);
+      expect(mutates()).toHaveLength(0);
+    } finally {
+      if (saved === undefined) delete process.env.GOOGLE_TOOLKIT_SPEND_CEILING; else process.env.GOOGLE_TOOLKIT_SPEND_CEILING = saved;
+    }
   });
 
   it('a timeout on the confirmed mutate is UNCONFIRMED (metered as a write), not "did not apply"', async () => {
