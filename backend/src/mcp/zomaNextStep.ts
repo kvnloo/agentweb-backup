@@ -26,8 +26,14 @@ const META_FIX_NEXT =
   'correct the field they name (ads_get_errors explains a code), then preview the corrected call again. Do not retry it unchanged.';
 const OTHER_NEXT = 'Fix what the error above names, then retry once. Only if it names a connection, permission or payment problem, call zoma_status for the fix.';
 
-/** Meta's auth / permission codes: a setup problem even when Meta words it as a request error. */
-const META_AUTH_CODE = /\bcode (190|102|10|2\d\d)\b/i;
+/** Meta's invalid / expired token: a reconnect, so a setup problem even when Meta words it as a request error. */
+const META_TOKEN_ERROR = /\bcode (190|102)\b|error validating access token|session has expired/i;
+/**
+ * A Graph error from Meta itself, including its permission codes (10, 2xx) and "(#200) Requires
+ * business_management permission": those name an object or role on the Meta side, which
+ * zoma_status cannot see (it answers "All set"), so they get Meta's error, not the setup hint.
+ */
+const META_GRAPH_ERROR = /\(#\d+\)|OAuthException|\bcode (10|2\d\d)\b/i;
 /** Meta (or our own pre-validation) refused the request's content. */
 const META_VALIDATION = /Invalid parameter|Meta refused|PARAM_VALIDATION_ERROR|subcode \d+|\(code \d+|\bcode 100\b|error_user_msg|fbtrace_id/i;
 /** Connection / auth / onboarding: the only failures zoma_status can actually fix. */
@@ -62,8 +68,8 @@ export function zomaErrorNextStep(message: string): string {
   }
   if (/payment method/i.test(message)) return 'Call zoma_status for the link to add a payment method (nothing is charged), then retry.';
   if (/read-only/i.test(message)) return 'Use a read tool here (e.g. zoma_ads_report), or make this change from Claude, ChatGPT, Codex or Cursor.';
-  if (META_AUTH_CODE.test(message)) return SETUP_NEXT;
-  if (META_VALIDATION.test(message)) return META_FIX_NEXT;
+  if (META_TOKEN_ERROR.test(message)) return SETUP_NEXT;
+  if (META_GRAPH_ERROR.test(message) || META_VALIDATION.test(message)) return META_FIX_NEXT;
   if (SETUP_FAILURE.test(message)) return SETUP_NEXT;
   return OTHER_NEXT;
 }
