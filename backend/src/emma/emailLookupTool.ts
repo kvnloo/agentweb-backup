@@ -61,7 +61,12 @@ async function resolveSingle(input: SingleInput, userId: string): Promise<{ inpu
 
   // Materialise inputs from leadId if provided (lookup wins over name+company).
   if (input.leadId && input.listId) {
-    const lead: any = await crmDb.getLeadById(input.listId, input.leadId).catch(() => null);
+    // Only a lead of a list the caller may read. The lead is a plain get by key, so without this any caller holding both ids read
+    // another tenant's lead (email, name, company, LinkedIn). A list the caller may not read is treated like a missing lead.
+    const list: any = await crmDb.getLeadListById(input.listId).catch(() => null);
+    const { canAccessCrmList } = await import('../services/crmAccessControl');
+    const mayRead = list ? await canAccessCrmList(userId, list).catch(() => false) : false;
+    const lead: any = mayRead ? await crmDb.getLeadById(input.listId, input.leadId).catch(() => null) : null;
     if (lead) {
       // Inline the lead's fields so the rest of the resolver can use the same
       // logic regardless of how the input arrived. Includes linkedin so a lead

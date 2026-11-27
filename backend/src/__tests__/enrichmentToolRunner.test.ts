@@ -323,7 +323,7 @@ describe('pickPreviewLeadIds', () => {
         { leadId: 'd', email: '', linkedin: '' },
       ],
     });
-    const ids = await pickPreviewLeadIds('list-1', undefined);
+    const ids = await pickPreviewLeadIds('list-1', undefined, 'user-1');
     expect(ids).toEqual(['b', 'c']);
   });
 
@@ -338,7 +338,7 @@ describe('pickPreviewLeadIds', () => {
         { leadId: 'real2', email: '', linkedin: 'https://linkedin.com/in/real2' },
       ],
     });
-    const ids = await pickPreviewLeadIds('list-1', undefined);
+    const ids = await pickPreviewLeadIds('list-1', undefined, 'user-1');
     expect(ids).toEqual(['real1', 'real2']);
   });
 
@@ -349,7 +349,7 @@ describe('pickPreviewLeadIds', () => {
         { leadId: 'junk2', email: 'test2@company.com', linkedin: '' },
       ],
     });
-    const ids = await pickPreviewLeadIds('list-1', undefined);
+    const ids = await pickPreviewLeadIds('list-1', undefined, 'user-1');
     expect(ids).toEqual(['junk1', 'junk2']);
   });
 
@@ -357,7 +357,7 @@ describe('pickPreviewLeadIds', () => {
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
       items: [{ leadId: 'a', email: '', linkedin: '' }, { leadId: 'b', email: '', linkedin: '' }],
     });
-    const ids = await pickPreviewLeadIds('list-1', undefined);
+    const ids = await pickPreviewLeadIds('list-1', undefined, 'user-1');
     expect(ids).toEqual(['a', 'b']);
   });
 
@@ -369,31 +369,44 @@ describe('pickPreviewLeadIds', () => {
         { leadId: 'c', email: 'c@co.com' },
       ],
     });
-    const ids = await pickPreviewLeadIds('list-1', ['c', 'a']);
+    const ids = await pickPreviewLeadIds('list-1', ['c', 'a'], 'user-1');
     expect(ids.sort()).toEqual(['a', 'c']);
   });
 
   it('throws when the list has no leads', async () => {
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: [] });
-    await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
+    await expect(pickPreviewLeadIds('list-1', undefined, 'user-1')).rejects.toThrow(/no leads/i);
   });
 
   it('treats a non-array items response as an empty pool and throws', async () => {
     // Exercises the `Array.isArray(result?.items) ? ... : []` false branch (line 98)
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: null });
-    await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
+    await expect(pickPreviewLeadIds('list-1', undefined, 'user-1')).rejects.toThrow(/no leads/i);
   });
 
   it('treats a missing items field as an empty pool and throws', async () => {
     // Exercises the `Array.isArray(result?.items) ? ... : []` false branch (line 98) via undefined
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({});
-    await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
+    await expect(pickPreviewLeadIds('list-1', undefined, 'user-1')).rejects.toThrow(/no leads/i);
   });
 
   it('treats a null DB result as an empty pool (optional-chaining null path, line 98)', async () => {
     // Exercises the `result?.items` optional-chaining false branch when result itself is null
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue(null);
-    await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
+    await expect(pickPreviewLeadIds('list-1', undefined, 'user-1')).rejects.toThrow(/no leads/i);
+  });
+
+  // ENG-2840: the access check comes first, and a list the caller cannot read answers exactly like a missing one.
+  it('refuses another account\'s list before reading any of its leads, with the not-found answer', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ userId: 'someone-else', fieldNames: [] });
+    await expect(pickPreviewLeadIds('list-1', ['lead-x'], 'user-1')).rejects.toThrow('Lead list not found');
+    expect(crmDb.getLeadsByListId).not.toHaveBeenCalled();
+  });
+
+  it('answers the same for a list that does not exist', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+    await expect(pickPreviewLeadIds('list-1', undefined, 'user-1')).rejects.toThrow('Lead list not found');
+    expect(crmDb.getLeadsByListId).not.toHaveBeenCalled();
   });
 });
 

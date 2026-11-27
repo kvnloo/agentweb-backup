@@ -94,6 +94,11 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     service = new McpClientService();
   });
 
+  // ENG-3187: every browser server now has a working folder of its own; remove them with the service.
+  afterEach(async () => {
+    await service.shutdown();
+  });
+
   it('should inject --headless, --no-sandbox, --isolated, and --config for Playwright MCP server', async () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',

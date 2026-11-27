@@ -52,6 +52,30 @@ export function driveErrorReasons(err: any): string[] {
   return raw.map((e: any) => String(e?.reason ?? '')).filter(Boolean);
 }
 
+/**
+ * ENG-2840: a Drive download requested as a stream (`responseType: 'stream'`) gets its error body back as TEXT (gaxios reads it into a
+ * string), and google-auth-library only unpacks an object body, so `err.errors`, `err.code` and Google's own message were lost: a throttle
+ * read as a plain 403 and the caller saw raw JSON. This gives such an error the shape a buffered request's error has. Anything else is
+ * returned unchanged.
+ */
+export function normalizeStreamedDriveError(err: any): any {
+  const data = err?.response?.data;
+  if (typeof data !== 'string') return err;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return err;
+  }
+  const e = parsed?.error;
+  if (!e || typeof e !== 'object') return err;
+  err.response.data = parsed;
+  if (!Array.isArray(err.errors) && Array.isArray(e.errors)) err.errors = e.errors;
+  if (typeof e.code === 'number') err.code = e.code;
+  if (typeof e.message === 'string' && e.message) err.message = e.message;
+  return err;
+}
+
 /** True when a 401/403 is really a quota/throttle answer, not an access decision. */
 export function isDriveThrottle(err: any): boolean {
   return driveErrorReasons(err).some(r => /ratelimitexceeded|dailylimitexceeded/i.test(r));

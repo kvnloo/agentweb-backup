@@ -35,6 +35,7 @@ import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import { ctx, jsonResult } from './toolHelpers';
 import { resolveClientScopedContext } from './adminClientScope';
+import { withoutSignedStorageLinks } from './knowledgeBaseParams';
 
 /**
  * Read one profile section.
@@ -348,7 +349,8 @@ mcpToolRegistry.register({
     return jsonResult({
       brand_guidelines: brand.data,
       market_strategy: strategy.data,
-      knowledge_base_files: knowledge.data,
+      // No year-2500 signed file links (knowledgeBaseParams.ts): read a file with read_knowledge_base_files.
+      knowledge_base_files: withoutSignedStorageLinks(knowledge.data),
       // Named fields across both sections (ENG-3122). Raw sections above stay
       // unchanged for existing callers.
       structured_export: buildBrandExport(brand.data, strategy.data),

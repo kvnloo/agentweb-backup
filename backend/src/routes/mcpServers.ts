@@ -438,14 +438,17 @@ router.post("/:name/discover-tools", async (req, res) => {
       });
     };
 
+    let mcpService: McpClientService | undefined;
+    let discoveryTransport: unknown;
     try {
       // Use McpClientService to create transport (handles decryption and env resolution)
-      const mcpService = new McpClientService();
+      mcpService = new McpClientService();
       
       // Cast server config to the exported type (assuming interface compatibility or simple object pass)
       // The local McpServerConfig in the file is very similar to the one in McpClientService
       // We can pass it directly as it matches the shape
       const transport = await mcpService.createTransport(serverName, server as any);
+      discoveryTransport = transport;
       
       // Create client and connect
       const client = new Client(
@@ -467,6 +470,7 @@ router.post("/:name/discover-tools", async (req, res) => {
       
       // Close connection
       await client.close();
+      mcpService.releaseTransportResources(transport);
       
       // Update server with discovered tools
       servers[serverIndex].discoveredTools = toolNames;
@@ -486,6 +490,8 @@ router.post("/:name/discover-tools", async (req, res) => {
         count: toolNames.length
       });
     } catch (mcpError: any) {
+      // ENG-3187: a failed discovery must not leave a browser server's working folder behind.
+      mcpService?.releaseTransportResources(discoveryTransport);
       console.error("Error discovering tools from MCP server:", mcpError);
       res.status(500).json({ 
         message: "Failed to discover tools from MCP server", 

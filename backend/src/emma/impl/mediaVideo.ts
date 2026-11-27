@@ -349,6 +349,24 @@ export async function describeImage(
     if (!llmModel) {
       llmModel = await getVisionModel();
     }
+    // ENG-2840 (W2-8), the ENG-2988 rule: an object of OUR bucket is read below with the server's own credentials (presigned), so it is
+    // read only for a caller who may read that key: the same check the file routes and the other storage tools make. Checked for every
+    // model and before any read, so neither the download nor the raw-URL fallback below can hand another tenant's object to a model.
+    if (!imageUrl.startsWith('data:')) {
+      const { isS3Url, extractS3KeyFromUrl } = await import('../../utils/s3Utils');
+      if (isS3Url(imageUrl)) {
+        const { checkOurBucketKeyRead, TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_UNAVAILABLE_MESSAGE } = await import('./toolStorageAccess');
+        const key = extractS3KeyFromUrl(imageUrl);
+        const decision = key ? await checkOurBucketKeyRead('describe_image', usageContext?.userId, key) : 'refuse';
+        if (decision !== 'allow') {
+          return {
+            success: false,
+            message: decision === 'unavailable' ? TOOL_FILE_UNAVAILABLE_MESSAGE : TOOL_FILE_REFUSAL_MESSAGE,
+            error: 'File not accessible',
+          };
+        }
+      }
+    }
     // Use custom prompt or default
     const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
