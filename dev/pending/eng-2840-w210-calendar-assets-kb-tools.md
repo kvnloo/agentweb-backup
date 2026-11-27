@@ -5,8 +5,12 @@
     - Only the caller's own Google sign-in is used; there is no fallback to a shared account.
     - Dates must carry a zone, ranges are at most 92 days, and `calendar_id` and `event_id` are checked by charset.
     - Google's raw error text is never passed on.
-  - `search_user_assets`: a pure read. The new `warm: false` option on `getExecutionsWithAssets` skips every session cache write, and
-    `backfill: false` skips the report fetch and the classifier. Answers carry no session ids. The URLs open for anyone holding them.
+  - `search_user_assets`: a pure read. New `getExecutionsWithAssets` options:
+    - `warm: false` skips every session cache write;
+    - `sessions: false` reads only the task-run files, because sessions are listed by `searchUserAssets`;
+    - `backfill: false` (existing) skips the report fetch and the classifier.
+
+    Answers carry no session ids. The URLs open for anyone holding them.
   - `inspect_linkedin_account`: the caller's connected LinkedIn outreach accounts and their queued actions. A refusal does not echo the id.
   - `update_email_draft_for_lead`: writes and saves a draft and sends nothing.
     - Access is checked first: another account's list answers like a missing one.
@@ -15,7 +19,11 @@
   - New route `POST /api/emma/kb-file-read`; the old route is unchanged.
   - It refuses `gdoc:` and `gsheet:` ids, which fall back to a shared Google service account for any file id, until the shared-Google
     fix's step 2.
+    - This is not a full boundary on its own. A Drive shortcut inside a registered folder is followed to its target through the same
+      account, and folder registration accepts any folder that account can open; step 2 closes both.
+    - `emma_send_message` can still have Emma read a `gdoc:` id.
   - 1 to 5 files, text only, at most 100,000 characters per file and 200,000 per call.
+  - It is `readOnly`, so a key with only `tools:read` can call it.
   - Fixed per-file errors; answers are fixed fields only.
   - It is now exempt from the public-response sanitizer, like `read_file_content`.
   - Annotated `read`: no path stores a token or writes.
@@ -32,8 +40,10 @@
     missing lead now counts as failed. The ids are capped at 500 (the portal sends at most one page of 200).
   - `materialize_knowledge_base_asset` buffered the whole Drive file before measuring it, so bad size metadata (0 during a virus scan)
     meant a large file was held in memory. The download is now streamed and stops at the 200 MB ceiling.
-  - A teammate's read of the shared workspace asset library no longer writes the other member's session caches (it already skipped the
-    backfill, ENG-2874).
+  - Drive text reads (`readGoogleDriveFileContent`, for Emma and MCP) buffered the whole file, exports included, and turned binary
+    files into base64 whatever their size. Naming a large video in a registered folder could exhaust the process's memory.
+    - Every Drive download is now a stream read with a 50 MB ceiling (`utils/readWithByteCap.ts`, shared with the asset download).
+    - A larger file is refused as too large.
   - Emma's Google Calendar reads give up after 30 s; they had no limit.
 - Not exposed:
   - `log_contact_event`: it writes a shared contact-events table with no tenant, a data-plane change for the owner.
@@ -44,6 +54,7 @@
   - Emma's own `search_user_assets` still backfills and classifies. Its fetch is guarded by the separate SSRF PR.
   - Emma's calendar tools pass Google's raw error text to her own chat.
 - Proof:
-  - New tests: 61 Calendar, 62 asset and outreach, 78 knowledge-base read, 35 lead draft, plus tests for each Emma fix.
+  - New tests: 61 Calendar, 62 asset and outreach, 79 knowledge-base read, 36 lead draft, 9 for the capped reader and the Drive
+    ceiling, plus tests for each Emma fix.
   - A sweep of 146 suites (3,140 tests) in the MCP, emma-route, tasks, CRM, enrichment, Drive and Calendar areas: green.
   - `npm run typecheck`: exit 0.
