@@ -1,3 +1,145 @@
+## ENG-3212: Built-in default spend ceiling for Google and X Toolkit writes (2026-11-27)
+
+**Problem:** Prod EB is at CloudFormation's 4096-char `EnvironmentVariables` limit, so
+`GOOGLE_TOOLKIT_SPEND_CEILING` and `X_ADS_TOOLKIT_SPEND_CEILING` were never set on prod. Unset
+meant "no ceiling", so external Zoma agents' Google/X budget writes had no spend limit.
+
+**Fix:** `googleSpendCeilingPolicyFromEnv` (`backend/src/mcp/googleToolkitWrites.ts`) now returns
+`DEFAULT_GOOGLE_X_SPEND_CEILING` = `{maxDailyBudget: 500_000_000, maxChangeRatio: 2}` (micros:
+$500/day, at most 2x per change) when the env var is unset or empty, mirroring
+`DEFAULT_LINKEDIN_SPEND_CEILING`. A set env var fully replaces the default; malformed JSON still
+fails closed (`{maxChangeRatio: -1}` → every money write refused).
+
+**Also fixed:** `raw` used to default to `process.env.GOOGLE_TOOLKIT_SPEND_CEILING`, and X passes
+`process.env.X_ADS_TOOLKIT_SPEND_CEILING` — when X's var was unset that `undefined` triggered the
+default parameter, so X silently inherited Google's ceiling. `raw` is now a required argument;
+each provider reads only its own env var.
+
+**Raise a limit:** set the provider's env var (micros JSON, e.g. `{"maxDailyBudget":1000000000}`).
+Note a set value replaces the default entirely, so include `maxChangeRatio` if you still want it.
+
+Tests: `backend/src/__tests__/eng3212.googleXDefaultCeiling.test.ts`.
+
+## ENG-3212: Google/X spend-ceiling refusals show currency, not micros (2026-11-27)
+
+Google Ads and X Ads toolkit writes refused over-ceiling budgets with the shared core's raw
+message, relabelled `(minor units)` → `(micros)`, e.g. `daily_budget 600000000 exceeds ... 500000000 (micros)`.
+They now go through `spendCeilingRefusalMessage` (`backend/src/mcp/googleToolkitWrites.ts`), which
+formats the same verdict with `formatMicros` as LinkedIn does: `daily_budget 600.00 USD exceeds this
+account's max daily budget of 500.00 USD.` and `daily_budget change 100.00 USD -> 300.00 USD is 3.00x, ...`.
+Display only — `evaluateMetaSpendCeiling`, units, policy parsing and thresholds are unchanged;
+`SPEND_CEILING_INVALID` messages pass through as before. Test: `eng3212.ceilingRefusalDollars.test.ts`.
+
+## ENG-3211: spend-ceiling ratio check skips a zero prior daily_budget under a daily cap (2026-11-27)
+
+With `META_TOOLKIT_SPEND_CEILING` set on prod-3 (`{maxDailyBudget:50000,maxChangeRatio:2}`), `evaluateMetaSpendCeiling` (`services/agentMode/metaSpendCeiling.ts`) treated any increase from a 0 prior as an infinite ratio and refused it, so a campaign or ad set with no budget could never be given one through the Toolkit, which re-blocked the case #4266 fixed. The ratio check now skips a zero prior **only** when the field is `daily_budget` AND the policy sets `maxDailyBudget`, so the absolute cap still bounds the new budget (0 -> 5000 allowed, 0 -> 60000 refused). Every other zero prior keeps the old refusal: `lifetime_budget`, `spend_cap` and `budget_amount` raises from 0 have no absolute cap, and a ratio-only policy (no `maxDailyBudget`) would otherwise let 0 -> anything through. Non-zero priors are still ratio-checked. The function is shared by the Meta, Google, LinkedIn and X toolkit write paths (`mcp/{meta,google,linkedInAds,xAds}ToolkitWrites.ts`), so this applies to all four.
+
+## ENG-3211: pixel health no longer fails without the Business read (2026-11-27)
+
+`backend/src/mcp/metaToolkitEventSources.ts` ran `readBusinessCatalogs` at the top of every event-source tool, so `meta_event_source_get_health` failed outright when Meta refused the business read ("(#100) Requires business_management permission to access the field") or when the ad account was not in a Business portfolio. The firing state only needs `act_X/adspixels` and `{pixel}/stats`. `get_health` now computes `state`, `last_fired_time` and `events_last_24h` first and reads the business best-effort: if that read fails or there is no business it returns `connected_catalogs: null`, `healthy: null` and a `connected_catalogs_reason`. `get`, `get_catalogs`, `connect` and `disconnect` are unchanged and still need the business. A failure reading a catalog's connected pixels after a successful business read still fails the call, as before.
+
+## ENG-2840: Calendar reads, asset search, LinkedIn outreach account, lead email drafts and a safer knowledge-base file read over MCP (2026-11-27)
+
+- Six more of Emma's tools on the MCP server for outside agents, on their own account and under Emma's names:
+  - `google_calendar_list_events`, `google_calendar_get_event`, `google_calendar_list_calendars`:
+    - Only the caller's own Google sign-in is used; there is no fallback to a shared account.
+    - Dates must carry a zone, ranges are at most 92 days, and `calendar_id` and `event_id` are checked by charset.
+    - Google's raw error text is never passed on.
+  - `search_user_assets`: a pure read. New `getExecutionsWithAssets` options:
+    - `warm: false` skips every session cache write;
+    - `sessions: false` reads only the task-run files, because sessions are listed by `searchUserAssets`;
+    - `backfill: false` (existing) skips the report fetch and the classifier.
+
+    Answers carry no session ids. The URLs open for anyone holding them.
+  - `inspect_linkedin_account`: the caller's connected LinkedIn outreach accounts and their queued actions. A refusal does not echo the id.
+  - `update_email_draft_for_lead`: writes and saves a draft and sends nothing.
+    - Access is checked first: another account's list answers like a missing one.
+    - It never runs with a session, and spends up to four model calls on the caller.
+- `read_knowledge_base_files` reshaped:
+  - New route `POST /api/emma/kb-file-read`; the old route is unchanged.
+  - It refuses `gdoc:` and `gsheet:` ids, which fall back to a shared Google service account for any file id, until the shared-Google
+    fix's step 2.
+    - This is not a full boundary on its own. A Drive shortcut inside a registered folder is followed to its target through the same
+      account, and folder registration accepts any folder that account can open; step 2 closes both.
+    - `emma_send_message` can still have Emma read a `gdoc:` id.
+  - 1 to 5 files, text only, at most 100,000 characters per file and 200,000 per call.
+  - It is `readOnly`, so a key with only `tools:read` can call it.
+  - Fixed per-file errors; answers are fixed fields only.
+  - It is now exempt from the public-response sanitizer, like `read_file_content`.
+  - Annotated `read`: no path stores a token or writes.
+- Same pattern as the other wave-2 tools:
+  - New metered `/api/emma/*` routes (`/google-calendar-read`, `/user-assets`, `/linkedin-outreach-account`, `/lead-email-draft`,
+    `/kb-file-read`) that check the arguments again and run Emma's code as `req.user.userId` only.
+  - A 4xx passes through; a 5xx gets a fixed text.
+  - A `CallGuard` per tool.
+- The MCP inventory goes from 150 to 156 tools.
+- Fixes in Emma's own code:
+  - `enrich_leads_preview` read the leads of any list id before its access check. "No leads to preview" versus the access refusal told a
+    caller whether another account's list existed. Access is now checked first, and a list the caller cannot read answers like a missing one.
+  - Portal `PUT /api/crm/lists/:listId/leads/bulk-contact-status`: `updateLead` is an upsert, so an unknown id created a stub lead. A
+    missing lead now counts as failed. The ids are capped at 500 (the portal sends at most one page of 200).
+  - `materialize_knowledge_base_asset` buffered the whole Drive file before measuring it, so bad size metadata (0 during a virus scan)
+    meant a large file was held in memory. The download is now streamed and stops at the 200 MB ceiling.
+  - Drive text reads (`readGoogleDriveFileContent`, for Emma and MCP) buffered the whole file, exports included, and turned binary
+    files into base64 whatever their size. Naming a large video in a registered folder could exhaust the process's memory.
+    - Every Drive download is now a stream read with a 50 MB ceiling (`utils/readWithByteCap.ts`, shared with the asset download).
+    - A larger file is refused as too large.
+  - Emma's Google Calendar reads give up after 30 s; they had no limit.
+- Not exposed:
+  - `log_contact_event`: it writes a shared contact-events table with no tenant, a data-plane change for the owner.
+  - `set_lead_contact_status` and `attach_knowledge_base_files`: already covered.
+  - `enrich_leads_preview` (it spends provider credits), `materialize_knowledge_base_asset`, `convert_to_pdf`, `create_html_template`.
+- Known, not changed (Emma, pre-existing):
+  - Other accounts' "public" knowledge bases are readable, by design pending an owner decision.
+  - Emma's own `search_user_assets` still backfills and classifies. Its fetch is guarded by the separate SSRF PR.
+  - Emma's calendar tools pass Google's raw error text to her own chat.
+- Proof:
+  - New tests: 61 Calendar, 62 asset and outreach, 79 knowledge-base read, 36 lead draft, 9 for the capped reader and the Drive
+    ceiling, plus tests for each Emma fix.
+  - A sweep of 146 suites (3,140 tests) in the MCP, emma-route, tasks, CRM, enrichment, Drive and Calendar areas: green.
+  - `npm run typecheck`: exit 0.
+
+## ENG-2840: describe_video and the HTML-report text backfill fetch only through the SSRF-guarded fetch (2026-11-27)
+
+- Found while researching the next batch of MCP tools (W2-10). Both are live in Emma today; neither is on the MCP server.
+- `describe_video` (`emma/impl/video.ts`): a non-YouTube URL was downloaded with a plain axios GET, with no host check, default redirects
+  and no timeout.
+  - Any signed-in user could make the server request an internal address, through Emma's tool or `POST /api/emma/describe-media`
+    with `type: "video"`.
+  - It now goes through `fetchCallerUrlBuffer` (`utils/callerUrlFetch.ts`):
+    - DNS is pinned to a public address, and every redirect is checked again.
+    - The size is capped while downloading (`MAX_DOWNLOADED_VIDEO_SIZE_MB`, default 100 MB).
+    - The whole download is bounded at 180 s.
+  - A refused URL gets the one generic refusal. YouTube URLs are unchanged, because Gemini fetches them itself.
+  - The video is now held in memory (up to the cap), written to the temp file, and then released before the Gemini upload. Before, it was streamed to disk.
+  - A download that hits the time limit says so plainly.
+  - A `MAX_DOWNLOADED_VIDEO_SIZE_MB` that is not a positive number falls back to 100 MB. Before, NaN turned the cap off.
+- HTML-report backfill (`routes/tasks.ts`, `enrichHtmlReportsWithSearchableText`):
+  - A session's report URLs are scraped from chat text (`utils/scanMessagesForAssets.ts`). The pattern accepts any host when
+    `.amazonaws.com/` appears later in the URL.
+  - The reports read, and `search_user_assets`, then fetched each one with plain axios.
+  - Now only a URL of our own bucket (`isS3Url`) is read, through `fetchCallerUrlText`, with a 5 MB cap and 15 s total.
+  - Any other URL is skipped, so it gets no searchable text, the same as when a fetch failed before.
+  - The tag stripping was quadratic on hostile HTML: 50 KB of "<" blocked the event loop for 1.3 s, and a user can put such a
+    file in their own reports.
+    - `utils/htmlSearchableText.ts` now does it in linear time, with the same text as before on normal reports.
+- Impact checked: the production hosts require IMDSv2, so a plain GET could not read instance credentials. Other internal addresses were reachable.
+- Not changed:
+  - The scrape pattern itself: report listing is unchanged.
+  - The knowledge-base update route's fetch of `result_files` URLs (`routes/tasks.ts`, about line 1617): those URLs are written by
+    the server, not chosen by a caller.
+- Proof:
+  - `agentModeService.describeVideo.test.ts`: guarded download, refusal, size, timeout, the size-setting fallback, and an empty file.
+  - `tasks.searchableTextPersistence.test.ts`: internal, foreign-host and other-bucket URLs are never fetched.
+  - `htmlSearchableText.test.ts`: the same text as the old expressions, and linear time on hostile input.
+  - A sweep of 22 suites (tasks routes, describe-media, caller-URL and SSRF guard tests): 315 pass.
+
+## ENG-3179: capture-drift monitor acknowledges a deliberately customized capture route (2026-11-26)
+
+- `captureDriftMonitor.ts` gains `CUSTOMIZED_CAPTURE_ROUTES` (repo -> reason). For a listed repo, a *drifted* `app/api/capture/route.ts` is acknowledged instead of filing the daily `lp-capture-drift` oncall item. A missing route and any `middleware.ts` drift still alert.
+- Seeded with the Smart Trade Team site (`lp-create-a-high-converting-mobil-f80e1869`): its route carries a `/become-a-pro` recruitment list, `NO_PIXEL_PATHS` and `SOURCE_BY_PATH` that `buildCaptureRoute` cannot emit, so regenerating would break recruitment routing.
+- Rollback: remove the map entry (or revert); the alert resumes on the next daily run.
+
 ## ENG-3196: Pure campaign-change risk classifier for Emma action engine (2026-11-26)
 
 Adds `backend/src/services/campaignChangeRiskPolicy.ts`, a deterministic, fail-closed, tenant-scoped classifier (execute / stage_for_approval / reject). Shadow library only; not wired into any execution path. First slice of ENG-1970.
