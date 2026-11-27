@@ -2686,43 +2686,6 @@ async function readGoogleDriveSharedFile(kbIdentifier: string, fileName: string,
 // Maximum bytes materialize_knowledge_base_asset will download/upload for one file.
 const MATERIALIZE_ASSET_MAX_BYTES = 200 * 1024 * 1024;
 
-/**
- * ENG-2840: the body of a download, read up to `maxBytes`. Returns null (and stops the download) as soon as more than `maxBytes` arrive.
- * A body that is already a buffer (some transports, and tests) is measured as is.
- */
-async function readWithByteCap(body: unknown, maxBytes: number): Promise<Buffer | null> {
-  if (Buffer.isBuffer(body)) return body.length > maxBytes ? null : body;
-  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-    const buffer = Buffer.from(body as any);
-    return buffer.length > maxBytes ? null : buffer;
-  }
-  const stream = body as NodeJS.ReadableStream & { destroy?: (error?: Error) => void };
-  if (!stream || typeof (stream as any).on !== 'function') return Buffer.alloc(0);
-  return new Promise<Buffer | null>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let done = false;
-    stream.on('data', (chunk: Buffer | string) => {
-      if (done) return;
-      const piece = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      total += piece.length;
-      if (total > maxBytes) {
-        done = true;
-        chunks.length = 0;
-        stream.destroy?.();
-        resolve(null);
-        return;
-      }
-      chunks.push(piece);
-    });
-    stream.on('end', () => {
-      if (!done) { done = true; resolve(Buffer.concat(chunks)); }
-    });
-    stream.on('error', (error: Error) => {
-      if (!done) { done = true; reject(error); }
-    });
-  });
-}
 
 /**
  * Turn an image/video file from a connected Google Drive knowledge base
@@ -2892,6 +2855,7 @@ export async function materializeKnowledgeBaseAsset(
       { fileId: file.id!, alt: 'media', supportsAllDrives: true },
       { responseType: 'stream' }
     );
+    const { readWithByteCap } = await import('../../utils/readWithByteCap');
     const buffer = await readWithByteCap(mediaResponse.data, MATERIALIZE_ASSET_MAX_BYTES);
     if (!buffer) {
       return {
@@ -2917,7 +2881,7 @@ export async function materializeKnowledgeBaseAsset(
       url: uploadResult.url,
       file_name: file.name || fileName,
       mime_type: mimeType,
-      size,
+      size: buffer.length, // the bytes actually stored (Drive's reported size can be 0)
       kb_identifier: kbIdentifier
     };
   } catch (error: any) {

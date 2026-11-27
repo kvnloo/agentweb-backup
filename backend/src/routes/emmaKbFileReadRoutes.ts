@@ -111,7 +111,7 @@ export function checkKbFileReadBody(body: unknown): KbFileReadCheck {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────── answers
 
 export type KbReadErrorClass =
-  | 'not_found' | 'not_connected' | 'rate_limited' | 'search_incomplete' | 'ambiguous' | 'not_text' | 'read_failed' | 'call_limit' | 'out_of_time';
+  | 'not_found' | 'not_connected' | 'rate_limited' | 'search_incomplete' | 'ambiguous' | 'not_text' | 'too_large' | 'read_failed' | 'call_limit' | 'out_of_time';
 
 /** The only error texts a file can carry. `not_found` also answers "not authorized". */
 export const KB_FILE_READ_ERRORS: Readonly<Record<KbReadErrorClass, string>> = Object.freeze({
@@ -121,6 +121,7 @@ export const KB_FILE_READ_ERRORS: Readonly<Record<KbReadErrorClass, string>> = O
   search_incomplete: 'The search for this file did not finish (part of the Google Drive folder could not be opened, or the folder is too large to search in time), so this is not a confirmed absence. Try again later, or read the file from a smaller folder.',
   ambiguous: 'More than one file in that Google Drive folder has this name. Rename one so the name is unique, then try again.',
   not_text: 'Not a text file: this file is an image, a video or another binary file, and only text can be read here.',
+  too_large: 'Too large: this file is over 50 MB, the most that can be read here.',
   read_failed: 'The file could not be read. Try again later.',
   call_limit: `Not read: this call already returned ${KB_FILE_READ_MAX_CALL_CHARS} characters, the most for one call. Read this file in another call.`,
   out_of_time: 'Not read: this call ran out of time before reaching this file. Read it in another call.',
@@ -172,6 +173,8 @@ export function classifyFailure(result: unknown): KbReadErrorClass {
   if (/^Multiple files named /.test(message)) return 'ambiguous';
   // Drive: the folder (or a sub-folder) could not be opened, the walk stopped at a bound, or the name query itself failed or timed out.
   if (/could not be accessed|not a confirmed absence|^Could not determine whether /.test(message)) return 'search_incomplete';
+  // ENG-2840: the Drive text read stops at DRIVE_TEXT_READ_MAX_BYTES (emma/impl/shared/googleDriveAccess.ts).
+  if (/is larger than \d+ MB, the most that can be read here/.test(message)) return 'too_large';
   if (/^Failed to read /.test(message)) return 'read_failed';
   if (/not found|does not exist/i.test(message)) return 'not_found';
   return 'read_failed';

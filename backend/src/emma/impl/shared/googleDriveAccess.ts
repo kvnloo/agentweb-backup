@@ -132,24 +132,32 @@ export async function fetchDriveFileComments(drive: any, fileId: string): Promis
   }
 }
 
+/** ENG-2840: the largest Drive file read for its text (Emma keeps at most 1,000,000 characters of it). */
+export const DRIVE_TEXT_READ_MAX_BYTES = 50 * 1024 * 1024;
+
 export async function readGoogleDriveFileContent(drive: any, fileId: string, fileName: string, mimeType: string): Promise<string> {
-  let content: Buffer;
+  // ENG-2840: every download is a stream read with a byte ceiling (DRIVE_TEXT_READ_MAX_BYTES). Before, the whole file was buffered (and
+  // a binary one then converted to base64) whatever its size, so naming a large video in a registered folder could exhaust the
+  // process's memory. Drive's reported size can be missing, so it is not trusted.
+  const { readWithByteCap } = await import('../../../utils/readWithByteCap');
+  const tooLarge = () => new Error(`"${fileName}" is larger than ${DRIVE_TEXT_READ_MAX_BYTES / (1024 * 1024)} MB, the most that can be read here`);
+  const exportAs = (exportMime: string) => drive.files.export({ fileId, mimeType: exportMime }, { responseType: 'stream' });
 
   // Google Workspace files need to be exported
+  let res: any;
   if (mimeType === 'application/vnd.google-apps.document') {
-    const res = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'arraybuffer' });
-    content = Buffer.from(res.data);
+    res = await exportAs('text/plain');
   } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
-    const res = await drive.files.export({ fileId, mimeType: 'text/csv' }, { responseType: 'arraybuffer' });
-    content = Buffer.from(res.data);
+    res = await exportAs('text/csv');
   } else if (mimeType === 'application/vnd.google-apps.presentation') {
-    const res = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'arraybuffer' });
-    content = Buffer.from(res.data);
+    res = await exportAs('text/plain');
   } else {
     // Binary files — download directly
-    const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'arraybuffer' });
-    content = Buffer.from(res.data);
+    res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
   }
+  const read = await readWithByteCap(res?.data, DRIVE_TEXT_READ_MAX_BYTES);
+  if (!read) throw tooLarge();
+  const content: Buffer = read;
 
   const extension = (fileName.split('.').pop() || '').toLowerCase();
 
