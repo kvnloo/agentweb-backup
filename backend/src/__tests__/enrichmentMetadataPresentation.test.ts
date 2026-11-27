@@ -106,6 +106,21 @@ describe('sanitizeLeadForResponse', () => {
     expect(sanitizeLeadForResponse(lead)).toBe(lead);
   });
 
+  it.each([undefined, 'allowlisted-admin', 'org-mate'])('hides the internal send claim for viewer %s without changing the stored lead', (viewer) => {
+    mockIsEnigmaEnabled.mockReturnValue(viewer === 'allowlisted-admin');
+    const lead = {
+      leadId: 'lead-claimed',
+      emailDraftSendClaimedAt: '2026-11-13T21:28:04.142Z#claim-token',
+      emailDraft: { subject: 'Draft', htmlContent: '<p>Hello</p>' },
+      customFields: { industry: 'Software' },
+    };
+    const out = sanitizeLeadForResponse(lead, viewer)!;
+    expect(out).not.toHaveProperty('emailDraftSendClaimedAt');
+    expect(out.emailDraft).toEqual(lead.emailDraft);
+    expect(out.customFields.industry).toBe('Software');
+    expect(lead.emailDraftSendClaimedAt).toContain('claim-token');
+  });
+
   it('handles null / undefined leads', () => {
     expect(sanitizeLeadForResponse(null)).toBeNull();
     expect(sanitizeLeadForResponse(undefined)).toBeUndefined();

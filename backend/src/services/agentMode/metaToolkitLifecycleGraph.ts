@@ -6,6 +6,8 @@
  * Ownership: a node id addresses a Graph object globally, so every read compares the
  * node's own account_id with the selected ad account and treats a foreign node as absent.
  */
+import { describeMetaError } from '../../utils/metaErrorDetail';
+
 export type LifecycleEntity = 'CAMPAIGN' | 'AD_SET' | 'AD';
 
 export interface MetaGraphHttp {
@@ -91,7 +93,18 @@ export async function copyMetaNode(ctx: MetaGraphContext, entity: LifecycleEntit
   if (entity !== 'AD' && opts.deep_copy) params.deep_copy = true;
   if (entity === 'AD_SET' && opts.campaign_id) params.campaign_id = opts.campaign_id;
   if (entity === 'AD' && opts.adset_id) params.adset_id = opts.adset_id;
-  const { data } = await ctx.http.post(`${base(ctx)}/${encodeURIComponent(id)}/copies`, null, { params });
+  let data: any;
+  try {
+    ({ data } = await ctx.http.post(`${base(ctx)}/${encodeURIComponent(id)}/copies`, null, { params }));
+  } catch (error: any) {
+    // axios's own message is "Request failed with status code 400" — the reason Meta gave
+    // (error_user_title / error_user_msg / subcode / fbtrace_id) is only in the response body.
+    // Re-thrown with that detail; `response` keeps status + Meta's body (never the request
+    // config, which carries the access token) so the caller still knows Meta answered.
+    const wrapped: any = new Error(describeMetaError(error, 'Meta refused the copy.'));
+    if (error?.response) wrapped.response = { status: error.response.status, data: error.response.data };
+    throw wrapped;
+  }
   const copiedId = data?.copied_campaign_id ?? data?.copied_adset_id ?? data?.copied_ad_id;
   const childIds: string[] = [];
   for (const group of Array.isArray(data?.ad_object_ids) ? data.ad_object_ids : []) {

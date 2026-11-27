@@ -16,7 +16,7 @@ import {
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
-import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
+import { googleToolkitEnabled, linkedInAdsToolkitEnabled, linkedInAdsWritesEnabled, xAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { annotateToolkitTools } from '../mcp/toolkitToolAnnotations';
 import { databricksToolView } from '../mcp/zomaDatabricksReadOnly';
 import { rateLimiter } from '../middleware/rateLimiter';
@@ -24,6 +24,8 @@ import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } 
 import { validateRef } from '../services/journeyAttribution';
 import { toZomaVoice, zomaErrorNextStep, zomaNextStep } from '../mcp/zomaNextStep';
 import { ZOMA_ADS_EXPERIENCE_QUESTION, ZOMA_WELCOME } from '../mcp/zomaAdsExperience';
+import { measurementReportsEnabledForUserId } from '../mcp/zomaMeasurementReport';
+import { describeMetaError, metaErrorFields } from '../utils/metaErrorDetail';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -38,32 +40,84 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
     return res.status(400).json({ error: toZomaVoice(error.message), next_step: zomaErrorNextStep(error.message) });
   }
   console.error('[meta-toolkit] call failed:', error instanceof Error ? error.message : error);
-  return res.status(500).json({ error: 'Meta Toolkit call failed.' });
+  return res.status(500).json({ error: metaToolkitFailureMessage(error) });
+}
+
+/**
+ * Never the bare "Meta Toolkit call failed.": the caller cannot act on it, and a failed read looked
+ * identical to an outage. When Meta refused, its own error fields (message, error_user_title,
+ * error_user_msg, code, subcode, fbtrace_id) are returned — they are Meta's answer to the caller's
+ * own request, and the only thing that names the field to fix. Any other exception is ours: its
+ * text can carry internals, so only its class is named (with any token redacted defensively).
+ */
+export function metaToolkitFailureMessage(error: unknown): string {
+  const redact = (text: string) => text
+    .replace(/access_token=[^&\s"']+/gi, 'access_token=[redacted]')
+    .replace(/\bEAA[A-Za-z0-9]{20,}\b/g, '[redacted]')
+    .trim()
+    .slice(0, 600);
+  if (metaErrorFields(error)) return `Meta Toolkit call failed: Meta refused the request: ${redact(describeMetaError(error))}`;
+  const kind = error instanceof Error && error.name ? error.name : typeof error;
+  return `Meta Toolkit call failed: internal error (${kind}) before Meta answered. This is not a problem with the request; report it rather than retrying.`;
 }
 
 /**
  * ENG-2823: Meta tools + Zoma tools, plus the Google Ads provider's tools while it is enabled.
  * The Google manifest is loaded lazily so the Meta-only path never imports it.
  */
-function toolkitManifest() {
+export function toolkitManifest(measurementReports: boolean) {
   // ENG-2747: every advertised tool carries MCP annotations (deny-by-default; see toolkitToolAnnotations.ts).
-  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest());
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
-  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]);
+  const tools: any[] = [...getMetaToolkitManifest(undefined, { measurementReports })];
+  if (googleToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
+    tools.push(...getGoogleToolkitManifest());
+  }
+  // ENG-3142: X Ads tools only while ZOMA_X_ADS_ENABLED is on.
+  if (xAdsToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getXAdsToolkitManifest } = require('../mcp/xAdsToolkitManifest') as typeof import('../mcp/xAdsToolkitManifest');
+    tools.push(...getXAdsToolkitManifest());
+  }
+  // LinkedIn Ads tools only while ZOMA_LINKEDIN_ADS_ENABLED is on.
+  if (linkedInAdsToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getLinkedInAdsToolkitManifest } = require('../mcp/linkedInAdsToolkitManifest') as typeof import('../mcp/linkedInAdsToolkitManifest');
+    tools.push(...getLinkedInAdsToolkitManifest());
+  }
+  return annotateToolkitTools(tools);
 }
 
-/** ENG-2747 (option B): Databricks-origin callers see only the tools they may call. */
-function toolsFor(caller: { databricksOrigin?: boolean } | undefined) {
-  const tools = toolkitManifest();
+/**
+ * ENG-2747 (option B): Databricks-origin callers see only the tools they may call.
+ * ENG-3155: the measurement report tools are listed when the flag is on or this caller is allowlisted.
+ */
+async function toolsFor(caller: { userId: string; databricksOrigin?: boolean }) {
+  const tools = toolkitManifest(await measurementReportsEnabledForUserId(caller.userId));
   return caller?.databricksOrigin ? databricksToolView(tools) : tools;
 }
 
 /** The Google section of the agent guide (between zoma-google markers) is served only while ZOMA_GOOGLE_ENABLED is on. */
 const GOOGLE_DOC_SECTION = /<!-- zoma-google:start -->[\s\S]*?<!-- zoma-google:end -->\n?/g;
 const GOOGLE_DOC_MARKERS = /<!-- zoma-google:(start|end) -->\n?/g;
-export function zomaSkillDoc(doc: string, google: boolean = googleToolkitEnabled()): string {
-  return google ? doc.replace(GOOGLE_DOC_MARKERS, '') : doc.replace(GOOGLE_DOC_SECTION, '');
+/**
+ * The LinkedIn Ads section (between zoma-linkedin markers) is served only while ZOMA_LINKEDIN_ADS_ENABLED is "read" or
+ * "true"; the part of it about changes (between zoma-linkedin-writes markers) only while it is "true".
+ */
+const LINKEDIN_WRITES_DOC_SECTION = /<!-- zoma-linkedin-writes:start -->[\s\S]*?<!-- zoma-linkedin-writes:end -->\n?/g;
+const LINKEDIN_WRITES_DOC_MARKERS = /<!-- zoma-linkedin-writes:(start|end) -->\n?/g;
+const LINKEDIN_DOC_SECTION = /<!-- zoma-linkedin:start -->[\s\S]*?<!-- zoma-linkedin:end -->\n?/g;
+const LINKEDIN_DOC_MARKERS = /<!-- zoma-linkedin:(start|end) -->\n?/g;
+export function zomaSkillDoc(
+  doc: string,
+  google: boolean = googleToolkitEnabled(),
+  linkedin: boolean = linkedInAdsToolkitEnabled(),
+  linkedinWrites: boolean = linkedInAdsWritesEnabled(),
+): string {
+  const withGoogle = google ? doc.replace(GOOGLE_DOC_MARKERS, '') : doc.replace(GOOGLE_DOC_SECTION, '');
+  if (!linkedin) return withGoogle.replace(LINKEDIN_DOC_SECTION, '');
+  const withWrites = linkedinWrites ? withGoogle.replace(LINKEDIN_WRITES_DOC_MARKERS, '') : withGoogle.replace(LINKEDIN_WRITES_DOC_SECTION, '');
+  return withWrites.replace(LINKEDIN_DOC_MARKERS, '');
 }
 
 const router = Router();
@@ -90,7 +144,7 @@ router.get('/skill.md', (_req: Request, res: Response) => {
 router.get('/tools', async (req: Request, res: Response) => {
   try {
     const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
-    return res.json({ tools: toolsFor(caller) });
+    return res.json({ tools: await toolsFor(caller) });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -151,9 +205,13 @@ function toolResultContent(result: unknown, nextStep: string | null) {
  * ENG-3134: MCP `instructions` (shown to the agent on connect). The first thing the user hears is
  * the welcome, then one question; zoma_status records the answer and returns the Meta connect link.
  */
-export function zomaMcpInstructions(google: boolean = googleToolkitEnabled()): string {
+export function zomaMcpInstructions(google: boolean = googleToolkitEnabled(), linkedin: boolean = linkedInAdsToolkitEnabled()): string {
+  const others = [google ? 'Google' : '', linkedin ? 'LinkedIn' : ''].filter(Boolean);
   return [
-    `${ZOMA_WELCOME} Zoma lets you run the user's ${google ? 'Meta (and Google)' : 'Meta'} ads safely from this chat.`,
+    `${ZOMA_WELCOME} Zoma lets you run the user's ${others.length ? `Meta (and ${others.join(' and ')})` : 'Meta'} ads safely from this chat.`,
+    `Use Zoma whenever the user talks about their Facebook or Instagram${others.length ? `, ${others.join(' or ')}` : ''} ads in their own words: ` +
+      'how the ads are doing or what they spent, why ads aren\'t spending, delivering or got rejected, pausing or changing ads, budgets or targeting, ' +
+      'audiences and retargeting, or seeing competitor ads.',
     `On first connect, greet the user with exactly "${ZOMA_WELCOME}" and ask one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}". ` +
       'Call zoma_status to get the answer options, then call zoma_status again with ads_experience set to their answer; it returns the next step (usually the Meta connect link). Relay it as given.',
     'Once an ad account is connected, zoma_ads_report answers spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for any date range. ' +
@@ -203,7 +261,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
         return rpcResult(res, id, {});
       case 'tools/list': {
         const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
-        return rpcResult(res, id, { tools: toolsFor(caller) });
+        return rpcResult(res, id, { tools: await toolsFor(caller) });
       }
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
@@ -257,7 +315,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
       return rpcError(res, id, -32001, message, error.status);
     }
     console.error('[meta-toolkit] MCP call failed:', error instanceof Error ? error.message : error);
-    return rpcError(res, id, -32603, 'Meta Toolkit call failed.');
+    return rpcError(res, id, -32603, metaToolkitFailureMessage(error));
   }
 });
 

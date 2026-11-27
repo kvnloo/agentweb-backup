@@ -31,6 +31,10 @@ import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } fro
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 import { HELP_ARTICLE_DEFINITION } from './metaToolkitHelp';
 import { isZomaAdsReportTool, ZOMA_ADS_REPORT_DEFINITION } from './zomaAdsReport';
+import { isZomaIndustryBenchmarkTool } from './zomaIndustryBenchmark';
+import { measurementReportsEnabled, ZOMA_MEASUREMENT_REPORT_DEFINITION } from './zomaMeasurementReport';
+import { ZOMA_REPORT_SCHEDULE_DEFINITION } from './zomaReportSchedule';
+import { withUseWhen } from './zomaUseWhen';
 
 export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
@@ -99,6 +103,21 @@ function narrowDefinition(definition: any): any {
       };
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;
+      // CREATE_PAUSED_BUNDLE is not on this surface, so its child props only advertised a one-call
+      // campaign + ad set + ads create that CAMPAIGN CREATE then refused. The nested campaign
+      // shape is accepted (flattenNestedCampaignCreate); the rest is one entity per call.
+      const pp = props.params?.properties;
+      if (pp) {
+        delete pp.ad_set;
+        delete pp.ads;
+        delete pp.requested_ad_count;
+        if (pp.campaign) {
+          pp.campaign = {
+            type: 'object',
+            description: 'CAMPAIGN CREATE only: the campaign fields (name, objective, special_ad_categories, ...) may be nested here instead of directly in params. Creates the campaign only; create the ad set and ads with their own calls.',
+          };
+        }
+      }
     }
   }
   if (Array.isArray(def?.inputSchema?.required)) {
@@ -112,7 +131,11 @@ function narrowDefinition(definition: any): any {
  * Fails loudly when a v1 tool is missing from the registry. A silently shorter
  * manifest would read as a product change.
  */
-export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegistry) {
+/**
+ * `opts.measurementReports`: whether this caller sees the ENG-3155 report tools (resolve per user with
+ * measurementReportsEnabledForUserId); default: the global flag only.
+ */
+export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegistry, opts: { measurementReports?: boolean } = {}) {
   const metaTools = META_TOOLKIT_V1_TOOL_NAMES.map((name) => {
     const tool = registry.getTool(name);
     if (!tool) throw new Error(`Meta Toolkit manifest: tool ${name} is not registered`);
@@ -120,7 +143,8 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
   });
   // ENG-2303: toolkit-local Zoma onboarding tools (handled by the gateway, not the registry).
   // ENG-2916: read-only account health + learning-phase tools (handled by the gateway).
-  return [
+  // Every description leads with a plain-language "Use when the user …" sentence (zomaUseWhen.ts).
+  return withUseWhen([
     ...metaTools,
     ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
@@ -142,12 +166,16 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...zomaToolDefinitions().map((d) => JSON.parse(JSON.stringify(d))),
     // ENG-3134: the one reporting tool (spend, impressions, clicks, CTR, CPC, conversions, ROAS).
     JSON.parse(JSON.stringify(ZOMA_ADS_REPORT_DEFINITION)),
-  ];
+    // ENG-3155: the proactive measurement report and its schedule (dark until the flag or the caller's allowlist entry).
+    ...((opts.measurementReports ?? measurementReportsEnabled())
+      ? [ZOMA_MEASUREMENT_REPORT_DEFINITION, ZOMA_REPORT_SCHEDULE_DEFINITION].map((d) => JSON.parse(JSON.stringify(d)))
+      : []),
+  ]);
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isZomaAdsReportTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaBoostTool(name) || isMetaExperimentWriteTool(name)) return;
+  if (isZomaTool(name) || isZomaAdsReportTool(name) || isZomaIndustryBenchmarkTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaBoostTool(name) || isMetaExperimentWriteTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

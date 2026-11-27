@@ -1,4 +1,5 @@
 import { Resend } from 'resend';
+import { createHash, randomUUID } from 'crypto';
 import { getSecret } from '../utils/secretsManager';
 import axios from 'axios';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
@@ -21,6 +22,31 @@ export interface ReceivedEmailAuthentication {
   spf?: ReceivedEmailAuthVerdict;
   dkim?: ReceivedEmailAuthVerdict;
   dmarc?: ReceivedEmailAuthVerdict;
+}
+
+/**
+ * ENG-2840: which line an email waits in. Every email shares ONE paced queue (2 a second). One GTM report sends one email at
+ * a time, so on its own it holds a single slot; but when several senders overlap (several reports at once, later several
+ * outside agents each emailing many contacts) a password reset or a support reply could wait behind all of their mail.
+ *
+ *  - `transactional` (the default for every caller that says nothing): mail a person is waiting for. Always served first.
+ *    Not bounded, exactly as before this change.
+ *  - `bulk`: automated or agent-triggered mail that can wait a few seconds. Served after the transactional lane (with a guaranteed
+ *    slot, see BULK_SLOT_EVERY) and bounded: a full lane rejects at once instead of growing without limit.
+ */
+export type EmailLane = 'transactional' | 'bulk';
+
+/** Thrown, at once, when the bulk lane is full. Nothing was queued and nothing was sent. */
+export class EmailQueueFullError extends Error {
+  readonly code = 'EMAIL_QUEUE_FULL';
+
+  constructor(
+    readonly lane: EmailLane,
+    readonly limit: number,
+  ) {
+    super(`The ${lane} email queue is full (${limit} waiting). Nothing was sent. Try again in a minute.`);
+    this.name = 'EmailQueueFullError';
+  }
 }
 
 /**
@@ -50,11 +76,57 @@ interface ResendSendParams {
   replyTo?: string;
   /** ENG-2367: extra headers (e.g. List-Unsubscribe). */
   headers?: Record<string, string>;
+  /** ENG-2984: tenant scope for the idempotency key; defaults to `from`. */
+  tenantId?: string;
+  /**
+   * ENG-2984: caller-supplied intent/step (e.g. `drip:<seqId>:<step>`). Two sends with the same
+   * tenant, recipients, content and intent share one Idempotency-Key, so Resend delivers once.
+   * Omitted → a fresh per-call nonce: retries of THIS call still reuse one key, but separate
+   * calls with identical content are not merged (unchanged behaviour for callers without one).
+   */
+  idempotencyIntent?: string;
+  /** ENG-2840: the line this email waits in. Absent = `transactional`. Never sent to Resend. */
+  lane?: EmailLane;
+}
+
+/** Internal: params after sendEmail has fixed the key, so queue + retries reuse it. */
+type KeyedResendSendParams = ResendSendParams & { idempotencyKey: string };
+
+const sortedList = (v?: string | string[]) =>
+  (Array.isArray(v) ? v : v ? [v] : []).map((a) => a.trim().toLowerCase()).sort();
+
+/**
+ * ENG-2984: deterministic Resend Idempotency-Key from (tenant, recipients, content hash, intent).
+ * Pure — identical inputs always give the same key; any content difference gives a different one.
+ */
+export function buildResendIdempotencyKey(params: ResendSendParams & { idempotencyIntent: string }): string {
+  const contentHash = createHash('sha256')
+    .update(JSON.stringify([
+      params.from,
+      params.subject,
+      params.html ?? '',
+      params.text ?? '',
+      params.inReplyTo ?? '',
+      params.replyTo ?? '',
+      params.headers ? Object.keys(params.headers).sort().map((k) => [k, params.headers![k]]) : [],
+    ]))
+    .digest('hex');
+  const digest = createHash('sha256')
+    .update(JSON.stringify([
+      params.tenantId ?? params.from,
+      sortedList(params.to),
+      sortedList(params.cc),
+      contentHash,
+      params.idempotencyIntent,
+    ]))
+    .digest('hex');
+  return `aw-send-${digest}`;
 }
 
 interface QueuedEmailSend {
   id: number;
-  params: ResendSendParams;
+  lane: EmailLane;
+  params: KeyedResendSendParams;
   resolve: (value: any) => void;
   reject: (error: any) => void;
 }
@@ -65,7 +137,14 @@ class ResendService {
   private readonly MAX_RETRIES = 3;
   private readonly BASE_DELAY = 1000; // 1 second base delay
   private readonly MIN_SEND_INTERVAL_MS = 500; // 2 requests/sec
+  /** The transactional lane (the queue every email used before lanes existed). */
   private sendQueue: QueuedEmailSend[] = [];
+  /** ENG-2840: the bulk lane. Bounded: at most BULK_QUEUE_LIMIT waiting. */
+  private bulkQueue: QueuedEmailSend[] = [];
+  private readonly BULK_QUEUE_LIMIT = 100;
+  /** While a bulk email waits, after this many transactional sends in a row the next send is a bulk one (bulk never starves). */
+  private readonly BULK_SLOT_EVERY = 10;
+  private transactionalStreak = 0;
   private isQueueWorkerRunning = false;
   private lastSendAt = 0;
   private queueItemId = 0;
@@ -200,15 +279,18 @@ class ResendService {
     console.log('Resend queue worker started');
 
     try {
-      while (this.sendQueue.length > 0) {
-        const queueItem = this.sendQueue.shift();
+      while (this.queuedCount() > 0) {
+        // Wait out the pacing gap BEFORE choosing the next email, so mail that arrives during the gap is considered: a
+        // password reset that arrives in the 500 ms after a send goes ahead of waiting bulk mail, not behind a bulk email
+        // that was already chosen. Nothing leaves the queues except here, so there is still an email to take afterwards.
+        await this.waitForRateLimitWindow();
+        const queueItem = this.takeNextQueued();
         if (!queueItem) {
           continue;
         }
 
-        await this.waitForRateLimitWindow();
         const recipient = Array.isArray(queueItem.params.to) ? queueItem.params.to.join(', ') : queueItem.params.to;
-        console.log(`Processing Resend queue item #${queueItem.id} for: ${recipient} (remaining: ${this.sendQueue.length})`);
+        console.log(`Processing Resend queue item #${queueItem.id} (lane=${queueItem.lane}) for: ${recipient} (remaining: ${this.queuedCount()})`);
 
         // A failed send rejects its own promise; it must never kill the queue
         // worker — later queued emails still get processed.
@@ -226,22 +308,55 @@ class ResendService {
       console.log('Resend queue worker idle');
 
       // Handle race where a new item is enqueued while worker is shutting down.
-      if (this.sendQueue.length > 0) {
+      if (this.queuedCount() > 0) {
         void this.processSendQueue();
       }
     }
   }
 
-  private enqueueSend(params: ResendSendParams): Promise<any> {
+  private queuedCount(): number {
+    return this.sendQueue.length + this.bulkQueue.length;
+  }
+
+  /**
+   * ENG-2840: pick the next email. Transactional first; but while a bulk email waits, every BULK_SLOT_EVERY-th send is
+   * the oldest bulk one, so a steady stream of transactional mail cannot starve bulk mail forever. The streak counts only
+   * transactional sends made WHILE a bulk email waits: a bulk email that arrives behind a long transactional backlog
+   * waits for BULK_SLOT_EVERY more transactional sends (not for the whole backlog), and it is never served early just
+   * because transactional mail was busy before it arrived.
+   */
+  private takeNextQueued(): QueuedEmailSend | undefined {
+    if (this.bulkQueue.length === 0) {
+      this.transactionalStreak = 0;
+      return this.sendQueue.shift();
+    }
+    if (this.sendQueue.length === 0 || this.transactionalStreak >= this.BULK_SLOT_EVERY) {
+      this.transactionalStreak = 0;
+      return this.bulkQueue.shift();
+    }
+    this.transactionalStreak += 1;
+    return this.sendQueue.shift();
+  }
+
+  private enqueueSend(params: KeyedResendSendParams): Promise<any> {
+    const lane: EmailLane = params.lane === 'bulk' ? 'bulk' : 'transactional';
+
+    // A full bulk lane refuses at once: nothing is queued, so nothing waits, and memory stays bounded.
+    if (lane === 'bulk' && this.bulkQueue.length >= this.BULK_QUEUE_LIMIT) {
+      console.warn(`[resend-queue] Refused a bulk email: the bulk lane is full (${this.BULK_QUEUE_LIMIT} waiting).`);
+      return Promise.reject(new EmailQueueFullError('bulk', this.BULK_QUEUE_LIMIT));
+    }
+
     return new Promise((resolve, reject) => {
       const queueItem: QueuedEmailSend = {
         id: ++this.queueItemId,
+        lane,
         params,
         resolve,
         reject
       };
-      this.sendQueue.push(queueItem);
-      console.log(`Queued Resend email #${queueItem.id}. Queue size: ${this.sendQueue.length}`);
+      (lane === 'bulk' ? this.bulkQueue : this.sendQueue).push(queueItem);
+      console.log(`Queued Resend email #${queueItem.id} (lane=${lane}). Queue size: ${this.sendQueue.length} transactional, ${this.bulkQueue.length} bulk`);
       void this.processSendQueue();
     });
   }
@@ -255,8 +370,9 @@ class ResendService {
     cc,
     inReplyTo,
     replyTo,
-    headers
-  }: ResendSendParams) {
+    headers,
+    idempotencyKey
+  }: KeyedResendSendParams) {
     await this.initializeResend();
 
     if (!this.resend) {
@@ -308,7 +424,9 @@ class ResendService {
 
     const result = await this.retryWithBackoff(
       async () => {
-        const { data, error } = await this.resend!.emails.send(emailOptions);
+        // ENG-2984: the same key on every attempt — a timeout whose request actually landed is
+        // replayed by Resend instead of delivered twice.
+        const { data, error } = await this.resend!.emails.send(emailOptions, { idempotencyKey });
         
         if (error) {
           const resendError: any = this.toErrorWithMetadata(error);
@@ -331,8 +449,20 @@ class ResendService {
    * Failure contract (ENG-164): REJECTS on any failure — init failure,
    * non-retryable API error, or exhausted retries. Never resolves `null`
    * for a failed send; a resolved promise means Resend accepted the email.
+   *
+   * ENG-2840: a `lane: 'bulk'` send also rejects, at once and with `EmailQueueFullError`, when the bulk lane already has
+   * its maximum number of emails waiting. Nothing was queued or sent in that case.
    */
-  async sendEmail(params: ResendSendParams) {
+  async sendEmail(rawParams: ResendSendParams) {
+    // ENG-2984: fix the Idempotency-Key once, from the caller's original params, before the
+    // queue/retry machinery so every attempt of this send carries the same key.
+    const params: KeyedResendSendParams = {
+      ...rawParams,
+      idempotencyKey: buildResendIdempotencyKey({
+        ...rawParams,
+        idempotencyIntent: rawParams.idempotencyIntent ?? `call:${randomUUID()}`,
+      }),
+    };
     // ENG-1215: the single chokepoint every send funnels through — this method,
     // `sendSystemEmail` (which delegates here), and all 28 direct callers in
     // emailService. Guarding here rather than at each call site is the whole
@@ -385,13 +515,16 @@ class ResendService {
     subject,
     html,
     text,
-    inReplyTo
+    inReplyTo,
+    lane
   }: {
     to: string | string[];
     subject: string;
     html?: string;
     text?: string;
     inReplyTo?: string;
+    /** ENG-2840: `bulk` for automated mail that can wait a few seconds; absent = transactional. */
+    lane?: EmailLane;
   }) {
     const from = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
     return this.sendEmail({
@@ -400,7 +533,8 @@ class ResendService {
       subject,
       html,
       text,
-      inReplyTo
+      inReplyTo,
+      lane
     });
   }
 

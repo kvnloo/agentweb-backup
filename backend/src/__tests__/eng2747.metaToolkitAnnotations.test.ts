@@ -1,5 +1,5 @@
 /**
- * ENG-2747 — every tool the Zoma toolkit advertises (Meta, Zoma onboarding, Google Ads) carries MCP
+ * ENG-2747 — every tool the Zoma toolkit advertises (Meta, Zoma onboarding, Google Ads, X Ads, LinkedIn Ads) carries MCP
  * annotations, and the labels never understate what a call can do. Deny-by-default: only tools
  * named in READ_ONLY_TOOLKIT_TOOLS are read-only; anything unclassified is a destructive write.
  */
@@ -26,6 +26,8 @@ jest.mock('../mcp/metaToolkitGateway', () => ({
 import router from '../routes/metaToolkit';
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
 import { getGoogleToolkitManifest } from '../mcp/googleToolkitManifest';
+import { getXAdsToolkitManifest } from '../mcp/xAdsToolkitManifest';
+import { getLinkedInAdsToolkitManifest } from '../mcp/linkedInAdsToolkitManifest';
 import {
   annotateToolkitTools,
   getToolkitToolAnnotations,
@@ -50,7 +52,9 @@ const NON_DESTRUCTIVE_WRITES = ['zoma_status', 'zoma_prepare_upload'];
 const LOCAL_READS = ['ads_get_errors', 'ads_get_help_article', 'zoma_usage'];
 
 function allAdvertised(): Advertised[] {
-  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]) as Advertised[];
+  return annotateToolkitTools([
+    ...getMetaToolkitManifest(), ...getGoogleToolkitManifest(), ...getXAdsToolkitManifest(), ...getLinkedInAdsToolkitManifest(true),
+  ]) as Advertised[];
 }
 
 describe('ENG-2747 Zoma toolkit tool annotations', () => {

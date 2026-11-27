@@ -21,6 +21,7 @@ import type Stripe from 'stripe';
 import { getJwtSecret } from '../config/jwt';
 import { createStripeClient } from '../services/stripeClientFactory';
 import { userDb } from '../services/db';
+import { createZomaReferralWebhookHandler, type ZomaReferralWebhookHandler } from '../services/zomaReferralWebhook';
 import {
   getMcpUserUsage,
   recordZomaBillingFunnel,
@@ -29,6 +30,7 @@ import {
 } from '../services/mcpUsageEventsService';
 import { getBackendUrl } from './oauth/authChallenge';
 import { ZomaNotReadyError } from './zomaErrors';
+import { formatEarlySignupFreeUntil, userHasEarlySignupFree } from './zomaEarlySignup';
 
 export const ZOMA_PLAN_PRODUCT_TAG = 'zoma_plan';
 /** Stripe ends a trial that has no payment method a little after trial_end, not at the same second. */
@@ -123,13 +125,26 @@ export function isBillableResult(result: unknown): boolean {
   return r.status === 'PREVIEW' || typeof r.verification === 'string';
 }
 
+/** String(value) that cannot throw: {"toString":1} makes String() raise a TypeError, which would surface as a 500. */
+function safeText(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return '';
+  }
+}
+
 /**
- * Writes that make ads live: Meta status → ACTIVE (CREATE and COPY are always PAUSED), and
- * Google Ads status → ENABLED on CREATE or UPDATE. Everything else — reads, drafts, paused
+ * Writes that make ads live: Meta status → ACTIVE (CREATE and COPY are always PAUSED),
+ * Google Ads status → ENABLED on CREATE or UPDATE, X and LinkedIn ACTIVATE (their creates are never live). Everything else — reads, drafts, paused
  * creates, pauses, edits — stays free.
  */
-export function isZomaPublishWrite(platform: 'meta' | 'google_ads', args: any): boolean {
+export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads' | 'linkedin_ads', args: any): boolean {
   if (platform === 'google_ads') return args?.status === 'ENABLED';
+  // ENG-3142: creates are always PAUSED. The X write validator coerces `action` with String(), so the paywall
+  // must classify the same coerced value: a non-string action (e.g. ["ACTIVATE"]) must not skip it.
+  if (platform === 'x_ads') return String(args?.action ?? '') === 'ACTIVATE';
+  if (platform === 'linkedin_ads') return safeText(args?.action) === 'ACTIVATE'; // creates are always DRAFT; coerced like the validator, but never throws
   return String(args?.action ?? '').toUpperCase() === 'UPDATE' && args?.params?.status === 'ACTIVE';
 }
 
@@ -455,6 +470,8 @@ export async function assertZomaPublishAllowed(
 ): Promise<void> {
   const cfg = deps.config();
   if (!cfg.enabled) return;
+  // Early-signup free period (dark unless ZOMA_EARLY_SIGNUP_FREE_ENABLED=true).
+  if (await userHasEarlySignupFree(userId, deps.getUser, deps.now())) return;
   let state: ZomaPlanState;
   try {
     state = await getZomaPlanState(userId, deps);
@@ -495,6 +512,8 @@ export interface ZomaPlanSummary {
   link?: string;
   /** Had a plan before: the link sells the plan itself, with no trial. */
   returning?: boolean;
+  /** Early-signup free period: publishing is allowed without a plan until this date (display string). */
+  free_until?: string;
   error?: string;
 }
 
@@ -502,17 +521,30 @@ export interface ZomaPlanSummary {
 export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps = defaultZomaBillingDeps): Promise<ZomaPlanSummary | undefined> {
   const cfg = deps.config();
   if (!cfg.enabled) return undefined;
+  const early = await userHasEarlySignupFree(userId, deps.getUser, deps.now());
+  const freeSummary = (): ZomaPlanSummary => ({ status: 'none', publish_enabled: true, free_until: formatEarlySignupFreeUntil(early!) });
   try {
-    const state = await getZomaPlanState(userId, deps);
+    const state = await getZomaPlanState(userId, deps).catch((error) => {
+      // The write guard lets an early signup publish without reading the plan, so status must agree.
+      if (early) return undefined;
+      throw error;
+    });
+    if (!state) return freeSummary();
+    // An early signup who already holds a live plan sees that plan, not "no card needed".
+    const holdsPlan = state.status === 'trialing' || state.status === 'active';
+    if (early && !holdsPlan) return freeSummary();
     const summary: ZomaPlanSummary = {
       status: state.status,
-      publish_enabled: planAllowsPublish(state),
+      // The write guard skips the paywall for early signups, whatever their plan state.
+      publish_enabled: early ? true : planAllowsPublish(state),
       ...(state.status === 'trialing' && state.trialEnd ? { trial_ends_at: state.trialEnd } : {}),
       ...(state.cancelAtPeriodEnd ? { cancels_at_period_end: true } : {}),
       ...(state.hadPlan ? { returning: true } : {}),
       ...(state.periodStart && state.periodEnd ? { period: { start: state.periodStart, end: state.periodEnd } } : {}),
     };
-    if (planPaymentPending(state)) {
+    if (early) {
+      // Exempt: publishing is allowed, so no payment-block message and no checkout link.
+    } else if (planPaymentPending(state)) {
       summary.error = PAYMENT_PENDING_MESSAGE;
     } else if (planPaymentFailed(state)) {
       summary.error = paymentFailedMessage(cfg);
@@ -531,6 +563,7 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
 export function formatZomaPlanLine(plan: ZomaPlanSummary, cfg: ZomaBillingConfig): string {
   const box = plan.publish_enabled ? '[x]' : '[ ]';
   if (plan.error) return `  ${box} Zoma plan (needed to make ads live): ${plan.error}`;
+  if (plan.free_until) return `  [x] Zoma plan: free until ${plan.free_until}, no card needed`;
   if (plan.status === 'trialing') {
     const until = plan.trial_ends_at ? ` until ${plan.trial_ends_at.slice(0, 10)}` : '';
     return plan.cancels_at_period_end
@@ -638,6 +671,9 @@ export function isZomaPlanObject(obj: any): boolean {
   return obj?.metadata?.product === ZOMA_PLAN_PRODUCT_TAG || subscriptionMetadataOfInvoice(obj)?.product === ZOMA_PLAN_PRODUCT_TAG;
 }
 
+/** Built on first use so importing this module never opens a Stripe or DynamoDB client. */
+let defaultReferralHandler: ZomaReferralWebhookHandler | undefined;
+
 /**
  * Handle a Zoma plan Stripe event. Returns true when the event belonged to the plan, in which
  * case the caller must skip the Emma subscription handlers (they would sync the user row's
@@ -648,8 +684,15 @@ export function isZomaPlanObject(obj: any): boolean {
 export async function handleZomaBillingWebhookEvent(
   event: Pick<Stripe.Event, 'id' | 'type' | 'created'> & { data: { object: any; previous_attributes?: any } },
   deps: Pick<ZomaBillingDeps, 'recordFunnel'> = defaultZomaBillingDeps,
+  referral: ZomaReferralWebhookHandler = (defaultReferralHandler ??= createZomaReferralWebhookHandler({ isZomaPlanObject })),
 ): Promise<boolean> {
   const obj = event.data.object;
+  // A credit note carries no plan metadata, so it is matched to a Zoma invoice inside the handler
+  // (ENG-3132, dark behind ZOMA_REFERRAL_ENABLED). It still falls through to the Emma path, which ignores it.
+  if (event.type === 'credit_note.created' || event.type === 'credit_note.voided') {
+    await (event.type === 'credit_note.created' ? referral.onCreditNoteCreated(obj) : referral.onCreditNoteVoided(obj));
+    return false;
+  }
   if (!isZomaPlanObject(obj)) return false;
   const userId: string | undefined = obj?.metadata?.userId ?? subscriptionMetadataOfInvoice(obj)?.userId;
   if (!userId) return true;
@@ -677,8 +720,13 @@ export async function handleZomaBillingWebhookEvent(
       await record(endedInTrial ? 'trial_canceled' : 'subscription_canceled', { subscriptionId: obj.id });
       break;
     }
+    case 'invoice.paid':
+    case 'invoice.payment_succeeded':
+      // Both fire per payment; commission is keyed on the invoice id, so the second is a no-op (ENG-3132).
+      await referral.onInvoicePaid(obj);
+      break;
     default:
-      // subscription.created, invoices etc.: Stripe owns the state; nothing to mirror.
+      // subscription.created, other invoice events etc.: Stripe owns the state; nothing to mirror.
       break;
   }
   return true;

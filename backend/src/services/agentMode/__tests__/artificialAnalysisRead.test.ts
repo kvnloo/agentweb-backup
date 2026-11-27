@@ -44,6 +44,15 @@ describe('Artificial Analysis read (ENG-3026)', () => {
     await expect(fetchArtificialAnalysisModels('k', noPagination as unknown as typeof fetch)).rejects.toThrow(/has_more/);
   });
 
+  it('ENG-3054: fails when a later page reports a different intelligence_index_version than page 1', async () => {
+    const pages = [
+      { data: [], intelligence_index_version: '4', pagination: { has_more: true } },
+      { data: [], intelligence_index_version: '5', pagination: { has_more: false } },
+    ];
+    const request = jest.fn(async () => json(pages.shift()));
+    await expect(fetchArtificialAnalysisModels('k', request as unknown as typeof fetch)).rejects.toThrow(/intelligence_index_version/);
+  });
+
   it('flags, as a review warning, a feed whose index major version differs from labelled registry scores', async () => {
     const last = { ...captured, pagination: { ...captured.pagination, has_more: false } };
     const payload = await fetchArtificialAnalysisModels('k', (async () => json(last)) as unknown as typeof fetch);

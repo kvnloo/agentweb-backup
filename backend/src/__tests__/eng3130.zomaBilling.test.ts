@@ -281,6 +281,11 @@ describe('ENG-3131 publish classification', () => {
     ['google_ads', { action: 'UPDATE', status: 'ENABLED' }, true],
     ['google_ads', { action: 'CREATE', status: 'ENABLED' }, true],
     ['google_ads', { action: 'CREATE', status: 'PAUSED' }, false],
+    ['x_ads', { action: 'ACTIVATE' }, true],
+    ['x_ads', { action: 'PAUSE' }, false],
+    ['x_ads', { action: 'CREATE' }, false], // creates are always PAUSED
+    // The X write validator coerces `action` with String(); a non-string action must not skip the paywall.
+    ['x_ads', { action: ['ACTIVATE'] }, true],
   ] as const)('%s %p → publish %p', (platform, args, expected) => {
     expect(isZomaPublishWrite(platform, args)).toBe(expected);
   });

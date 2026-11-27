@@ -17,6 +17,7 @@ jest.mock('../../../services/funding/runFunding', () => ({
 import { createHash } from 'node:crypto';
 import { mcpToolRegistry, withToolAnnotations } from '../registry';
 import { KB_TEXT_FILE_MAX_BYTES } from '../apiTools';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from '../knowledgeBaseParams';
 import { findScopeDenial } from '../apiKeyScopes';
 import { classifyMcpTool } from '../toolAnnotationPolicy';
 
@@ -210,6 +211,81 @@ describe('text only, size cap', () => {
     expect((await run('create_knowledge_base_file', { kb_id: 'kb-own', file_name: 'a.md', content: 'PNG\u0000\u0001' })).error).toContain('binary');
     expect((await run('create_knowledge_base_file', { kb_id: 'kb-own', file_name: 'a.pdf', content: 'x' })).error).toContain('.txt');
     expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('list_knowledge_bases: the inputs Emma\'s list takes (the service decides what each does)', () => {
+  it('sends no query when called with no arguments (as before)', async () => {
+    mockMcpFetch.mockResolvedValue({ files: [] });
+    await run('list_knowledge_bases', {});
+    expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({ method: 'GET', path: '/api/emma/knowledge-bases', queryParams: {} }));
+  });
+
+  it('forwards kb_type, the dates, limit and offset to the route', async () => {
+    mockMcpFetch.mockResolvedValue({ files: [] });
+    await run('list_knowledge_bases', { kb_type: 'google-drive', modified_after: '2026-04-15', modified_before: '2026-04-22', limit: 25, offset: '50' });
+    expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({ queryParams: { kb_type: 'google-drive', modified_after: '2026-04-15', modified_before: '2026-04-22', limit: '25', offset: '50' } }));
+  });
+
+  it('empty, blank and zero values mean "not given"; the kind is matched without regard to case', () => {
+    expect(buildKbListQuery({ kb_type: ' Private ', modified_after: ' ', limit: 0, offset: '', modified_before: null })).toEqual({ kb_type: 'private' });
+    expect(buildKbListQuery({ limit: '0', offset: 0 })).toEqual({});
+    expect(buildKbListQuery(undefined)).toEqual({});
+  });
+
+  it.each([
+    ['a kind that is not one of the sources', { kb_type: 'dropbox' }, /kb_type must be one of google-drive, private, public, clickup, clickup-tasks, foreplay-swipefile, foreplay-board \(got "dropbox"\)/],
+    ['a kind that is not text', { kb_type: 5 }, /kb_type must be one of/],
+    ['a date that is not a date', { modified_after: 'last week' }, /modified_after must be a calendar date in YYYY-MM-DD form/],
+    ['a date with a time (the service takes dates only)', { modified_after: '2026-04-15T10:00:00Z' }, /modified_after must be a calendar date in YYYY-MM-DD form/],
+    ['a date that does not exist', { modified_before: '2026-02-31' }, /modified_before must be a calendar date in YYYY-MM-DD form/],
+    ['a date with an impossible month', { modified_before: '2026-13-45' }, /modified_before must be a calendar date in YYYY-MM-DD form/],
+    ['a date that is not text', { modified_after: 20260415 }, /modified_after must be text/],
+    ['a negative limit', { limit: -1 }, /limit must be a whole number/],
+    ['a fractional offset', { offset: 1.5 }, /offset must be a whole number/],
+    ['a limit of words', { limit: 'many' }, /limit must be a whole number/],
+  ])('%s is refused by name and nothing is sent', async (_label, args, message) => {
+    await expect(run('list_knowledge_bases', args)).rejects.toThrow(message);
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('limit and offset have an upper bound (the service has none and would walk a whole Drive folder)', async () => {
+    expect(buildKbListQuery({ limit: MAX_KB_LIST_LIMIT, offset: MAX_KB_LIST_OFFSET })).toEqual({ limit: String(MAX_KB_LIST_LIMIT), offset: String(MAX_KB_LIST_OFFSET) });
+    await expect(run('list_knowledge_bases', { limit: MAX_KB_LIST_LIMIT + 1 })).rejects.toThrow(/limit must be 1000 or less/);
+    await expect(run('list_knowledge_bases', { offset: '100001' })).rejects.toThrow(/offset must be 100000 or less/);
+    await expect(run('list_knowledge_bases', { limit: 9007199254740991 })).rejects.toThrow(/limit must be 1000 or less/);
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('modified_after later than modified_before is refused (no file could match); the same day is fine', () => {
+    expect(() => buildKbListQuery({ modified_after: '2026-04-22', modified_before: '2026-04-15' })).toThrow(/modified_after must not be later than modified_before/);
+    expect(buildKbListQuery({ modified_after: '2026-04-15', modified_before: '2026-04-15' })).toEqual({ modified_after: '2026-04-15', modified_before: '2026-04-15' });
+  });
+
+  it('the years 0000 to 0099 are dates too (the service takes them)', () => {
+    expect(buildKbListQuery({ modified_after: '0050-01-01' })).toEqual({ modified_after: '0050-01-01' });
+    expect(() => buildKbListQuery({ modified_after: '0050-02-30' })).toThrow(/calendar date/);
+  });
+
+  it('padded dates and numbers are trimmed and leading zeros dropped', () => {
+    expect(buildKbListQuery({ modified_after: ' 2026-04-15 ', limit: ' 025 ', offset: '007' })).toEqual({ modified_after: '2026-04-15', limit: '25', offset: '7' });
+  });
+
+  it('a leap day is a date, a non-leap one is not', () => {
+    expect(buildKbListQuery({ modified_after: '2024-02-29' })).toEqual({ modified_after: '2024-02-29' });
+    expect(() => buildKbListQuery({ modified_after: '2026-02-29' })).toThrow(/calendar date/);
+  });
+
+  it('every kind the schema offers is accepted', () => {
+    for (const kind of KB_LIST_TYPES) expect(buildKbListQuery({ kb_type: kind })).toEqual({ kb_type: kind });
+  });
+
+  it('the description says what each input does (the service applies dates, limit and offset to Google Drive only)', () => {
+    const description: string = mcpToolRegistry.getTool('list_knowledge_bases')!.definition.description;
+    expect(description).toMatch(/modified_after and modified_before \(dates as YYYY-MM-DD\), limit \(1 to 1000, default 100\) and offset \(0 to 100000\) page and narrow the Google Drive files only/);
+    expect(description).toMatch(/"private" and "public" both mean only the platform knowledge bases/);
+    expect(description).toMatch(/ClickUp folder entries are listed whatever kb_type is/);
+    expect(description).toMatch(/yours, those your organisation shares with you, and public ones/);
   });
 });
 

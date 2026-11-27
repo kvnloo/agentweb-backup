@@ -1091,7 +1091,13 @@ function getEmailContentPreview(emailContent: any, maxLength: number): string | 
       : plainText;
   }
 
-export async function getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
+/**
+ * `options` (ENG-2840 W2-5a, set only by the MCP lead tools): `maxContentFetches` bounds the email bodies one read fetches from the mail provider
+ * (see crmDb.getLeadEngagements); `recoverStaleList: false` skips the search of the caller's other lists for a lead that is not in `listId`.
+ * That search costs one AW-LeadLists query per organization member plus batched lead reads, and AW-LeadLists is provisioned at 5 read units, so
+ * it is not offered to an API key that can repeat it 60 times a minute. Without options (Emma, the portal, the readback verifier) nothing changes.
+ */
+export async function getLeadDetails(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number; recoverStaleList?: boolean }): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
       const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
@@ -1113,7 +1119,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
       const requestedListId = listId;
       let lead = await crmDb.getLeadById(listId, leadId);
       let correctedListId: string | null = null;
-      if (!lead) {
+      if (!lead && options?.recoverStaleList !== false) {
         // ENG-969 follow-up: the requested list_id may just be stale/wrong
         // rather than the lead not existing at all. See leadRecovery.ts for
         // the full rationale (tiering, retry, and why it always fails safe).
@@ -1182,7 +1188,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
       // Get engagement count and recent engagements
       const [engagementCount, engagementsResult] = await Promise.all([
         crmDb.getLeadEngagementCount(listId, leadId, userId),
-        crmDb.getLeadEngagements(listId, leadId, userId)
+        options ? crmDb.getLeadEngagements(listId, leadId, userId, options) : crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagements = engagementsResult.engagements || [];
       const customFields = lead.customFields || {};
@@ -1788,6 +1794,14 @@ export async function setLeadContactStatus(
 
       for (const leadId of leadIds) {
         try {
+          // `updateLead` is an upsert: for an id that is not in this list (deleted, or mistyped) it would CREATE an empty stub lead that
+          // then shows up in the list. A missing lead is a failure to report, never a lead to create.
+          const existing = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+          if (!existing) {
+            failed++;
+            errors.push(`${leadId}: lead not found in this list`);
+            continue;
+          }
           const updates: any = {
             contactStatus,
             contactStatusUpdatedAt: now,
@@ -2347,7 +2361,7 @@ export async function deleteLeadList(listId: string, userId: string): Promise<an
     }
   }
 
-export async function getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number): Promise<any> {
+export async function getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number, options?: { maxContentFetches?: number }): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
@@ -2379,7 +2393,7 @@ export async function getLeadEngagements(listId: string, leadId: string, userId:
           console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
           return null;
         }),
-        crmDb.getLeadEngagements(listId, leadId, userId)
+        options ? crmDb.getLeadEngagements(listId, leadId, userId, options) : crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
       const engagementCountAvailable = engagementCountResult !== null;
       const engagementCount: any = engagementCountResult || {};
@@ -2447,9 +2461,25 @@ export async function getLeadEngagements(listId: string, leadId: string, userId:
     }
   }
 
+/**
+ * ENG-2840 (W2-7): limits for an event written by an outside agent (the MCP tool `add_lead_engagement`). Emma's own tool passes none.
+ * `channel` is stamped into the event's data and is what `maxChannelEvents` counts; a lead whose stored record is `maxLeadBytes` or more
+ * takes no event; an `idempotencyKey` already on one of the lead's events records nothing (the answer says so). The append is made only if
+ * the lead did not change since it was read, so two calls with the same key at once cannot both record.
+ */
+export interface AgentEngagementLimits {
+  channel: string;
+  maxChannelEvents: number;
+  maxLeadBytes: number;
+  idempotencyKey?: string;
+}
+
+const AGENT_ENGAGEMENT_ATTEMPTS = 3;
+
 export async function addLeadEngagement(
     listId: string, leadId: string, eventType: string,
-    userId: string, eventData?: any, eventDate?: string
+    userId: string, eventData?: any, eventDate?: string,
+    agentLimits?: AgentEngagementLimits,
   ): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -2470,7 +2500,7 @@ export async function addLeadEngagement(
         return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
-      const lead = await crmDb.getLeadById(listId, leadId);
+      const lead = await crmDb.getLeadById(listId, leadId, agentLimits ? { consistentRead: true } : undefined);
       if (!lead) {
         // ENG-2808: tell the model how to recover instead of retrying the same pair.
         return {
@@ -2479,6 +2509,10 @@ export async function addLeadEngagement(
           error: 'The specified lead does not exist in this list',
           hint: 'Do not retry with the same lead_id/list_id. Look the lead up with search_leads (by name or email) to get its current lead_id and list_id, then call add_lead_engagement again.',
         };
+      }
+
+      if (agentLimits) {
+        return await addAgentLeadEngagement(crmDb, listId, leadId, lead, eventType, eventData, eventDate, agentLimits);
       }
 
       await crmDb.addLeadEngagement(listId, leadId, {
@@ -2498,6 +2532,44 @@ export async function addLeadEngagement(
       return { success: false, message: 'Failed to add lead engagement', error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
+
+/** The outside-agent path of addLeadEngagement (see AgentEngagementLimits). `lead` is the consistent read made by the caller. */
+async function addAgentLeadEngagement(
+  crmDb: any, listId: string, leadId: string, firstRead: any, eventType: string, eventData: any, eventDate: string | undefined,
+  limits: AgentEngagementLimits,
+): Promise<any> {
+  const leadName = `${firstRead.firstName || ''} ${firstRead.lastName || ''}`.trim();
+  // `channel` and `idempotencyKey` are the server's: a caller's own values for them are dropped, then ours are set.
+  const { channel: _channel, idempotencyKey: _key, ...callerData } = (eventData && typeof eventData === 'object' ? eventData : {}) as Record<string, unknown>;
+  const data = { ...callerData, channel: limits.channel, ...(limits.idempotencyKey ? { idempotencyKey: limits.idempotencyKey } : {}) };
+  let lead = firstRead;
+  for (let attempt = 1; attempt <= AGENT_ENGAGEMENT_ATTEMPTS; attempt++) {
+    const events: any[] = Array.isArray(lead.engagements) ? lead.engagements : [];
+    if (limits.idempotencyKey && events.some((e) => e?.eventData?.idempotencyKey === limits.idempotencyKey)) {
+      return { success: true, recorded: false, duplicate: true, message: 'An event with this idempotency_key is already on the lead; nothing was recorded again.', eventType, leadName };
+    }
+    if (events.filter((e) => e?.eventData?.channel === limits.channel).length >= limits.maxChannelEvents) {
+      return { success: false, message: `This lead already holds ${limits.maxChannelEvents} events recorded by outside agents, the most it takes. Nothing was recorded.` };
+    }
+    if (Buffer.byteLength(JSON.stringify(lead), 'utf8') >= limits.maxLeadBytes) {
+      return { success: false, message: 'This lead\'s stored record is nearly full, so it takes no more events from outside agents. Nothing was recorded.' };
+    }
+    try {
+      await crmDb.addLeadEngagement(listId, leadId, {
+        eventType,
+        eventData: data,
+        createdAt: eventDate || new Date().toISOString(),
+      }, typeof lead.updatedAt === 'string' ? { expectedUpdatedAt: lead.updatedAt } : {});
+      return { success: true, recorded: true, message: `Engagement "${eventType}" recorded for ${leadName}`.trim(), eventType, leadName };
+    } catch (err: any) {
+      if (!err?.preconditionFailed) throw err;
+      // The lead changed between the read and the append: read it again and decide again (the key may now be on it).
+      lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+      if (!lead) return { success: false, message: 'Lead not found' };
+    }
+  }
+  return { success: false, message: 'The lead kept changing while the event was being recorded. Nothing was recorded; try again.' };
+}
 
 export async function sendEmailToLead(listId: string, leadId: string, userId: string): Promise<any> {
     try {
@@ -2615,6 +2687,22 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         };
       }
 
+      // ENG-2984: claim the draft atomically before the provider call. Two concurrent
+      // invocations both read the same draft above; only the one whose conditional claim
+      // succeeds may send, so the lead gets at most one email. The draft stays stored until
+      // the send succeeds, so a crash/deploy mid-send never loses it (stale claims expire).
+      const claimToken = await crmDb.claimLeadEmailDraft(listId, leadId, draft);
+      if (!claimToken) {
+        return {
+          success: false,
+          message: 'Email draft already sent or changed',
+          // ENG-2984 / Opslane run 2213: a refused claim means either a send is in flight or
+          // the draft changed. Say so truthfully and give the recovery path: an orphaned claim
+          // (crashed send) expires after the 5-minute lease, after which a retry succeeds.
+          error: 'Another request is sending this draft right now (or the draft was just changed), so it was not sent twice. Check the lead in a minute: if the draft is gone, it was sent. If the draft is still there after about 5 minutes, retry the send once.',
+        };
+      }
+
       try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
@@ -2626,14 +2714,37 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         });
         emailId = sendResult.messageId;
       } catch (error) {
+        // The send did not go out: release the claim so the user can retry now (best effort;
+        // an unreleased claim also expires on its own).
+        try {
+          await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
+        } catch (releaseError) {
+          console.error('AgentMode: failed to release email draft claim after send failure (ENG-2984):', releaseError);
+        }
         if (error instanceof SenderDailyLimitExceededError) {
           return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
         throw error;
       }
 
-      // Clear the draft after successful send
-      await crmDb.updateLead(listId, leadId, { emailDraft: null });
+      // Clear the sent draft and our claim in one conditional write: only while we still own
+      // the claim AND the stored draft is the one we sent, so a draft replaced mid-send (or a
+      // replacement sender after our lease expired) is never deleted.
+      try {
+        const cleared = await crmDb.completeLeadEmailDraftSend(listId, leadId, claimToken, draft);
+        if (!cleared) {
+          console.warn('AgentMode: sent email but draft changed or claim lost mid-send; left stored draft intact (ENG-2984)');
+          // Our send finished: drop our claim so a replacement draft is sendable now. Token-
+          // conditional, so a no-op if another sender owns the claim.
+          try {
+            await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
+          } catch (releaseError) {
+            console.error('AgentMode: failed to release email draft claim after replaced draft (ENG-2984):', releaseError);
+          }
+        }
+      } catch (clearError) {
+        console.error('AgentMode: failed to clear sent email draft (ENG-2984):', clearError);
+      }
 
       return {
         success: true,

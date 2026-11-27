@@ -318,6 +318,14 @@ router.post('/conversable-share', asyncHandler(agentModeController.createConvers
 // Stop conversable sharing
 router.delete('/session/:sessionId/conversable-share', asyncHandler(agentModeController.stopConversableShare));
 
+// GET /api/agent-mode/session/:sessionId/conversable-share
+// ENG-3170: read whether sensitive actions are allowed on this session's interactive link (owner only)
+router.get('/session/:sessionId/conversable-share', asyncHandler(agentModeController.getConversableShareSettings));
+
+// PATCH /api/agent-mode/session/:sessionId/conversable-share
+// ENG-3170: the owner turns sensitive actions on or off for the link that already exists
+router.patch('/session/:sessionId/conversable-share', asyncHandler(agentModeController.updateConversableShareSettings));
+
 
 // POST /api/agent-mode/scheduled-chats
 // Create scheduled chat
@@ -353,6 +361,11 @@ router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeControlle
 // scripts/grant-schedule-autopublish.ts's owner-confirmed allowlist, may
 // still need that migration path if they don't — see that script's header).
 router.post('/scheduled-chats/:scheduleId/publish-consent', asyncHandler(agentModeController.revokeScheduledChatPublishConsent));
+
+// POST /api/agent-mode/scheduled-chats/:scheduleId/adopt-visitor-edits
+// ENG-2816 (step 3): the owner takes over a schedule a share-link visitor wrote into, removing every visitor mark so its runs get
+// the owner's full tool set again. Portal login only: refuses self-calls (so no MCP tool can reach it), delegates and visitor writes.
+router.post('/scheduled-chats/:scheduleId/adopt-visitor-edits', asyncHandler(agentModeController.adoptScheduledChatVisitorEdits));
 
 // PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
 // Toggle scheduled chat status (enable/disable)

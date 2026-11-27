@@ -1057,6 +1057,40 @@ checkruns "${d}" '[
 run_gate "${d}"
 check '#3967: Opslane could-not-test abstention does not block' 0 'VERDICT: PASS'
 
+# ENG-3102 — a fourth abstention wording. Real check-run from agentweb#4134 at
+# head 1e3d1e2ec (id 133303033669, 2026-11-16): Opslane did not run at all.
+opslane_didnt_verify() { # $1 conclusion
+  printf '{"id":133303033669,"name":"Opslane","app":{"slug":"opslane"},"status":"completed","conclusion":"%s","started_at":"2026-11-16T12:43:57Z","completed_at":"2026-11-16T12:43:57Z","output":{"title":"Opslane didn'"'"'t verify this commit","summary":"Opslane didn'"'"'t run on this commit (a daily limit, the plan, or a setup change). Push again or start a run to verify it. This check doesn'"'"'t block the merge."}}' "$1"
+}
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend build","status":"completed","conclusion":"success"},
+  '"$(opslane_didnt_verify neutral)"'
+]'
+run_gate "${d}"
+check 'ENG-3102: Opslane did-not-verify abstention does not block' 0 'VERDICT: PASS'
+check 'ENG-3102: the dropped did-not-verify run is named in the log' 0 'ignored 1 Opslane (neutral) check-run(s) with an abstention title'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_didnt_verify failure)"'
+]'
+run_gate "${d}"
+check 'ENG-3102: an Opslane failure with the did-not-verify title still blocks' 1 'Opslane (failure)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral "Opslane didn't verify")"'
+]'
+run_gate "${d}"
+check 'ENG-3102: a near-miss did-not-verify title still blocks' 1 'Opslane (neutral)'
+
 cr_run() { # $1 conclusion, $2 title
   printf '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"status":"completed","conclusion":"%s","output":{"title":"%s"}}' "$1" "$2"
 }

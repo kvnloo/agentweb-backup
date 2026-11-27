@@ -12,6 +12,8 @@
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
  *   GET  /api/zoma/google/callback    ENG-3135 Google Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/google-ads/callback)
  *   POST /api/zoma/google/select      server-rendered Google Ads account picker submit
+ *   GET  /api/zoma/linkedin/callback  LinkedIn Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/linkedin-ads/callback); not routed (falls through like an unknown route) unless ZOMA_LINKEDIN_ADS_ENABLED is read/true
+ *   POST /api/zoma/linkedin/select    server-rendered LinkedIn ad account picker submit (same gate)
  *   GET  /api/zoma/continue           resume the journey from a signed link
  *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
@@ -40,8 +42,12 @@ import {
   type ZomaDeviceFlowDeps,
 } from '../mcp/zomaDeviceFlow';
 import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, type ZomaGoogleDeps } from '../mcp/zomaGoogleConnect';
+import { completeLinkedInAdsConnect, defaultZomaLinkedInAdsDeps, selectLinkedInAdsAccounts, type ZomaLinkedInAdsDeps } from '../mcp/zomaLinkedInAdsConnect';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
+import { linkedInAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
+import { recordWeeklyReportOptOut, verifyUnsubscribeToken } from '../mcp/zomaWeeklyReport';
+import { MEASUREMENT_UNSUBSCRIBE_CONTEXT, stopAllReportSchedules } from '../mcp/zomaReportSchedule';
 
 export const ZOMA_SETUP_MAX_PER_MINUTE = 10;
 export const ZOMA_POLL_MAX_PER_MINUTE = 60;
@@ -77,6 +83,26 @@ export function linkifyHttps(text: string): string {
 // submit continues on to Stripe Checkout (or back to Meta), so that page allows those hops.
 const PICKER_FORM_ACTION = "'self' https://checkout.stripe.com https://www.facebook.com";
 
+// One stylesheet for every Zoma browser step (code entry, the ads question, account pickers, result pages).
+// Inline only: the CSP below allows inline styles and nothing external. Palette matches the Zoma weekly email.
+const ZOMA_PAGE_CSS =
+  `*{box-sizing:border-box}` +
+  `body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1.25rem;background:#f6f8fa;color:#202124;font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.55}` +
+  `main{width:100%;max-width:30rem;background:#fff;border:1px solid #dadce0;border-radius:12px;padding:2rem 1.75rem;box-shadow:0 1px 3px rgba(60,64,67,.1)}` +
+  `.brand{margin:0 0 1.25rem;font-size:.8rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#5f6368}` +
+  `h1{margin:0 0 .5rem;font-size:1.45rem;line-height:1.25}p{margin:.5rem 0;color:#3c4043}small{color:#5f6368}a{color:#1a73e8}` +
+  `ol{padding-left:1.25rem;color:#3c4043}li{margin:.35rem 0}form{margin:1rem 0 0}` +
+  `label{display:flex;align-items:flex-start;gap:.7rem;margin:.55rem 0;padding:.8rem .9rem;border:1px solid #dadce0;border-radius:8px;cursor:pointer}` +
+  `label:hover{border-color:#80868b}label:focus-within{outline:2px solid #1a73e8;outline-offset:1px}` +
+  `input[type=checkbox]{flex:none;width:1.1rem;height:1.1rem;margin:.2rem 0 0;accent-color:#202124}` +
+  `input.code{display:block;width:100%;margin:0 0 .75rem;padding:.65rem .75rem;border:1px solid #dadce0;border-radius:8px;font:inherit;font-size:1.25rem;letter-spacing:.15em;text-transform:uppercase}` +
+  `input.code:focus{outline:2px solid #1a73e8;border-color:transparent}` +
+  `button,a.button{display:inline-block;padding:.65rem 1.25rem;border:0;border-radius:8px;background:#202124;color:#fff;font:inherit;font-weight:600;text-decoration:none;cursor:pointer}` +
+  `button:hover,a.button:hover{background:#3c4043}a.button{margin-top:.5rem}` +
+  `button.choice{display:block;width:100%;margin:.55rem 0;padding:.9rem 1rem;border:1px solid #dadce0;background:#fff;color:#202124;font-weight:500;text-align:left}` +
+  `button.choice:hover{border-color:#202124;background:#f6f8fa}` +
+  `@media(max-width:30rem){main{padding:1.5rem 1.25rem}}`;
+
 function page(res: Response, status: number, title: string, body: string, formAction = "'self'") {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}`);
@@ -89,36 +115,31 @@ function page(res: Response, status: number, title: string, body: string, formAc
     .type('html')
     .send(
       `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-        `<title>${escapeHtml(title)}</title><style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1rem;line-height:1.5}` +
-        `label{display:block;margin:.4rem 0}a.button{display:inline-block;margin-top:.5rem}` +
-        `input{font-size:1.25rem;letter-spacing:.15em;text-transform:uppercase;padding:.4rem;width:10rem}button{font-size:1rem;padding:.45rem 1rem}</style></head>` +
-        `<body><h1>${escapeHtml(title)}</h1>${body}</body></html>`,
+        `<title>${escapeHtml(title)}</title><style>${ZOMA_PAGE_CSS}</style></head>` +
+        `<body><main><p class="brand">Zoma</p><h1>${escapeHtml(title)}</h1>${body}</main></body></html>`,
     );
 }
 
 function codeForm(message?: string) {
   return (
     (message ? `<p>${escapeHtml(message)}</p>` : '<p>Enter the code your agent showed you to connect Zoma to your AgentWeb account.</p>') +
-    `<form method="get" action="activate"><input name="user_code" placeholder="XXXX-XXXX" autocomplete="off" autofocus required> <button type="submit">Continue</button></form>`
+    `<form method="get" action="activate"><input class="code" name="user_code" placeholder="XXXX-XXXX" autocomplete="off" autofocus required><button type="submit">Continue</button></form>`
   );
 }
 
 function renderStep(res: Response, step: BrowserStep, req?: Request) {
   if (step.kind === 'redirect') return res.redirect(req?.method === 'POST' ? 303 : 302, step.url);
   if (step.kind === 'ask_ads_experience') {
+    // One click answers: each option is a submit button carrying the same `answer` field the radios used.
     const options = step.options
-      .map(
-        (o, i) =>
-          `<label><input type="radio" name="answer" value="${escapeHtml(o.value)}"${i === 0 ? ' required' : ''}> ${escapeHtml(o.label)}</label>`,
-      )
+      .map((o) => `<button type="submit" class="choice" name="answer" value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</button>`)
       .join('');
     return page(
       res,
       200,
       step.question,
       (step.message ? `<p><strong>${escapeHtml(step.message)}</strong></p>` : '<p>So Zoma can set you up the right way.</p>') +
-        `<form method="post" action="${escapeHtml(step.action)}"><input type="hidden" name="t" value="${escapeHtml(step.token)}">${options}` +
-        `<p><button type="submit">Continue</button></p></form>`,
+        `<form method="post" action="${escapeHtml(step.action)}"><input type="hidden" name="t" value="${escapeHtml(step.token)}">${options}</form>`,
       // A "runs_ads" answer continues on to Meta (or Stripe) from this submit.
       PICKER_FORM_ACTION,
     );
@@ -128,7 +149,7 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
       .map(
         (a, i) =>
           `<label><input type="checkbox" name="account_id" value="${escapeHtml(a.account_id)}"${i === 0 ? ' checked' : ''}> ` +
-          `${escapeHtml(a.name || a.account_id)} <small>(${escapeHtml(a.account_id)}${a.currency ? `, ${escapeHtml(a.currency)}` : ''})</small></label>`,
+          `<span>${escapeHtml(a.name || a.account_id)} <small>(${escapeHtml(a.account_id)}${a.currency ? `, ${escapeHtml(a.currency)}` : ''})</small></span></label>`,
       )
       .join('');
     return page(
@@ -137,7 +158,7 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
       'Choose your ad account',
       (step.message ? `<p><strong>${escapeHtml(step.message)}</strong></p>` : '<p>Pick the Meta ad account(s) Zoma should manage.</p>') +
         `<form method="post" action="${escapeHtml(step.action)}"><input type="hidden" name="t" value="${escapeHtml(step.token)}">${options}` +
-        `<p><button type="submit">Continue</button></p></form>`,
+        `<p><button type="submit">${escapeHtml(step.submitLabel ?? 'Continue')}</button></p></form>`,
       PICKER_FORM_ACTION,
     );
   }
@@ -155,6 +176,7 @@ export function createZomaRouter(
   deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
   googleDeps: ZomaGoogleDeps = defaultZomaGoogleDeps,
   billingDeps?: Parameters<typeof openZomaCheckout>[1],
+  linkedInDeps: ZomaLinkedInAdsDeps = defaultZomaLinkedInAdsDeps,
 ): Router {
   const router = Router();
 
@@ -236,6 +258,28 @@ export function createZomaRouter(
     }
   });
 
+  // LinkedIn off (ZOMA_LINKEDIN_ADS_ENABLED not read/true): these routes do not exist. Fall through BEFORE the
+  // shared throttle so an off deployment answers like any unknown route and a probe uses none of its bucket.
+  const linkedInOffered = (_req: Request, _res: Response, next: NextFunction) =>
+    ((linkedInDeps.enabled ?? linkedInAdsToolkitEnabled)() ? next() : next('route'));
+
+  router.get('/linkedin/callback', linkedInOffered, throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      const q = req.query;
+      return renderStep(res, await completeLinkedInAdsConnect({ code: q.code, state: q.state, error: q.error }, linkedInDeps));
+    } catch (error) {
+      return failPage(res, 'linkedin_callback', error);
+    }
+  });
+
+  router.post('/linkedin/select', linkedInOffered, throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      return renderStep(res, await selectLinkedInAdsAccounts({ t: req.body?.t, account_id: req.body?.account_id }, linkedInDeps), req);
+    } catch (error) {
+      return failPage(res, 'linkedin_connect', error);
+    }
+  });
+
   router.post('/ads-experience', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       return renderStep(res, await answerAdsExperience({ t: req.body?.t, answer: req.body?.answer }, deps), req);
@@ -281,6 +325,64 @@ export function createZomaRouter(
     // Funnel only (ENG-3131 R5): a failed write must never change what the user sees.
     await recordZomaCheckoutCanceled(req.query, billingDeps).catch((e) => console.error('[zoma-billing] cancel record failed:', e));
     return page(res, 200, 'Zoma plan', '<p>Checkout was canceled and nothing was charged. Reads and drafts still work. Ask your agent for the link again whenever you want to go live.</p>');
+  });
+
+  // ENG-3133: opt out of the weekly Zoma email. GET only shows a confirm button (a mail scanner that
+  // opens the link must not unsubscribe anyone); POST records the opt-out, which is idempotent.
+  router.get('/weekly-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), (req: Request, res: Response) => {
+    const token = typeof req.query.t === 'string' ? req.query.t : '';
+    if (!verifyUnsubscribeToken(token)) {
+      return page(res, 400, 'Weekly Zoma email', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the weekly email for you.</p>');
+    }
+    return page(
+      res,
+      200,
+      'Weekly Zoma email',
+      `<p>Stop the weekly Zoma ad report email?</p><form method="post" action="/api/zoma/weekly-report/unsubscribe"><input type="hidden" name="t" value="${escapeHtml(token)}"><button type="submit">Unsubscribe</button></form>`,
+    );
+  });
+
+  router.post('/weekly-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    const userId = verifyUnsubscribeToken(req.body?.t ?? req.query?.t);
+    if (!userId) {
+      return page(res, 400, 'Weekly Zoma email', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the weekly email for you.</p>');
+    }
+    try {
+      await recordWeeklyReportOptOut(userId);
+      return page(res, 200, 'Unsubscribed', '<p>You will not get the weekly Zoma ad report any more. Zoma itself keeps working as before.</p>');
+    } catch (error) {
+      logZomaSetup({ step: 'weekly_report_opt_out', outcome: 'error', reason: error });
+      return page(res, 500, 'Weekly Zoma email', '<p>We could not record that just now. Open the link again in a moment, or write to support@agentweb.pro and we will stop the weekly email for you.</p>');
+    }
+  });
+
+  // ENG-3155: the measurement-report email's signed opt-out. GET only shows a button (mail scanners
+  // that open links change nothing); POST stops every measurement-report schedule of the user.
+  router.get('/measurement-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), (req: Request, res: Response) => {
+    const token = typeof req.query.t === 'string' ? req.query.t : '';
+    if (!verifyUnsubscribeToken(token, undefined, MEASUREMENT_UNSUBSCRIBE_CONTEXT)) {
+      return page(res, 400, 'Zoma measurement report', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the measurement report for you.</p>');
+    }
+    return page(
+      res,
+      200,
+      'Zoma measurement report',
+      `<p>Stop the Zoma measurement report emails?</p><form method="post" action="/api/zoma/measurement-report/unsubscribe"><input type="hidden" name="t" value="${escapeHtml(token)}"><button type="submit">Unsubscribe</button></form>`,
+    );
+  });
+
+  router.post('/measurement-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    const userId = verifyUnsubscribeToken(req.body?.t ?? req.query?.t, undefined, MEASUREMENT_UNSUBSCRIBE_CONTEXT);
+    if (!userId) {
+      return page(res, 400, 'Zoma measurement report', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the measurement report for you.</p>');
+    }
+    try {
+      await stopAllReportSchedules(userId);
+      return page(res, 200, 'Unsubscribed', '<p>You will not get the Zoma measurement report any more. Your agent can turn it back on with zoma_report_schedule.</p>');
+    } catch (error) {
+      logZomaSetup({ step: 'measurement_report_opt_out', outcome: 'error', reason: error });
+      return page(res, 500, 'Zoma measurement report', '<p>We could not record that just now. Open the link again in a moment, or write to support@agentweb.pro and we will stop it for you.</p>');
+    }
   });
 
   router.post('/token/revoke', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {

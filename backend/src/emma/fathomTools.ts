@@ -23,6 +23,13 @@ const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
  */
 const FATHOM_MAX_PAGES = 20;
 
+/**
+ * ENG-2840 (W2-9): axios's `timeout` on each Fathom request. In Node it is an idle timer (30 s with no data on the socket), not a cap on
+ * the whole request: a request that never answers now fails instead of holding the call open forever, but a slow trickle can run longer.
+ * An outside (MCP) caller is bounded by its self-call's own wait (meetingEventReadTools.ts TIMEOUTS_MS), not by this.
+ */
+export const FATHOM_REQUEST_TIMEOUT_MS = 30_000;
+
 // ── fathom_get_meetings ──────────────────────────────────────────────────────
 
 emmaToolRegistry.register({
@@ -84,6 +91,7 @@ emmaToolRegistry.register({
         const url = `${FATHOM_API_BASE}/meetings?${params.toString()}`;
         const response = await axios.get(url, {
           headers: { 'Authorization': `Bearer ${accessToken}` },
+          timeout: FATHOM_REQUEST_TIMEOUT_MS,
         });
 
         // Fathom API returns { items: [...], limit, next_cursor }
@@ -211,7 +219,7 @@ emmaToolRegistry.register({
       properties: {
         recording_id: {
           type: 'number',
-          description: 'The recording ID from the meetings list (required)',
+          description: 'The recording ID from the meetings list (required). Must be a recording_id returned by fathom_get_meetings.',
         },
       },
       required: ['recording_id'],
@@ -240,6 +248,7 @@ emmaToolRegistry.register({
       const url = `${FATHOM_API_BASE}/recordings/${args.recording_id}/transcript`;
       const response = await axios.get(url, {
         headers: { 'Authorization': `Bearer ${accessToken}` },
+        timeout: FATHOM_REQUEST_TIMEOUT_MS,
       });
 
       const data = response.data as any;
@@ -269,8 +278,11 @@ emmaToolRegistry.register({
       if (status === 404) {
         return {
           success: false,
-          message: `Recording ${args.recording_id} not found. Use fathom_get_meetings to list available recordings.`,
+          message: `Recording ${args.recording_id} not found for the connected Fathom account. Use a recording_id returned by fathom_get_meetings.`,
           status,
+          // ENG-3153: the connected account is healthy; the model named a recording it does not have.
+          // A bad argument, so it must not cluster as not_found -> config ("reconnect the account").
+          errorClass: 'invalid_args',
         };
       }
       console.error('[fathom_get_transcript] API error:', error?.message);

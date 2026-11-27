@@ -10,6 +10,12 @@ jest.mock('../mcp/server/httpClient', () => ({
   clearUserCache: jest.fn(),
 }));
 
+// The update tools of manage_brand take one call at a time per account, after identifying the account with a database read. These tests check what is sent to the
+// routes, not that lookup (it is covered through the real path in mcp.manageBrand.writes.test.ts), so the lock is a pass-through here.
+jest.mock('../mcp/server/accountLock', () => ({
+  withAccountLock: (_prefix: string, _context: unknown, work: (key: string) => Promise<unknown>) => work('test-lock-key'),
+}));
+
 // Mock skillService and subscriptionService for install_skills/list_available_skills
 jest.mock('../services/skillService', () => ({
   skillService: {
@@ -646,23 +652,6 @@ describe('apiTools', () => {
     it('propagates a refusal from the route (e.g. the page already has a tracker)', async () => {
       mockMcpFetch.mockRejectedValue(new Error('API error (409): This page already carries its own tracker'));
       await expect(mcpToolRegistry.execute('enable_session_tracking', { page_id: 'p1' }, context)).rejects.toThrow('already carries its own tracker');
-    });
-  });
-
-  describe('manage_gtm_items - add_phase', () => {
-    it('should call POST /api/gtm-plan/:id/phases', async () => {
-      mockMcpFetch.mockResolvedValue({ phaseId: 'phase-1' });
-
-      await mcpToolRegistry.execute('manage_gtm_items', {
-        action: 'add_phase', plan_id: 'plan-1',
-        name: 'Launch Phase', description: 'Product launch'
-      }, context);
-
-      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
-        method: 'POST',
-        path: '/api/gtm-plan/plan-1/phases',
-        body: { name: 'Launch Phase', description: 'Product launch', status: undefined },
-      }));
     });
   });
 

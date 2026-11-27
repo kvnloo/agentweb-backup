@@ -18,6 +18,8 @@ import { AgentModeService } from '../services/agentModeService';
 // a clean cache each time, so it must reset the module's cache itself now).
 import { __resetDataAnalysisConsistencyCacheForTests } from '../emma/impl/searchResearch';
 
+// The download goes through utils/callerUrlFetch (guarded, covered in callerUrlFetch.test.ts); here it is handed to the axios mock below.
+jest.mock('../utils/callerUrlFetch', () => require('./helpers/callerUrlFetchAxiosBridge').callerUrlFetchViaAxiosMock());
 jest.mock('axios', () => ({
   get: jest.fn(),
   post: jest.fn()
@@ -38,6 +40,13 @@ jest.mock('../utils/s3Utils', () => ({
 
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn()
+}));
+
+// This suite is about the analysis itself. Who may read which S3 key (ENG-2988 rule) is a boundary here; it is covered with the
+// real policy in performDataAnalysis.storageAccess.test.ts. No assertion of this suite was changed.
+jest.mock('../services/storageAccessPolicy', () => ({
+  ...jest.requireActual('../services/storageAccessPolicy'),
+  decideStorageAccess: jest.fn().mockResolvedValue({ allow: true }),
 }));
 
 const mockedAxiosGet = axios.get as jest.Mock;
@@ -357,7 +366,7 @@ describe('AgentModeService.performDataAnalysis', () => {
     const instruction = `Read from ${s3Key} and compute total tokens per user.`;
     const result = await (service as any).performDataAnalysis([], instruction, 'user-1');
 
-    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith(s3Key);
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith(s3Key, undefined, { maxBytes: expect.any(Number) });
     expect(mockedAxiosPost).toHaveBeenCalledTimes(1);
     const postBody = mockedAxiosPost.mock.calls[0][1];
     const sentInstruction = postBody.contents[0].parts[postBody.contents[0].parts.length - 1].text as string;
@@ -408,7 +417,7 @@ describe('AgentModeService.performDataAnalysis', () => {
 
     const result = await (service as any).performDataAnalysis([s3Url], 'Summarize the data.', 'user-1');
 
-    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith('users/user-1/files/1234/abc/data.csv', 'agentweb-user-files');
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith('users/user-1/files/1234/abc/data.csv', 'agentweb-user-files', { maxBytes: 52428800 });
     expect(mockedAxiosGet).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
   });

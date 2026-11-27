@@ -328,6 +328,27 @@ describe('fathom_get_transcript', () => {
     expect(result.message).toContain('not found');
   });
 
+  // ENG-3153: a 404 means the model named a recording this account does not have (for example the
+  // id from a fathom.video/calls/<id> link). The account is healthy, so it must not cluster as
+  // not_found -> config ("reconnect the account").
+  it('ENG-3153: a 404 classifies as invalid_args/schema_reject, not not_found/config', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    mockedAxios.get = jest.fn().mockRejectedValue({
+      response: { status: 404 },
+      message: 'Request failed with status code 404',
+    });
+
+    const result = await executeTool('fathom_get_transcript', { recording_id: 810527663 }, { userId: 'user-1' });
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('fathom_get_meetings');
+    expect(result.message).toContain('not found');
+    expect(result.errorClass).toBe('invalid_args');
+    expect(result.status).toBe(404);
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('invalid_args');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified), classified?.message)).toBe('schema_reject');
+  });
+
   it('returns helpful error when no Fathom account is connected', async () => {
     mockedGetAccounts.mockResolvedValue([]);
 
@@ -433,5 +454,18 @@ describe('fathom_get_onboarding_context', () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('Authentication required');
+  });
+});
+
+describe('ENG-2840 (W2-9): every Fathom request is bounded in time', () => {
+  it('the meetings and transcript requests both give up after 30 s', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    mockedAxios.get = jest.fn()
+      .mockResolvedValueOnce({ data: { items: [], next_cursor: null } })
+      .mockResolvedValueOnce({ data: { transcript: [] } });
+    await executeTool('fathom_get_meetings', {}, { userId: 'user-1' });
+    await executeTool('fathom_get_transcript', { recording_id: 101 }, { userId: 'user-1' });
+    expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+    for (const [, options] of (mockedAxios.get as jest.Mock).mock.calls) expect(options.timeout).toBe(30_000);
   });
 });

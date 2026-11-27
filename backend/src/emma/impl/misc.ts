@@ -261,7 +261,7 @@
  */
 import axios from 'axios';
 import { createHash } from 'crypto';
-import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../../utils/s3Utils';
+import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectStreamAbortable, getS3ObjectMetadata } from '../../utils/s3Utils';
 import { pdfPageRender } from './shared/pdfTextRender';
 import { resolvePinnedPublicAddress, SsrfBlockedError } from '../../utils/ssrfGuard';
 import { getCrmSenders } from './shared/crmSenders';
@@ -295,15 +295,24 @@ const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wm
 // — see this module's header comment ("ADMIN_SKILL_TOOL_NAMES is DUPLICATED
 // here, not imported back") for why this is a plain literal copy rather than
 // a shared import.
-const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'read_client_meta_budgets', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 export function getAdminToolNames(): string[] {
   return [...ADMIN_SKILL_TOOL_NAMES];
 }
 
 /**
+ * Tools registered for agent mode that a session is offered only through a skill that lists them, never through the
+ * `__other_skills__` catch-all pool (every registered tool that no published skill lists). `manage_market_strategy` (ENG-2840) is the
+ * MCP server's market strategy tool, bridged so a skill can list it; Emma's own `update_market_strategy` is a foundation tool, and a
+ * second strategy writer with different merge rules should not appear in every catch-all session next to it.
+ */
+export const SKILL_ONLY_TOOL_NAMES: readonly string[] = ['manage_market_strategy'];
+
+/**
  * Get tools that are not associated with any published skill.
- * Excludes foundation tools and admin-only tools.
+ * Excludes foundation tools, admin-only tools, the page-context-only get_visual_context and the skill-only tools
+ * (SKILL_ONLY_TOOL_NAMES).
  *
  * `foundationTools`/`getAllTools` are injected — see this module's header
  * comment ("ENG-2103 F2 FOLLOW-UP") for why: `foundationTools` must be a LIVE
@@ -329,11 +338,14 @@ export function getUnassociatedTools(
     skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
   });
 
-  // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
+  // Build exclusion set: foundation tools + admin-only tools + page-context-only tools + skill-only tools
   const excludedTools = new Set<string>(foundationTools);
   ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
   // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
   excludedTools.add('get_visual_context');
+  // Skill-only tools (ENG-2840): offered through a skill that lists them, not through this catch-all pool. A work plan or
+  // schedule that names one in requiredFunctionCalls therefore does not get it from the pool either.
+  SKILL_ONLY_TOOL_NAMES.forEach(t => excludedTools.add(t));
 
   // Get all registered tools and find those not in any skill
   const allTools = getAllTools();
@@ -530,6 +542,27 @@ export async function saveFile(
  */
 export interface ReadFileCallerContext {
   userId?: string | null;
+  /**
+   * ENG-2840 (W2-7, the MCP tool): read only a file in the caller's own AgentWeb storage; any other URL is refused before anything is
+   * fetched (no web pages, no other hosts). Emma leaves it unset.
+   */
+  ownStorageOnly?: boolean;
+  /**
+   * ENG-2840 (W2-7, the MCP tool): refuse a stored file larger than this many bytes, from its stored size before reading and again while
+   * reading. Emma leaves it unset (no limit).
+   */
+  maxBytes?: number;
+}
+
+/** The refusal for a URL outside the caller's own storage when `ownStorageOnly` is set. */
+export const OWN_STORAGE_ONLY_MESSAGE = 'Only a file in your own AgentWeb storage can be read here (a file URL that AgentWeb returned for your account). Web pages and other sites are not fetched.';
+
+function fileTooLarge(maxBytes: number): { success: false; message: string; error: string } {
+  return {
+    success: false,
+    message: `This file is larger than ${Math.floor(maxBytes / (1024 * 1024))} MB, the most that can be read here.`,
+    error: 'File too large',
+  };
 }
 
 /** Key prefixes a user owns in the shared bucket (see s3Utils/brand/books/sandbox writers). */
@@ -631,6 +664,12 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
       };
     }
 
+    // ENG-2840 (W2-7): with ownStorageOnly, anything that is not a file of AgentWeb's own bucket is refused first, before any other answer
+    // (an image or video URL elsewhere gets the same refusal) and before anything is fetched.
+    if (caller?.ownStorageOnly === true && !extractS3KeyFromUrl(normalizedFileUrl)) {
+      return { success: false, message: OWN_STORAGE_ONLY_MESSAGE, error: 'Not a file in your AgentWeb storage' };
+    }
+
     // Determine file type from URL
     const urlPath = new URL(normalizedFileUrl).pathname;
     const extension = urlPath.split('.').pop()?.toLowerCase() || '';
@@ -669,18 +708,42 @@ export async function readFileContent(fileUrl: string, caller?: ReadFileCallerCo
           error: 'File not accessible'
         };
       }
+      const maxBytes = caller?.maxBytes;
+      let meta: any;
+      if (maxBytes !== undefined) {
+        // ENG-2840 (W2-7): the stored size first, so a file over the limit is never downloaded. A size that cannot be read is not a pass:
+        // the stream below still stops at the limit.
+        try {
+          meta = await getS3ObjectMetadata(s3Key);
+        } catch {
+          meta = undefined;
+        }
+        if (typeof meta?.ContentLength === 'number' && meta.ContentLength > maxBytes) return fileTooLarge(maxBytes);
+      }
       // Private bucket object — stream via SDK (same pattern as filesController)
-      const stream = getS3ObjectStream(s3Key);
+      // With a limit, the stream's destroy() also aborts the S3 request, so stopping early frees the connection.
+      const stream = maxBytes !== undefined ? getS3ObjectStreamAbortable(s3Key) : getS3ObjectStream(s3Key);
       const chunks: Buffer[] = [];
+      let received = 0;
       for await (const chunk of stream) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const piece = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        received += piece.length;
+        if (maxBytes !== undefined && received > maxBytes) {
+          (stream as any).destroy?.();
+          return fileTooLarge(maxBytes);
+        }
+        chunks.push(piece);
       }
       buffer = Buffer.concat(chunks);
-      try {
-        const meta = await getS3ObjectMetadata(s3Key);
-        contentType = meta.ContentType || '';
-      } catch {
-        contentType = '';
+      if (maxBytes !== undefined) {
+        contentType = meta?.ContentType || '';
+      } else {
+        try {
+          const stored = await getS3ObjectMetadata(s3Key);
+          contentType = stored.ContentType || '';
+        } catch {
+          contentType = '';
+        }
       }
       console.log(`AgentMode: Fetched S3 file via SDK, size: ${buffer.length} bytes, type: ${contentType}`);
     } else {

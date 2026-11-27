@@ -163,6 +163,19 @@ function validateSubdomain(subdomain: string, base: string = SUBDOMAIN_BASE): vo
 /**
  * Validate a custom domain format.
  */
+/**
+ * AgentWeb's own domains (the API's CORS list and the trusted report hosts). A customer can never attach one of these, or a host under
+ * one, as a custom domain: every customer project lives in AgentWeb's own Vercel team, so Vercel reports a host under a domain the team
+ * already holds as verified with no proof from the customer (and *.agentwebforms.com DNS already points at Vercel). Managed subdomains
+ * (addSubdomain) and page subdomains (setPageSubdomain, which needs an attached main domain) do not come through here.
+ */
+export const RESERVED_PLATFORM_DOMAINS: readonly string[] = Object.freeze(['agentweb.pro', SUBDOMAIN_BASE, 'hireemma.ai']);
+
+export function isReservedPlatformDomain(host: string): boolean {
+  const h = String(host ?? '').toLowerCase().trim().replace(/\.+$/, '');
+  return RESERVED_PLATFORM_DOMAINS.some((d) => h === d || h.endsWith(`.${d}`));
+}
+
 function validateDomain(domain: string): void {
   // Basic domain validation: must have at least one dot, no spaces
   const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/;
@@ -321,6 +334,10 @@ export async function addCustomDomain(
 ): Promise<CustomDomainRecord> {
   const cleanDomain = domain.toLowerCase().trim();
   validateDomain(cleanDomain);
+  // Refused before anything reaches Vercel. "Invalid" makes the route answer 400.
+  if (isReservedPlatformDomain(cleanDomain)) {
+    throw new Error(`Invalid domain: ${cleanDomain} is an AgentWeb domain and cannot be used as a custom domain. Use a domain you own.`);
+  }
 
   const headers = await getVercelHeaders();
 

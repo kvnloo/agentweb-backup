@@ -3,6 +3,8 @@ import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { buildAwsHttpOptions } from "../utils/awsHttpOptions";
 import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
+import { MEMORY_CATEGORIES, type MemoryCategory } from '../utils/memoryCategories';
+import { MEMORY_READ_MAX_ROWS_PROMPT } from '../utils/memoryReadLimits';
 import dotenv from "dotenv";
 import path from "path";
 import { S3 } from "aws-sdk";
@@ -31,12 +33,65 @@ import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { isConditionalFailure } from "./voice/setupWrites";
 import { LEAD_SUBMISSION_CLAIM_PARTITION } from "./leadSubmissionIdempotency";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
+import { readScheduleProvenance } from "../utils/scheduleProvenance";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+
+/**
+ * ENG-2840 (W2-5a): the provider fetches of a CAPPED lead-history read (the MCP lead tools) go through ONE chain for the whole process: one at
+ * a time, `gapMs` apart (the gap the platform's own sends keep, 2 a second). At most `backlog` fetches may be in the chain (one running, the rest
+ * waiting) and at most `perUser` of them one account's, so one account crawling its leads cannot fill it; a fetch that would not fit is skipped and
+ * its event comes back without a body. A fetch that has not answered after `timeoutMs` (10 s: the ten fetches of one call, if the provider hangs, then take about 100 s, inside the 5-minute self-call timeout) is given up on (the event comes back without a body and
+ * the chain moves on): the provider reads have no timeout of their own, and one request that never answers must not block every later read in the
+ * process. The provider's request limit is shared with the platform's sends, and an API key can repeat a read 60 times a minute (up to 600), so a
+ * per-call limit alone would still let several calls fetch at once. An uncapped read (Emma, the portal) does not use the chain.
+ * `cappedFetchTuning` is exported so a test can shorten the gap and the deadline.
+ */
+export const cappedFetchTuning = { gapMs: 500, backlog: 20, perUser: 10, timeoutMs: 10_000 };
+let cappedFetchChain: Promise<unknown> = Promise.resolve();
+let cappedFetchWaiting = 0;
+const cappedFetchByUser = new Map<string, number>();
+/** `fetch` with a deadline: an answer in time, or null (an error is passed on). The abandoned request, if any, is not cancelled. */
+function withDeadline<T>(fetch: () => Promise<T>): Promise<T | null> {
+  return new Promise<T | null>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(null), cappedFetchTuning.timeoutMs);
+    (timer as any).unref?.();
+    let started: Promise<T>;
+    try {
+      started = fetch();
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+      return;
+    }
+    started.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
+  });
+}
+function runCappedFetch<T>(userId: string, fetch: () => Promise<T>): Promise<T | null> {
+  const mine = cappedFetchByUser.get(userId) ?? 0;
+  if (cappedFetchWaiting >= cappedFetchTuning.backlog || mine >= cappedFetchTuning.perUser) return Promise.resolve(null);
+  cappedFetchWaiting++;
+  cappedFetchByUser.set(userId, mine + 1);
+  const run = cappedFetchChain.then(() => withDeadline(fetch));
+  const done = () => {
+    cappedFetchWaiting--;
+    const left = (cappedFetchByUser.get(userId) ?? 1) - 1;
+    if (left > 0) cappedFetchByUser.set(userId, left); else cappedFetchByUser.delete(userId);
+  };
+  run.then(done, done);
+  cappedFetchChain = run.then(() => undefined, () => undefined).then(() => {
+    if (!(cappedFetchTuning.gapMs > 0)) return undefined;
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, cappedFetchTuning.gapMs);
+      (timer as any).unref?.();
+    });
+  });
+  return run;
+}
 
 /** ENG-2123: until when getLeadIdsByPhoneKey should not try PhoneKeyIndex again (missing index / denied). */
 let phoneIndexUnavailableUntil = 0;
@@ -349,6 +404,12 @@ export interface User {
    * the per-user unsubscribe flow (future: `POST /api/drip/unsubscribe`).
    */
   dripUnsubscribed?: boolean;
+  /**
+   * ENG-3133. ISO time the user unsubscribed from the weekly Zoma ad-performance email. When set, the weekly
+   * report job MUST NOT email this user. Scoped to that one email: it changes nothing else (no other mail, no
+   * Zoma access). Absent = subscribed.
+   */
+  zomaWeeklyReportOptOutAt?: string;
   onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
   onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
   /**
@@ -3805,6 +3866,32 @@ const writeShedRunResults = async (
  */
 export const EXPECT_UNSET = Symbol.for("agentweb.schedule.expectUnset");
 
+/**
+ * ENG-2816 (step 3): the one tolerant reader of a schedule's `provenance` (the String Set naming the content fields a share-link
+ * visitor wrote). Lives in utils/scheduleProvenance.ts so the pure publish resolver can use it without importing this module;
+ * exported here because the db layer is where the attribute's three shapes (a DynamoDBSet off the wire, an array in memory and in
+ * API responses, absent) meet.
+ */
+export { readScheduleProvenance };
+
+/**
+ * A schedule item as the rest of the app should see it: `provenance`, when present, is a sorted array, never the DocumentClient's
+ * `DynamoDBSet` wrapper (which would otherwise leak into API responses and be spread, compared and cloned as an object). An item
+ * with no `provenance` attribute (every schedule that predates this change) comes back as the SAME object, untouched.
+ */
+const withReadableProvenance = <T>(item: T): T => {
+  if (!item || typeof item !== "object") return item;
+  const raw = (item as any).provenance;
+  if (raw === undefined) return item;
+  return { ...(item as any), provenance: readScheduleProvenance(raw) };
+};
+
+/** `withReadableProvenance` over a list; the same array comes back when no item carries the attribute. */
+const withReadableProvenanceAll = <T>(items: T[]): T[] =>
+  Array.isArray(items) && items.some((item) => item && typeof item === "object" && (item as any).provenance !== undefined)
+    ? items.map(withReadableProvenance)
+    : items;
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3853,11 +3940,17 @@ export const scheduleDb = {
     variableRequestAccessTokenHash?: string;
     variableRequestAccessTokenExpiresAt?: string;
     variableRequestAccessTokenConsumedAt?: string;
+    // ENG-2816 (step 3): the content fields a share-link visitor wrote (see utils/scheduleProvenance.ts). Stored as a DynamoDB
+    // String Set; an empty or absent list writes NO attribute (a Set cannot be empty, and an unmarked schedule carries nothing).
+    provenance?: string[];
   }) {
     try {
+      const { provenance, ...rest } = schedule;
+      const marks = readScheduleProvenance(provenance);
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Item: schedule,
+        // A schedule that never carried the key is written exactly as before (the same object).
+        Item: marks.length > 0 ? { ...rest, provenance: dynamodb.createSet(marks) } : ('provenance' in schedule ? rest : schedule),
       };
 
       await writeWithEvaluationGuard(dynamodb, schedule.userId, TABLE_PREFIX, { Put: params });
@@ -3878,23 +3971,28 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByTaskId");
     }
   },
 
-  async getScheduleById(scheduleId: string) {
+  /**
+   * `consistent` asks for a strongly consistent read. Only a security decision needs it (ENG-2816: is this schedule marked as
+   * visitor-written, right now); every other caller keeps the default eventually consistent read and its cost.
+   */
+  async getScheduleById(scheduleId: string, options?: { consistent?: boolean }) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
+        ...(options?.consistent ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
-      return result.Item;
+      return withReadableProvenance(result.Item);
     } catch (error) {
       handleDynamoDbError(error, "getScheduleById");
     }
@@ -3908,7 +4006,7 @@ export const scheduleDb = {
    */
   async getAllSchedules(): Promise<any[]> {
     try {
-      return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+      return withReadableProvenanceAll(await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`));
     } catch (error) {
       // Rethrows. A scan that dies halfway must not read as "no schedules" — that
       // would turn a transient failure into a migration that silently grants nothing.
@@ -3982,6 +4080,11 @@ export const scheduleDb = {
       pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
+      // ENG-2816 (step 3): NOT a stored attribute. Members to ADD to the schedule's `provenance` String Set (see
+      // utils/scheduleProvenance.ts), carried in the SAME UpdateExpression as the content change they describe, so a visitor's content
+      // and its mark land together or not at all. Marks are only ever added here; the whole attribute comes off through
+      // `removeAttributes: ['provenance']` (the adopt route), which works on whatever shape the stored value has.
+      provenanceAdd: string[];
     }>,
     /**
      * ENG-827: attributes that must STILL hold for this write to land, as read a
@@ -4010,6 +4113,18 @@ export const scheduleDb = {
      */
     removeAttributes?: string[]
   ) {
+    // ENG-2816 (step 3): split the non-stored provenance key off BEFORE the SET loop below, which would otherwise turn it into
+    // `SET #provenanceAdd = ...` on an attribute that does not exist.
+    const { provenanceAdd, ...storedUpdates } = updates as Record<string, any>;
+    const provenanceToAdd = readScheduleProvenance(provenanceAdd);
+    if (storedUpdates.provenance !== undefined) {
+      // A direct SET would store a List, and the next ADD on it would fail. The set is only ever touched through ADD, and removed
+      // whole through removeAttributes.
+      throw new Error('updateSchedule: set provenance through provenanceAdd, not as an attribute.');
+    }
+    if (provenanceToAdd.length > 0 && (removeAttributes || []).includes('provenance')) {
+      throw new Error('updateSchedule: provenance cannot be added to and removed in one write.');
+    }
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
@@ -4022,7 +4137,7 @@ export const scheduleDb = {
       // ValidationException. Skipping makes a stray undefined a no-op rather than
       // a crash. Deliberate removal goes through `removeAttributes` instead, so
       // it can never be triggered by an accidentally-undefined field.
-      Object.entries(updates).forEach(([key, value]) => {
+      Object.entries(storedUpdates).forEach(([key, value]) => {
         if (value === undefined) return;
         updateExpressions.push(`#${key} = :${key}`);
         expressionAttributeNames[`#${key}`] = key;
@@ -4100,6 +4215,13 @@ export const scheduleDb = {
       const clauses: string[] = [];
       if (updateExpressions.length > 0) clauses.push(`SET ${updateExpressions.join(", ")}`);
       if (removeTargets.length > 0) clauses.push(`REMOVE ${removeTargets.join(", ")}`);
+      // ENG-2816 (step 3): the provenance mark rides the SAME expression as the content change it describes. A write that carries
+      // only a mark is a real write and must not fall into the "nothing to do" return below.
+      if (provenanceToAdd.length > 0) {
+        expressionAttributeNames['#provenance'] = 'provenance';
+        expressionAttributeValues[':provenanceAdd'] = dynamodb.createSet(provenanceToAdd);
+        clauses.push('ADD #provenance :provenanceAdd');
+      }
       if (clauses.length === 0) {
         // Nothing to do. Returning beats sending an empty expression, which
         // DynamoDB rejects, and beats pretending a write happened.
@@ -4125,7 +4247,7 @@ export const scheduleDb = {
       }
 
       const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return withReadableProvenance(result.Attributes);
     } catch (error) {
       handleDynamoDbError(error, "updateSchedule");
     }
@@ -4152,7 +4274,7 @@ export const scheduleDb = {
 
     try {
       const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return withReadableProvenance(result.Attributes);
     } catch (error) {
       // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry.
       if (isDynamoItemSizeError(error)) {
@@ -4162,7 +4284,7 @@ export const scheduleDb = {
             if (plan === null) break;
             const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
             if (written.raced) continue;
-            return written.attributes;
+            return withReadableProvenance(written.attributes);
           }
         } catch (recoveryError) {
           // Recovery failed too — report the condition that actually stopped the write.
@@ -4299,7 +4421,7 @@ export const scheduleDb = {
         }));
       }
 
-      return dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat');
+      return withReadableProvenanceAll(dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat'));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
@@ -4485,7 +4607,7 @@ export const scheduleDb = {
           ExpressionAttributeValues: { ':status': status, ':type': 'scheduled_chat' },
         })
       ));
-      return results.flat();
+      return withReadableProvenanceAll(results.flat());
     } catch (error) {
       // Best-effort reconciler input: a transient list failure just skips this
       // sweep (the next one retries), so log and return empty rather than throw.
@@ -4605,7 +4727,17 @@ export const scheduleDb = {
     }
   },
 
-  async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true) {
+  /**
+   * ENG-3047: pass `expected` (the due time and last run time the caller read) to make
+   * the advance land only if the row still carries both. Of two callers that read the
+   * same due row, one advances and decrements `runCount`; the other gets an error
+   * marked `preconditionFailed` and has changed nothing. `lastRunTime` is checked as
+   * well because it moves on every fire: an edit that puts the old due time back
+   * cannot let a caller holding the older row through. A `lastRunTime` that was read
+   * as anything but a non-empty string or absent is not checked. Without `expected`
+   * the write is unconditional.
+   */
+  async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true, expected?: { nextRunTime: string; lastRunTime?: unknown }) {
     try {
       // First, get the current schedule to check runCount
       const getParams = {
@@ -4659,9 +4791,30 @@ export const scheduleDb = {
         ReturnValues: 'ALL_NEW',
       };
 
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes;
-    } catch (error) {
+      if (expected === undefined) {
+        const result = await dynamodb.update(params).promise();
+        return withReadableProvenance(result.Attributes);
+      }
+
+      const conditions = ['#nextRunTime = :expectedNextRunTime'];
+      attributeValues[':expectedNextRunTime'] = expected.nextRunTime;
+      if (typeof expected.lastRunTime === 'string' && expected.lastRunTime.length > 0) {
+        conditions.push('#lastRunTime = :expectedLastRunTime');
+        attributeValues[':expectedLastRunTime'] = expected.lastRunTime;
+      } else if (expected.lastRunTime === undefined) {
+        conditions.push('attribute_not_exists(#lastRunTime)');
+      }
+      try {
+        const result = await dynamodb.update({ ...params, ConditionExpression: conditions.join(' AND ') }).promise();
+        return withReadableProvenance(result.Attributes);
+      } catch (updateError: any) {
+        if (updateError?.code !== 'ConditionalCheckFailedException') throw updateError;
+        const lost: any = new Error('Schedule advance precondition failed');
+        lost.preconditionFailed = true;
+        throw lost;
+      }
+    } catch (error: any) {
+      if (error?.preconditionFailed === true) throw error;
       handleDynamoDbError(error, "updateScheduleAfterRun");
       throw error;
     }
@@ -4688,7 +4841,7 @@ export const scheduleDb = {
 
         const result = await dynamodb.scan(params).promise();
         if (result.Items && result.Items.length > 0) {
-          return result.Items[0];
+          return withReadableProvenance(result.Items[0]);
         }
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
@@ -4732,7 +4885,7 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getPendingSchedules");
     }
@@ -4749,7 +4902,7 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByUserId");
     }
@@ -9818,7 +9971,15 @@ export const crmDb = {
     }
   },
 
-  async getLeadEngagements(listId: string, leadId: string, userId: string) {
+  /**
+   * `options.maxContentFetches` (ENG-2840 W2-5a, set only by the MCP lead tools): the most email bodies this call may fetch from the mail
+   * provider. Without it (Emma, the portal) every received or delivered event that has no stored body is fetched, all at once. With it, only
+   * the NEWEST that many such events are fetched, through one process-wide chain (one at a time, 500 ms apart, at most 20 in it and 10 per
+   * account, each given up on after 10 s; one that does not fit is skipped), and stored (so a later call reaches the next ones, as long as these succeed: a body that cannot be
+   * fetched is not remembered and uses the allowance again on every call); the others are returned without a body.
+   * An event whose body is already stored never uses up the allowance. A value that is not a finite number of at least 0 is no cap.
+   */
+  async getLeadEngagements(listId: string, leadId: string, userId: string, options?: { maxContentFetches?: number }) {
     try {
       // Get the lead
       const lead = await this.getLeadById(listId, leadId);
@@ -9851,10 +10012,28 @@ export const crmDb = {
 
       const filteredEvents = [...emailEvents, ...linkedInEvents];
 
+      const maxContentFetches = options?.maxContentFetches;
+      const capFetches = typeof maxContentFetches === 'number' && Number.isFinite(maxContentFetches) && maxContentFetches >= 0;
+      const fetchAllowed = new Set<any>();
+      if (capFetches) {
+        const needContent = filteredEvents
+          .filter((e: any) => (e.eventType === 'email.received' || e.eventType === 'email.delivered') && !e.emailContent && e.data?.email_id)
+          .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        for (const e of needContent.slice(0, Math.floor(maxContentFetches as number))) fetchAllowed.add(e);
+      }
+
+      // A capped read (the MCP lead tools) fetches its bodies through the process-wide chain (see runCappedFetch): one at a time, paced, with a
+      // backlog limit. An uncapped read (Emma, the portal) runs every fetch at once, as before.
+      const runFetch = <T>(fetch: () => Promise<T>): Promise<T | null> => (capFetches ? runCappedFetch(userId, fetch) : fetch());
+      // A capped read hands its fetches to the chain newest first, so what a busy chain skips is the oldest, not the newest.
+      const eventsToLoad = capFetches
+        ? [...filteredEvents].sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        : filteredEvents;
+
       // Transform email events to engagement format
       // For email.received events, fetch the email content
       const emailEngagements = await Promise.all(
-        filteredEvents.map(async (event: any) => {
+        eventsToLoad.map(async (event: any) => {
           const baseEngagement = {
             eventType: event.eventType,
             eventData: event.data,
@@ -9884,13 +10063,16 @@ export const crmDb = {
                 };
               }
 
+              // Over the caller's allowance (see options.maxContentFetches): no fetch, the event is returned without a body
+              if (capFetches && !fetchAllowed.has(event)) return baseEngagement;
+
               // Fetch from Resend if not cached
               const resendService = require('./resendService').resendService;
 
               if (event.eventType === 'email.received') {
-                emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+                emailContent = await runFetch(() => resendService.getReceivedEmailContent(event.data.email_id));
               } else if (event.eventType === 'email.delivered') {
-                emailContent = await resendService.getDeliveredEmailContent(event.data.email_id);
+                emailContent = await runFetch(() => resendService.getDeliveredEmailContent(event.data.email_id));
               }
 
               if (emailContent) {
@@ -11379,6 +11561,101 @@ export const crmDb = {
   },
 
   /**
+   * ENG-2984: atomically claims a lead's stored email draft for sending. The draft itself is NOT
+   * removed (a crash/deploy mid-send must not lose it); instead a send-claim timestamp is set ONLY
+   * while the draft still equals `expectedDraft` and no fresh claim exists. Of two concurrent
+   * senders exactly one wins; the loser gets false and must not send. A claim older than
+   * `leaseMs` is treated as abandoned (crashed sender) so the user can retry. Touches only
+   * `emailDraftSendClaimedAt` (no updatedAt, so no GSI re-projection).
+   */
+  async claimLeadEmailDraft(
+    listId: string,
+    leadId: string,
+    expectedDraft: Record<string, unknown>,
+    leaseMs: number = 5 * 60 * 1000,
+  ): Promise<string | null> {
+    const now = Date.now();
+    // Ownership token: ISO timestamp prefix keeps the lexicographic stale-lease comparison
+    // valid; the random suffix lets release() remove only this caller's claim.
+    const token = `${new Date(now).toISOString()}#${randomUUID()}`;
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'SET emailDraftSendClaimedAt = :now',
+        ConditionExpression:
+          'emailDraft = :expected AND (attribute_not_exists(emailDraftSendClaimedAt) OR emailDraftSendClaimedAt < :staleBefore)',
+        ExpressionAttributeValues: {
+          ':expected': expectedDraft,
+          ':now': token,
+          ':staleBefore': new Date(now - leaseMs).toISOString(),
+        },
+      }).promise();
+      return token;
+    } catch (err) {
+      if (isConditionalFailure(err)) return null;
+      handleDynamoDbError(err, 'claimLeadEmailDraft');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: after a successful send, clears the draft and the send-claim in ONE conditional
+   * write — only while the claim still holds the caller's token AND the stored draft still equals
+   * the draft that was sent. Returns false (nothing written) otherwise, so a draft replaced
+   * mid-send or a replacement sender's claim is never removed.
+   */
+  async completeLeadEmailDraftSend(
+    listId: string,
+    leadId: string,
+    token: string,
+    sentDraft: Record<string, unknown>,
+  ): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        // No updatedAt: changing the GSI range key re-projects the sparse lookup indexes, which
+        // fails on legacy rows carrying "" index keys (see updateLead's self-heal). Bookkeeping
+        // only, like claimLeadEmailDraft.
+        UpdateExpression: 'SET emailDraft = :null REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token AND emailDraft = :sent',
+        ExpressionAttributeValues: {
+          ':null': null,
+          ':token': token,
+          ':sent': sentDraft,
+        },
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'completeLeadEmailDraftSend');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: releases a send-claim (after a failed send, or after a successful send has cleared
+   * the draft). Removes the claim only while it still holds the caller's token, so a sender whose
+   * lease expired cannot drop a replacement sender's claim. Idempotent; a mismatch is a no-op.
+   */
+  async releaseLeadEmailDraftClaim(listId: string, leadId: string, token: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token',
+        ExpressionAttributeValues: { ':token': token },
+      }).promise();
+    } catch (err) {
+      if (isConditionalFailure(err)) return;
+      handleDynamoDbError(err, 'releaseLeadEmailDraftClaim');
+      throw err;
+    }
+  },
+
+  /**
    * Conditional patch of the object record at `lead.system[key]`, applied in ONE UpdateItem. Returns
    * false (nothing written) when ANY condition fails, so a replayed or out-of-order caller is a clean
    * no-op rather than a partial write:
@@ -11487,8 +11764,8 @@ export const crmDb = {
 
 // ─── Account Memory ───────────────────────────────────────────────
 
-const VALID_MEMORY_CATEGORIES = ['preference', 'history', 'insight', 'workflow'] as const;
-type MemoryCategory = typeof VALID_MEMORY_CATEGORIES[number];
+// The category list lives in utils/memoryCategories.ts so emma/impl/memory.ts can check it without loading this file.
+const VALID_MEMORY_CATEGORIES = MEMORY_CATEGORIES;
 
 const ACCOUNT_MEMORY_TABLE = `${TABLE_PREFIX}AW-AccountMemory`;
 const ORG_MEMORY_TABLE = `${TABLE_PREFIX}AW-OrgMemory`;
@@ -11707,19 +11984,87 @@ export const browserCookieDb = {
   },
 };
 
+// ENG-2840 (W2-1): the bounds are in utils/memoryReadLimits.ts (why a read now follows the cursor, and why these numbers).
+export interface MemoryReadOptions {
+  /** Hard bound on rows returned. Default: MEMORY_READ_MAX_ROWS_PROMPT. Ignored when a `limit` is passed. */
+  maxRows?: number;
+  /** Newest rows first (memory ids are ULIDs). Default true. Ignored when a `limit` is passed (that call keeps its old order), and
+   * for a category read, whose index sorts by category, not by time. */
+  newestFirst?: boolean;
+  /** Do not fetch the embedding vectors at all (a projection: about 40 of every 45 KB of a row on the wire). Default false: the
+   * prompt loader ranks by them. */
+  omitEmbeddings?: boolean;
+  /** Strongly consistent read (`ConsistentRead`), so a memory saved a moment ago is in the answer. Applies to a read of the table only:
+   * a category read goes through an index, which cannot be read consistently, and ignores this. Costs twice the read capacity. */
+  consistentRead?: boolean;
+}
+
+/** The bound of a read, as a whole number of at least 1 (a zero or negative bound would send DynamoDB an invalid Limit). */
+function memoryReadBound(options: MemoryReadOptions): number {
+  const requested = options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT;
+  // Not a number, zero or negative: the default. A fraction rounds down but never below 1.
+  if (!Number.isFinite(requested) || requested <= 0) return MEMORY_READ_MAX_ROWS_PROMPT;
+  return Math.max(1, Math.floor(requested));
+}
+
+/** DynamoDB returns a LastEvaluatedKey whenever the Limit was used up, even when nothing is left, so "stopped at the bound" means "there may be more". */
+function warnReadStoppedAtBound(kind: 'account' | 'org', bound: number, ownerId: unknown): void {
+  console.warn(`[memory] ${kind} memory read stopped at its ${bound}-row bound (there may be more rows stored) (${ownerId})`);
+}
+
+// The attributes a memory row carries (read from every row on prod on 2026-11-23). A list read that omits the embeddings names them
+// all, so it fetches everything the row holds except the 1,536-number vector.
+export const ACCOUNT_MEMORY_LIST_ATTRIBUTES = ['userId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceSessionId'] as const;
+export const ORG_MEMORY_LIST_ATTRIBUTES = ['orgId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceUserId'] as const;
+
+function withoutEmbeddingsProjection(attributes: readonly string[]): Pick<AWS.DynamoDB.DocumentClient.QueryInput, 'ProjectionExpression' | 'ExpressionAttributeNames'> {
+  return {
+    ProjectionExpression: attributes.map((_, i) => `#mp${i}`).join(', '),
+    ExpressionAttributeNames: Object.fromEntries(attributes.map((name, i) => [`#mp${i}`, name])),
+  };
+}
+
+function withoutEmbeddings<T extends Record<string, any>>(rows: T[]): Omit<T, 'embedding'>[] {
+  return rows.map((row) => Object.fromEntries(Object.entries(row).filter(([name]) => name !== 'embedding')) as Omit<T, 'embedding'>);
+}
+
 /** Keep structured ads lessons out of generic relevance injection, without consuming its
- * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed. */
-async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.QueryInput): Promise<any[]> {
+ * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed.
+ *
+ * `opts.maxRows` bounds a read that has no `limit`: the loop follows the cursor until the rows run out or the bound is reached
+ * (it used to return after the first page that held any ordinary row). That read now reaches rows far past the first page, so one row
+ * without a text `content` (nothing to show, nothing to rank) is skipped and logged instead of failing the whole list and every prompt.
+ * A read WITH a `limit` still fails closed on it, exactly as before, and an item that is not a row at all (not an object, no string
+ * id) always fails closed. */
+async function queryOrdinaryAccountMemories(
+  params: AWS.DynamoDB.DocumentClient.QueryInput,
+  opts: { maxRows?: number } = {},
+): Promise<any[]> {
   const rows: any[] = [];
   let query = { ...params };
   let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-  for (let page = 0; page < 10; page++) {
+  const want = params.Limit ?? opts.maxRows;
+  const skipUnreadable = params.Limit === undefined && Boolean(opts.maxRows);
+  const skipped: string[] = [];
+  const finish = (result: any[]): any[] => {
+    if (skipped.length > 0) {
+      console.warn(`[memory] account memory read skipped ${skipped.length} row(s) without text content, ids ${skipped.slice(0, 5).join(', ')} (${params.ExpressionAttributeValues?.[':userId']})`);
+    }
+    return result;
+  };
+  // One page holds 40 or more rows even at the largest row size, so the page budget grows with the bound.
+  const maxPages = params.Limit === undefined && opts.maxRows ? Math.max(10, Math.ceil(opts.maxRows / 30) + 10) : 10;
+  for (let page = 0; page < maxPages; page++) {
     const result = await dynamodb.query({ ...query, ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-      ...(params.Limit ? { Limit: params.Limit - rows.length } : {}) }).promise();
+      ...(want ? { Limit: want - rows.length } : {}) }).promise();
     if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed account memory page');
     for (const item of result.Items ?? []) {
-      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string' || typeof item.content !== 'string') {
-        throw new Error('Malformed account memory item');
+      // Not a row at all (not an object, no string id): the page itself is wrong, always fail closed.
+      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string') throw new Error('Malformed account memory item');
+      if (typeof item.content !== 'string') {
+        if (!skipUnreadable) throw new Error('Malformed account memory item');
+        skipped.push(item.memoryId);
+        continue;
       }
       if (!item.memoryId.startsWith('ads-learning#')) rows.push(item);
     }
@@ -11732,12 +12077,42 @@ async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.
         ExpressionAttributeValues: { ...params.ExpressionAttributeValues,
           ':learningBoundary': descending ? 'ads-learning#' : 'ads-learning#\uffff' } };
       cursor = undefined;
-      if (params.Limit && rows.length >= params.Limit) return rows.slice(0, params.Limit);
+      if (want && rows.length >= want) {
+        if (params.Limit === undefined && opts.maxRows) warnReadStoppedAtBound('account', opts.maxRows, params.ExpressionAttributeValues?.[':userId']);
+        return finish(rows.slice(0, want));
+      }
       continue;
     }
-    if (!cursor || (params.Limit ? rows.length >= params.Limit : rows.length > 0)) return params.Limit ? rows.slice(0, params.Limit) : rows;
+    // With a bound (a `limit` or `opts.maxRows`) keep reading until it is reached or the rows run out. Without one, the old rule
+    // stands: the first page that holds any ordinary row is the answer.
+    if (!cursor || (want ? rows.length >= want : rows.length > 0)) {
+      if (cursor && params.Limit === undefined && opts.maxRows) {
+        warnReadStoppedAtBound('account', opts.maxRows, params.ExpressionAttributeValues?.[':userId']);
+      }
+      return finish(want ? rows.slice(0, want) : rows);
+    }
   }
   throw new Error('Account memory retrieval exceeded its bounded page budget; incomplete results withheld');
+}
+
+/** Org memory rows (no learning range to skip): follow the cursor until the rows run out or `maxRows` is reached. Fails closed
+ * when the page budget runs out, like the account reader. */
+async function queryOrgMemoryRows(params: AWS.DynamoDB.DocumentClient.QueryInput, maxRows: number): Promise<any[]> {
+  const rows: any[] = [];
+  let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+  const maxPages = Math.max(10, Math.ceil(maxRows / 30) + 10);
+  for (let page = 0; page < maxPages; page++) {
+    const result = await dynamodb.query({ ...params, ...(cursor ? { ExclusiveStartKey: cursor } : {}), Limit: maxRows - rows.length }).promise();
+    if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed org memory page');
+    // No row validation here: the org reader never had any, and one odd row must not take the whole org list (or every member's prompt) down.
+    rows.push(...(result.Items ?? []));
+    cursor = result.LastEvaluatedKey;
+    if (!cursor || rows.length >= maxRows) {
+      if (cursor) warnReadStoppedAtBound('org', maxRows, params.ExpressionAttributeValues?.[':orgId']);
+      return rows.slice(0, maxRows);
+    }
+  }
+  throw new Error('Org memory retrieval exceeded its bounded page budget; incomplete results withheld');
 }
 
 export const accountMemoryDb = {
@@ -11794,7 +12169,11 @@ export const accountMemoryDb = {
     }
   },
 
-  async getUserMemories(userId: string, category?: string, limit?: number) {
+  /**
+   * A call with a `limit` behaves exactly as before. A call without one now reads up to `options.maxRows` rows (default: the
+   * newest MEMORY_READ_MAX_ROWS_PROMPT) by following the cursor; it used to return one page.
+   */
+  async getUserMemories(userId: string, category?: string, limit?: number, options: MemoryReadOptions = {}) {
     try {
       const params: AWS.DynamoDB.DocumentClient.QueryInput = category
         ? {
@@ -11809,9 +12188,15 @@ export const accountMemoryDb = {
           KeyConditionExpression: 'userId = :userId',
           ExpressionAttributeValues: { ':userId': userId },
           ...(limit ? { Limit: limit } : {}),
+          // Newest first only for an unbounded-by-limit table read: the category index sorts by category, not by time.
+          ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
+          ...(options.consistentRead ? { ConsistentRead: true } : {}),
         };
 
-      return await queryOrdinaryAccountMemories(params);
+      // A list read that leaves the vectors out does not fetch them: a projection, not a strip after the read.
+      const readParams = options.omitEmbeddings ? { ...params, ...withoutEmbeddingsProjection(ACCOUNT_MEMORY_LIST_ATTRIBUTES) } : params;
+      const rows = await queryOrdinaryAccountMemories(readParams, limit ? {} : { maxRows: memoryReadBound(options) });
+      return options.omitEmbeddings ? withoutEmbeddings(rows) : rows;
     } catch (error) {
       handleDynamoDbError(error, 'getUserMemories');
       throw error;
@@ -11844,8 +12229,12 @@ export const accountMemoryDb = {
         Key: { userId, memoryId },
         UpdateExpression: 'SET embedding = :e',
         ExpressionAttributeValues: { ':e': embedding },
+        // UpdateItem upserts: without this, a memory deleted while its embedding was being backfilled comes back as a row with no content.
+        ConditionExpression: 'attribute_exists(memoryId)',
       }).promise();
-    } catch (error) {
+    } catch (error: any) {
+      // The memory was deleted in the meantime: there is nothing to backfill.
+      if (error?.code === 'ConditionalCheckFailedException') return;
       handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }
@@ -11904,13 +12293,16 @@ export const accountMemoryDb = {
     }
   },
 
-  async deleteMemory(userId: string, memoryId: string) {
+  /** Resolves true when a row was deleted and false when there was no such memory (a delete of a missing id used to look like success). */
+  async deleteMemory(userId: string, memoryId: string): Promise<boolean> {
     if (memoryId.startsWith('ads-learning#')) throw new Error('Use learning review to preserve audit history');
     try {
-      await dynamodb.delete({
+      const result = await dynamodb.delete({
         TableName: ACCOUNT_MEMORY_TABLE,
         Key: { userId, memoryId },
+        ReturnValues: 'ALL_OLD',
       }).promise();
+      return Boolean(result?.Attributes);
     } catch (error) {
       handleDynamoDbError(error, 'deleteMemory');
       throw error;
@@ -11965,7 +12357,9 @@ export const orgMemoryDb = {
     }
   },
 
-  async getOrgMemories(orgId: string, category?: string, limit?: number) {
+  /** Same contract as accountMemoryDb.getUserMemories: a `limit` call is unchanged; without one, the read follows the cursor up to
+   * `options.maxRows` (default: the newest MEMORY_READ_MAX_ROWS_PROMPT) instead of returning one page. */
+  async getOrgMemories(orgId: string, category?: string, limit?: number, options: MemoryReadOptions = {}) {
     try {
       const params: AWS.DynamoDB.DocumentClient.QueryInput = category
         ? {
@@ -11980,10 +12374,15 @@ export const orgMemoryDb = {
           KeyConditionExpression: 'orgId = :orgId',
           ExpressionAttributeValues: { ':orgId': orgId },
           ...(limit ? { Limit: limit } : {}),
+          ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
+          ...(options.consistentRead ? { ConsistentRead: true } : {}),
         };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      const readParams = options.omitEmbeddings ? { ...params, ...withoutEmbeddingsProjection(ORG_MEMORY_LIST_ATTRIBUTES) } : params;
+      const rows = limit
+        ? (await dynamodb.query(readParams).promise()).Items || []
+        : await queryOrgMemoryRows(readParams, memoryReadBound(options));
+      return options.omitEmbeddings ? withoutEmbeddings(rows) : rows;
     } catch (error) {
       handleDynamoDbError(error, 'getOrgMemories');
       throw error;
@@ -12016,8 +12415,12 @@ export const orgMemoryDb = {
         Key: { orgId, memoryId },
         UpdateExpression: 'SET embedding = :e',
         ExpressionAttributeValues: { ':e': embedding },
+        // UpdateItem upserts: without this, a memory deleted while its embedding was being backfilled comes back as a row with no content.
+        ConditionExpression: 'attribute_exists(memoryId)',
       }).promise();
-    } catch (error) {
+    } catch (error: any) {
+      // The memory was deleted in the meantime: there is nothing to backfill.
+      if (error?.code === 'ConditionalCheckFailedException') return;
       handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }
@@ -12088,12 +12491,15 @@ export const orgMemoryDb = {
     }
   },
 
-  async deleteMemory(orgId: string, memoryId: string) {
+  /** Resolves true when a row was deleted and false when there was no such org memory. */
+  async deleteMemory(orgId: string, memoryId: string): Promise<boolean> {
     try {
-      await dynamodb.delete({
+      const result = await dynamodb.delete({
         TableName: ORG_MEMORY_TABLE,
         Key: { orgId, memoryId },
+        ReturnValues: 'ALL_OLD',
       }).promise();
+      return Boolean(result?.Attributes);
     } catch (error) {
       handleDynamoDbError(error, 'deleteOrgMemory');
       throw error;

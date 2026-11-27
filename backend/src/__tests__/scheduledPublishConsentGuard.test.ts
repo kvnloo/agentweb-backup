@@ -644,7 +644,8 @@ describe('default dependency resolution (ENG-827)', () => {
       await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' })
     ).toBeNull();
     expect(chatbotDb.getChatSession).toHaveBeenCalledWith('sess-1');
-    expect(scheduleDb.getScheduleById).toHaveBeenCalledWith('1c20ada1-0000-4000-8000-000000000001');
+    // ENG-2816 (step 3): the schedule is read CONSISTENTLY: whether a visitor has marked it is a security decision about a public post.
+    expect(scheduleDb.getScheduleById).toHaveBeenCalledWith('1c20ada1-0000-4000-8000-000000000001', { consistent: true });
   });
 
   it('refuses through the real modules when the owner holds the schedule', async () => {

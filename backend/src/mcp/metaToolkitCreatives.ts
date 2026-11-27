@@ -41,7 +41,7 @@ import net from 'net';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
-import { assertAdsManagementGranted } from './metaToolkitWrites';
+import { assertAdsManagementGranted, assertMetaPageAccessForCreate } from './metaToolkitWrites';
 import { MetaService } from '../services/metaService';
 import { probePublicMediaUrl, SsrfBlockedError } from '../utils/ssrfGuard';
 import { googleToolkitEnabled } from './zomaToolDefinitions';
@@ -91,6 +91,8 @@ export interface MetaToolkitCreativeDeps {
   previewCreative: (userId: string, accountId: string, params: any) => Promise<any>;
   dispatch: (userId: string, dispatch: any) => Promise<{ result: any; createdId?: string }>;
   readCreative: (userId: string, accountId: string, creativeId: string) => Promise<any>;
+  /** ENG-3129: one-click Meta reconnect link for the Page-access refusal. */
+  connectLink?: (userId: string) => Promise<string>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   videoWaitMs: number;
@@ -137,6 +139,7 @@ const defaultDeps: MetaToolkitCreativeDeps = {
   dispatch: async (userId, d) => (await ams()).dispatchToolkitConfirmedMetaWrite(userId, d),
   readCreative: async (userId, accountId, creativeId) =>
     (await ams()).manageMetaAdsAdCreatives(userId, 'GET', accountId, { creative_id: creativeId }),
+  connectLink: async (userId) => (await import('../services/metaConnectUrl')).buildMetaConnectUrl(userId, 'marketing'),
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   now: () => Date.now(),
   videoWaitMs: 90_000,
@@ -336,7 +339,11 @@ export async function prepareZomaUpload(userId: string, args: any, depsIn: MetaT
     upload_command: `curl -sS --fail -X PUT -H 'Content-Type: ${contentType}' --upload-file '<path to ${filename}>' '${uploadUrl}'`,
     next_step:
       `Run upload_command with the real local path (it prints nothing on success). Then call call_meta_marketing_api with ` +
-      `entity_type AD_CREATIVE, action ${action}, params.${urlParam} = file_url. The upload URL expires in 15 minutes and only accepts Content-Type ${contentType}.`,
+      `entity_type AD_CREATIVE, action ${action}, params.${urlParam} = file_url` +
+      // Google image assets accept PNG, JPG and GIF only, so a WebP file is not offered to Google.
+      (kind === 'image' && googleToolkitEnabled() && /\.(png|jpe?g|gif)$/i.test(filename)
+        ? ' (Meta), or call_google_ads_api entity_type ASSET, action UPLOAD, asset_type IMAGE or LOGO, name (required), data = file_url (Google Ads)' : '') +
+      `. The upload URL expires in 15 minutes and only accepts Content-Type ${contentType}.`,
   };
 }
 
@@ -416,7 +423,21 @@ export async function executeMetaToolkitCreative(userId: string, rawArgs: any, d
     if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
     throw error;
   }
-  assertAdsManagementGranted(await deps.listAccounts(userId), accountId);
+  const accounts = await deps.listAccounts(userId);
+  assertAdsManagementGranted(accounts, accountId);
+  // ENG-3129: a creative needs a Page; refuse before any upload/preview reaches Meta. Uploads stay ungated.
+  if (action === 'CREATE' || action === 'BULK_CREATE') {
+    const asId = (v: any) => (typeof v === 'string' && v) || (typeof v === 'number' && Number.isFinite(v)) ? String(v) : undefined;
+    const topPage = asId(params.page_id);
+    // BULK_CREATE: each item's page_id (falling back to the top-level one) is what Meta will use.
+    const itemPages = action === 'BULK_CREATE' && Array.isArray(params.items)
+      ? params.items.map((it: any) => asId(it?.page_id) ?? topPage).filter((v: any): v is string => !!v)
+      : [];
+    await assertMetaPageAccessForCreate(accounts, accountId, {
+      pageIds: itemPages.length ? itemPages : topPage ? [topPage] : [],
+      connectLink: deps.connectLink && (() => deps.connectLink!(userId)),
+    });
+  }
 
   if (action === 'UPLOAD_IMAGE') {
     const { fetchUrl } = await resolveAssetUrl(userId, params.image_url, 'image', deps);

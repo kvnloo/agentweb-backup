@@ -140,7 +140,7 @@ function graphRefusal(error: any, doing: string): MetaToolkitRefusal {
   let hint = '';
   try {
     if (meta?.code !== undefined) {
-      const explained: any = explainMetaError({ code: String(meta.code) });
+      const explained: any = explainMetaError({ code: String(meta.code), ...(typeof meta.message === 'string' ? { message: meta.message } : {}) });
       if (explained?.known && typeof explained.action === 'string') hint = ` ${explained.action}`;
     }
   } catch { /* explainer is advisory */ }

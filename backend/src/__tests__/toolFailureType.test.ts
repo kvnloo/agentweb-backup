@@ -1,4 +1,6 @@
 import { classifyToolFailureType, FAILURE_TYPES } from '../utils/toolFailureType';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { ToolRestrictionDenied, restrictionRefusal, scheduleProvenanceUnverifiableRefusal, sensitiveActionRefusal, sensitiveActionScheduleRefusal, sensitiveActionUnverifiableRefusal } from '../services/toolRestrictionProfiles';
 
 /**
  * Decision-layer classification for agent tool failures. Sits on top of the
@@ -318,5 +320,63 @@ describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM r
       + 'Marketing access was requested when the account was connected and HubSpot did not grant it.')).toBe('config');
     expect(classifyToolFailureType('Error',
       'This HubSpot connection was authorised for CRM access only, so it cannot read or write EMAIL (a Marketing Hub object).')).toBe('config');
+  });
+  // ENG-3152/ENG-3154: authorization refusals are the guard working, not tool bugs.
+  describe('restriction-profile refusals (ENG-3152)', () => {
+    const roundTrip = (msg: string) => classifyToolFailureType(classifyToolErrorClass(new ToolRestrictionDenied(msg)), msg);
+    const t = 'get_lead_notification_settings';
+    it.each([
+      ['share-visitor owner settings', restrictionRefusal('share_visitor', t, [])],
+      ['share-visitor admin', restrictionRefusal('share_visitor', 'admin_tool', ['admin_tool'])],
+      ['share-visitor connect_account', restrictionRefusal('share_visitor', 'connect_account', [])],
+      ['scheduled-run owner settings', restrictionRefusal('share_visitor_schedule', t, [])],
+      ['scheduled-run admin', restrictionRefusal('share_visitor_schedule', 'admin_tool', ['admin_tool'])],
+      ['scheduled-run connect_account', restrictionRefusal('share_visitor_schedule', 'connect_account', [])],
+    ])('round-trips the %s refusal to by_design', (_n, msg) => {
+      expect(msg).toBeTruthy();
+      expect(roundTrip(msg as string)).toBe('by_design');
+    });
+    it('keeps the transient provenance-unverifiable refusal as bug (class name alone is not enough)', () => {
+      expect(roundTrip(scheduleProvenanceUnverifiableRefusal(t))).toBe('bug');
+    });
+    // ENG-3170: a visitor refused a sensitive tool on a link the owner left off is the guard working, not a tool bug
+    it.each([
+      ['share-link sensitive action', sensitiveActionRefusal('delete_leads')],
+      ['scheduled-run sensitive action', sensitiveActionScheduleRefusal('slack_send_message')],
+      ['scheduled-run sensitive action (profile refusal)', restrictionRefusal('share_visitor_schedule', 'delete_leads', [], {})],
+    ])('round-trips the %s refusal to by_design', (_n, msg) => {
+      expect(msg).toBeTruthy();
+      expect(roundTrip(msg as string)).toBe('by_design');
+    });
+    // ENG-3187: the browser's navigate refusals are the boundary working, not a tool bug (they must not feed the bug-triage stream)
+    it.each([
+      'The browser can only open public web pages (http or https). It cannot open local files or other kinds of address.',
+      'The browser can only open public web pages. It cannot open internal, local-network or IPv6 literal addresses.',
+      'The browser could not check that address just now (it did not resolve). Check the spelling, or try again in a moment.',
+    ])('classifies the browser navigate refusal "%s" as by_design', (msg) => {
+      expect(roundTrip(msg)).toBe('by_design');
+    });
+    it('keeps "the owner\'s setting could not be verified just now" as bug, like the provenance one', () => {
+      expect(roundTrip(sensitiveActionUnverifiableRefusal('delete_leads'))).toBe('bug');
+    });
+  });
+
+  describe('"Organization membership required" (ENG-3152)', () => {
+    it('is by_design as the whole message, any case, trimmed', () => {
+      expect(classifyToolFailureType('Error', 'Organization membership required')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '  ORGANIZATION MEMBERSHIP REQUIRED \n')).toBe('by_design');
+    });
+    it.each([
+      'Organization membership required: x',
+      'Organization not found',
+      'Authentication required',
+      'Only org owners and admins can update lead notification settings',
+    ])('keeps near-miss %j as bug', (m) => {
+      expect(classifyToolFailureType('Error', m)).toBe('bug');
+    });
+  });
+
+  it('still treats an unrelated Error as bug', () => {
+    expect(classifyToolFailureType('Error', 'Stored lead notification settings are invalid')).toBe('bug');
   });
 });

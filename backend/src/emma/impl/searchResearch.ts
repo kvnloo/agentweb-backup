@@ -141,6 +141,12 @@ import axios from 'axios';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { getSecret } from '../../utils/secretsManager';
 import { getS3ObjectAsString } from '../../utils/s3Utils';
+import {
+  CALLER_URL_BLOCKED_MESSAGE,
+  CallerUrlBlockedError,
+  CallerUrlTooLargeError,
+  fetchCallerUrlBuffer,
+} from '../../utils/callerUrlFetch';
 import { meterUsageFromResponse } from '../../utils/llmClients';
 import {
   parseCsvProvenance,
@@ -290,6 +296,80 @@ export function classifyDataAnalysisFailure(result: { message?: unknown; error?:
   return 'upstream_5xx';
 }
 
+/** Total time one plain-URL download may take (redirects included). The guarded fetch enforces it as ONE deadline. */
+const DOWNLOAD_TIMEOUT_MS = 30000;
+
+/**
+ * The guarded fetch gives a download ONE total deadline (redirects included). A host that cannot send the file in time surfaces as an
+ * aborted request (axios `ERR_CANCELED`) or a timeout, and is a bad argument for this tool (a slow or huge file), not an account or config fault.
+ */
+function isDownloadTimeout(error: unknown): boolean {
+  const e = error as { code?: unknown; name?: unknown; message?: unknown } | null;
+  if (e?.code === 'ECONNABORTED' || e?.code === 'ETIMEDOUT' || e?.code === 'ERR_CANCELED') return true;
+  if (e?.name === 'CanceledError' || e?.name === 'TimeoutError') return true;
+  return typeof e?.message === 'string' && /timed out following redirects|timeout of \d+ms exceeded|aborted due to timeout/i.test(e.message);
+}
+
+/**
+ * ENG-3151: the model often turns a tool-response key it was shown ("tool-responses/<uuid>/call_N.txt") into a URL by guessing the
+ * bucket host (agentweb-tool-responses-prod.s3..., aw-team-internal-storage.s3..., bare s3.amazonaws.com). Every guess 404s. When an
+ * https URL on an amazonaws.com host carries a tool-responses key as its path, return that key so it is read like a bare key, under the
+ * same ownership check. Any other URL, and any path that is not exactly a tool-responses key, returns null (a plain download as before).
+ *
+ * Deliberate choices:
+ *  - The host is ignored for ANY `*.amazonaws.com` host: the invented hosts are exactly what this repairs. Nothing is fetched from the
+ *    host (the key is read from OUR bucket by the server), so userinfo and port are ignored too, and the query string / fragment is dropped.
+ *    Safety comes from the exact key shape plus the caller's ownership check (`fileAccess.check`), not from the host.
+ *  - Path-style URLs (`https://s3.<region>.amazonaws.com/<bucket>/tool-responses/...`) are intentionally NOT repaired: the path then starts
+ *    with the bucket name, so it is not a key and returns null (out of scope; it falls through to the guarded fetch as before).
+ *  - Dot segments are resolved by the WHATWG URL parser before this runs; encoded slashes decode into extra `/`, which the key regex refuses.
+ */
+function toolResponseKeyFromAmazonUrl(fileUrl: string): string | null {
+  let u: URL;
+  try { u = new URL(fileUrl); } catch { return null; }
+  if (u.protocol !== 'https:' || !/(^|\.)amazonaws\.com$/i.test(u.hostname)) return null;
+  let key: string;
+  try { key = decodeURIComponent(u.pathname.replace(/^\/+/, '')); } catch { return null; }
+  if (!/^tool-responses\/[a-z0-9-]{36}\/[^/]+$/i.test(key)) return null;
+  return key;
+}
+
+/**
+ * ENG-3151: every file goes to the Gemini code-execution sandbox labelled `text/csv`, which Google documents as working best with
+ * text and CSV. PDF and Excel files sent that way were answered with HTTP 400 `invalid_argument` after seconds to minutes of
+ * upload. They are refused up front instead: by extension before anything is downloaded or read, and by the file's first bytes
+ * (PDF `%PDF-`, zip container `PK\x03\x04`, legacy Office `D0 CF 11 E0`) before the model call. The cause of the 400 is not proven;
+ * the refusal is safe either way because these files already fail.
+ */
+const BINARY_EXTENSIONS: Record<string, string> = {
+  pdf: 'PDF', xlsx: 'Excel', xlsm: 'Excel', xlsb: 'Excel', xls: 'Excel', docx: 'Word', doc: 'Word', pptx: 'PowerPoint', zip: 'zip archive',
+};
+
+function binaryKindFromName(entry: string): string | null {
+  let path = entry;
+  try { path = entry.includes('://') ? new URL(entry).pathname : entry; } catch { return null; }
+  let last = path.slice(path.lastIndexOf('/') + 1);
+  try { last = decodeURIComponent(last); } catch { /* keep the raw name */ }
+  const dot = last.lastIndexOf('.');
+  return dot < 0 ? null : (BINARY_EXTENSIONS[last.slice(dot + 1).toLowerCase()] ?? null);
+}
+
+function binaryKindFromBytes(buf: Buffer): string | null {
+  if (buf.length >= 5 && buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'PDF';
+  if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return 'Excel/Word/zip';
+  if (buf.length >= 4 && buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0) return 'Office';
+  return null;
+}
+
+function binaryFileRefusal(entry: string, kind: string) {
+  const shown = entry.length > 120 ? `${entry.slice(0, 117)}...` : entry;
+  return {
+    success: false,
+    message: `file_urls entry "${shown}" is a ${kind} file, and perform_data_analysis reads text files only (CSV, TSV, JSON or plain text). Convert the data to CSV and pass that file, or put the data inline in analysis_instruction.`,
+    errorClass: 'invalid_args',
+  };
+}
+
 /** ENG-2993: HTTP status of a failed file download (axios response, else message). */
 function downloadHttpStatus(error: unknown): number | undefined {
   const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
@@ -347,6 +427,28 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
   try {
     const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
 
+    // The SDK reads below use the SERVER's credentials, which can read every bucket in the account. So each key a caller
+    // names is checked against the caller with the same rule as the REST file routes (ENG-2988). One lookup cache per call.
+    // Loaded here, not with the static imports: the access policy reaches the database layer and chatbotService, which this
+    // module must not load when it is merely required (see the header note and searchResearch.moduleIsolation.test.ts).
+    const { TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_UNAVAILABLE_MESSAGE, createToolFileAccess } = await import('./toolStorageAccess');
+    const fileAccess = createToolFileAccess('perform_data_analysis', userId);
+    // `invalid_args`, not `not_found`: the model named a file the caller may not read, a bad argument. `not_found` is bucketed as a
+    // config/account fault ("resolve the account, not the code"), the phantom cluster ENG-2993 removed for dead caller URLs.
+    const refuseFile = () => ({
+      success: false,
+      message: TOOL_FILE_REFUSAL_MESSAGE,
+      error: 'File not accessible',
+      errorClass: 'invalid_args',
+    });
+    // The check itself could not run (a lookup failed): tell the model to retry, not that the file is gone.
+    const fileCheckUnavailable = () => ({
+      success: false,
+      message: TOOL_FILE_UNAVAILABLE_MESSAGE,
+      error: 'File access check unavailable',
+      errorClass: 'upstream_5xx',
+    });
+
     if (!analysisInstruction) {
       return {
         success: false,
@@ -378,17 +480,35 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
       let resolved = analysisInstruction;
       const resolvedKeys: string[] = [];
       const failedKeys: string[] = [];
+      // Check EVERY key before reading any: a call that names a file the caller may not read is refused whole, with the same
+      // answers as the other two read sites (a refusal is `invalid_args`; a check that could not run says "try again").
+      const keyDecisions: string[] = [];
+      for (const key of uniqueKeys) keyDecisions.push(await fileAccess.check(key));
+      if (keyDecisions.includes('refuse')) return refuseFile();
+      if (keyDecisions.includes('unavailable')) return fileCheckUnavailable();
+      const instructionTooLarge = (size?: number) => ({
+        success: false,
+        message: `After resolving tool-response references, the analysis_instruction is too large (${size !== undefined ? `${size.toLocaleString()} characters, ` : ''}max ${MAX_INLINE_INSTRUCTION_CHARS.toLocaleString()}). IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`
+      });
       for (const key of uniqueKeys) {
         try {
-          const content = await getS3ObjectAsString(key);
+          // Read at most what could still fit in the instruction (a character is at most 3 UTF-8 bytes), shared by every place the key is
+          // named (each is replaced by the content): a larger object is refused without loading it or building the multiplied text, as
+          // the whole instruction would be refused after it anyway.
+          const occurrences = Math.max(1, resolved.split(key).length - 1);
+          const allowance = Math.max(0, Math.floor((3 * (MAX_INLINE_INSTRUCTION_CHARS - resolved.length)) / occurrences));
+          const content = await getS3ObjectAsString(key, undefined, { maxBytes: allowance });
           if (content) {
             // Replace all occurrences of the key with the actual content inline
             resolved = resolved.split(key).join(`\n[Content of ${key}]:\n${content}\n`);
             resolvedKeys.push(key);
+            // A key named many times multiplies its content: stop as soon as the instruction is over the limit.
+            if (resolved.length > MAX_INLINE_INSTRUCTION_CHARS) return instructionTooLarge(resolved.length);
           } else {
             failedKeys.push(key);
           }
-        } catch {
+        } catch (readErr) {
+          if ((readErr as any)?.name === 'S3ObjectTooLargeError') return instructionTooLarge();
           failedKeys.push(key);
         }
       }
@@ -447,7 +567,13 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-3.5-flash';
 
     // Get file size limit from environment or use default (50MB)
-    const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
+    // 50MB in bytes. A value that is not a number must not switch the cap off (a NaN limit compares false with everything).
+    const configuredMaxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800');
+    const maxTotalSize = Number.isFinite(configuredMaxTotalSize) && configuredMaxTotalSize >= 0 ? configuredMaxTotalSize : 52428800;
+    const totalSizeExceeded = () => ({
+      success: false,
+      message: `Total file size exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`,
+    });
 
     // Prepare file data for analysis.
     // IMPORTANT: Gemini code_execution only writes a file part to the sandbox
@@ -466,6 +592,14 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     const fileRawContents: string[] = [];
     let totalSize = 0;
 
+    // ENG-3151: refuse formats the sandbox cannot read before any download. Only plain URLs here: an s3:// or tool-responses key is
+    // judged after its access check below, so a key the caller may not read still gets the one uniform "not found or no access" answer.
+    for (const entry of urlsToProcess) {
+      if (entry.startsWith('s3://') || /^tool-responses\/[a-z0-9-]{36}\//i.test(entry)) continue;
+      const kind = binaryKindFromName(entry);
+      if (kind) return binaryFileRefusal(entry, kind);
+    }
+
     for (const fileUrl of urlsToProcess) {
       try {
         // If the LLM passed an s3:// URI (e.g. "s3://bucket/key"), fetch directly via SDK
@@ -481,10 +615,17 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
               message: `Cannot parse S3 URL "${fileUrl}": no object key found. Use the full s3://bucket/key format.`,
             };
           }
+          // Only our own bucket, and only a key this caller may read: the bucket here is whatever the caller wrote.
+          if (!fileAccess.isOurBucket(s3Bucket)) return refuseFile();
+          const s3Decision = await fileAccess.check(s3Key);
+          if (s3Decision !== 'allow') return s3Decision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
+          { const kind = binaryKindFromName(s3Key); if (kind) return binaryFileRefusal(fileUrl, kind); }
           let s3Content: string;
           try {
-            s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
+            // Read at most what is left of the total allowance: an object larger than that is refused without loading it.
+            s3Content = await getS3ObjectAsString(s3Key, s3Bucket, { maxBytes: Math.max(maxTotalSize - totalSize, 0) });
           } catch (s3Err) {
+            if ((s3Err as any)?.name === 'S3ObjectTooLargeError') return totalSizeExceeded();
             const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
             return {
               success: false,
@@ -514,21 +655,27 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
         // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
         const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
-        if (bareS3KeyPattern.test(fileUrl)) {
+        // ENG-3151: also a key the model wrapped in an invented amazonaws.com host.
+        const toolResponseKey = toolResponseKeyFromAmazonUrl(fileUrl) ?? fileUrl;
+        if (bareS3KeyPattern.test(toolResponseKey)) {
+          const bareDecision = await fileAccess.check(toolResponseKey);
+          if (bareDecision !== 'allow') return bareDecision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
+          { const kind = binaryKindFromName(fileUrl); if (kind) return binaryFileRefusal(fileUrl, kind); }
           let s3Content: string;
           try {
-            s3Content = await getS3ObjectAsString(fileUrl);
+            s3Content = await getS3ObjectAsString(toolResponseKey, undefined, { maxBytes: Math.max(maxTotalSize - totalSize, 0) });
           } catch (s3Err) {
+            if ((s3Err as any)?.name === 'S3ObjectTooLargeError') return totalSizeExceeded();
             const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
             return {
               success: false,
-              message: `Cannot read tool-response file "${fileUrl}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
+              message: `Cannot read tool-response file "${toolResponseKey}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
             };
           }
           if (!s3Content) {
             return {
               success: false,
-              message: `Tool-response file "${fileUrl}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
+              message: `Tool-response file "${toolResponseKey}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
             };
           }
           const contentBuffer = Buffer.from(s3Content, 'utf-8');
@@ -550,15 +697,33 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           continue;
         }
 
-        // Download the file
-        const response = await axios.get(fileUrl, {
-          responseType: 'arraybuffer',
-          timeout: 30000
+        // An entry that is not a URL at all (a plain file name, a local path) is a mistake of the caller, not a blocked address: say so, and do
+        // not log it as a refused URL.
+        let parsesAsUrl = true;
+        try { new URL(fileUrl); } catch { parsesAsUrl = false; }
+        if (!parsesAsUrl) {
+          return {
+            success: false,
+            message: `file_urls entry "${fileUrl}" is not a URL. Pass a public https link, an s3:// key from save_file or a tool-responses key, or put the data inline in analysis_instruction.`,
+            errorClass: 'invalid_args',
+          };
+        }
+
+        // Download the file. A URL the caller chose is fetched only through the guarded fetch (public addresses only, every redirect
+        // checked again), and the body is capped at what is left of the total budget, so one URL cannot stream an unbounded body into memory.
+        const { buffer: fileBuffer } = await fetchCallerUrlBuffer(fileUrl, {
+          tool: 'perform_data_analysis',
+          userId,
+          maxBytes: Math.max(maxTotalSize - totalSize, 0),
+          timeoutMs: DOWNLOAD_TIMEOUT_MS,
         });
 
+        // ENG-3151: a binary file behind a URL with no telling extension.
+        const sniffed = binaryKindFromBytes(fileBuffer);
+        if (sniffed) return binaryFileRefusal(fileUrl, sniffed);
+
         // Check file size
-        const fileData = response.data as ArrayBuffer;
-        totalSize += fileData.byteLength;
+        totalSize += fileBuffer.byteLength;
         if (totalSize > maxTotalSize) {
           return {
             success: false,
@@ -569,7 +734,6 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // Send to Gemini as text/csv so the file materializes on the sandbox
         // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
         // be CSV, JSON, or plain text — the model is told this in the prompt.
-        const fileBuffer = Buffer.from(fileData);
         const base64Content = fileBuffer.toString('base64');
 
         fileParts.push({
@@ -582,7 +746,30 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         fileRawContents.push(fileBuffer.toString('utf-8'));
 
       } catch (error) {
+        // A URL the guard refuses: one generic answer, nothing about why (no address, no DNS text) and no `error` echo, so the
+        // answer cannot be used to map the internal network. A bad argument, not a tool fault.
+        if (error instanceof CallerUrlBlockedError) {
+          return {
+            success: false,
+            message: `Cannot fetch file_urls entry ${fileUrl}: ${CALLER_URL_BLOCKED_MESSAGE} Put the data inline in analysis_instruction, or pass an s3:// key from save_file or a tool-responses key.`,
+            errorClass: 'invalid_args',
+          };
+        }
+        if (error instanceof CallerUrlTooLargeError) {
+          return {
+            success: false,
+            message: `Total file size exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`,
+            errorClass: 'invalid_args',
+          };
+        }
         console.error(`Error processing file ${fileUrl}:`, error);
+        if (isDownloadTimeout(error)) {
+          return {
+            success: false,
+            message: `Downloading ${fileUrl} did not finish within the ${DOWNLOAD_TIMEOUT_MS / 1000}-second download limit. The host is too slow or the file too large: use a smaller file or a faster link, or put the data inline in analysis_instruction.`,
+            errorClass: 'timeout',
+          };
+        }
         // ENG-2993: an HTTP 4xx (other than 429) on a caller-supplied URL means
         // the model passed a dead, expired, or non-public link. There is no
         // account to repair, so it must not cluster as not_found -> `config`.

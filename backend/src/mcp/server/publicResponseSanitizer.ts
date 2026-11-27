@@ -2,8 +2,9 @@
  * ENG-2335 (ENG-336.3): strip internal identifiers from PUBLIC MCP tool responses.
  *
  * Applied only to external MCP callers (API key / OAuth) on non-admin tools.
- * In-process portal callers, admin lookup tools, and admin client-scoped calls
- * (`client_id`) are returned unchanged.
+ * In-process portal callers, admin lookup tools, and client-scoped calls
+ * (`client_id`) made by a caller who really is an admin are returned unchanged;
+ * a `client_id` argument from anyone else changes nothing.
  *
  * Functional session/run/request handles are retained only by the tool-purpose
  * sets below; unrelated tools cannot inherit those exceptions.
@@ -98,14 +99,30 @@ export function stripInternalIds(value: any, depth = 0, toolName = ''): any {
   return visit(value, depth);
 }
 
+/**
+ * Tools whose answer is the caller's OWN stored text (ENG-2840 W2-2: the memory tools). Their answers carry the memory id and the text the
+ * caller saved or may already read in Settings, and no identifier of ours. Rewriting JSON-looking text in them would hand an agent back
+ * something other than what it saved (a memory that is a JSON object with an `apiKeyId` field comes back without that field).
+ */
+export const OWN_CONTENT_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'save_memory', 'delete_memory', 'list_memories', 'save_org_memory', 'delete_org_memory',
+  // ENG-2840 (W2-7): the text of the caller's own stored file, in an answer built from fixed fields (fileReadTool.ts).
+  'read_file_content',
+  // ENG-2840 (W2-10): the text of the caller's knowledge-base files, in an answer built from fixed fields (kbFileReadTool.ts).
+  'read_knowledge_base_files',
+]);
+
 export function shouldSanitizePublicResponse(
   toolName: string,
   toolArgs: Record<string, unknown> | undefined,
-  context: { externalMcp?: boolean },
+  context: { externalMcp?: boolean; callerIsAdmin?: boolean },
 ): boolean {
   if (!context.externalMcp) return false;
   if (ADMIN_TOOL_NAMES.has(toolName)) return false;
-  if (toolArgs && (toolArgs.client_id || toolArgs.clientId)) return false;
+  if (OWN_CONTENT_TOOL_NAMES.has(toolName)) return false;
+  // `client_id` marks an admin acting for a client, whose answers keep their internal ids. The argument alone proves nothing: any caller can
+  // add it to any tool (most tools ignore it), so it switches sanitising off only when the caller really is an admin.
+  if (toolArgs && (toolArgs.client_id || toolArgs.clientId) && context.callerIsAdmin === true) return false;
   return true;
 }
 

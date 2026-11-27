@@ -719,8 +719,9 @@ cd backend
 
 # 1. Verify TypeScript compilation (catches type errors)
 #    Use `npm run typecheck` — it runs `tsc --noEmit` with a raised heap
-#    (--max-old-space-size=6144). A full backend type-check peaks near node's
-#    default ~4GB heap ceiling, so plain `npx tsc` can OOM when memory is tight.
+#    (--max-old-space-size=10240). A full backend type-check uses about 6.7 GB
+#    (measured 2026-11-24), above node's default heap ceiling, so plain `npx tsc`
+#    OOMs; a 6144 cap crashed it too (exit 134), even on a clean origin/main.
 npm run typecheck
 
 # 2. Run tests
