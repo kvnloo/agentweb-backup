@@ -29,7 +29,8 @@ import { getWorkspaceAssets, resolveWorkspaceMembers, getWorkspaceApprovalStatus
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { isS3Url, uploadFileToS3 } from '../utils/s3Utils';
-import { CALLER_URL_MAX_TEXT_BYTES, fetchCallerUrlText } from '../utils/callerUrlFetch';
+import { fetchCallerUrlText } from '../utils/callerUrlFetch';
+import { htmlToSearchableText } from '../utils/htmlSearchableText';
 import { classifyReport, ReportType } from '../services/reportClassificationService';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -2585,6 +2586,8 @@ export async function getExecutionsWithAssets(
 
 /** Total time for reading one HTML report for its searchable text (ENG-2840; the old per-read idle timeout was 5 s). */
 const HTML_REPORT_FETCH_TIMEOUT_MS = 15_000;
+/** Largest HTML report read for its searchable text (ENG-2840; only the first 3,000 characters of text are kept). */
+const HTML_REPORT_MAX_BYTES = 5 * 1024 * 1024;
 
 /**
  * Fetch HTML content for report files that lack searchableText and attach extracted plain text.
@@ -2620,18 +2623,11 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, 
         const html = await fetchCallerUrlText(file.url, {
           tool: 'html_report_backfill',
           userId,
-          maxBytes: CALLER_URL_MAX_TEXT_BYTES,
+          maxBytes: HTML_REPORT_MAX_BYTES,
           timeoutMs: HTML_REPORT_FETCH_TIMEOUT_MS,
         });
-        // Strip tags, collapse whitespace, truncate
-        const text = html
-          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, MAX_TEXT_LENGTH);
-        file.searchableText = text;
+        // Strip tags, collapse whitespace, truncate (in time linear in the input: see utils/htmlSearchableText.ts)
+        file.searchableText = htmlToSearchableText(html, MAX_TEXT_LENGTH);
       } catch {
         // Non-fatal — leave searchableText absent if fetch fails
       }
