@@ -68,11 +68,25 @@ function header(headers: Record<string, unknown>, name: string): string {
 
 /* istanbul ignore next -- tests inject a transport; production pins DNS here. */
 async function defaultRequest(url: string, pinned: Pinned, method: Method, timeoutMs: number, maxBytes: number): Promise<HttpReply> {
+  try {
+    return await sendRequest(url, pinned, method, timeoutMs, maxBytes);
+  } catch (err: any) {
+    // The abort signal below ends a request at its time limit; say so in the words of axios's own timeout, not "canceled".
+    if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError') throw new Error(`timeout of ${timeoutMs}ms exceeded`);
+    throw err;
+  }
+}
+
+/* istanbul ignore next -- tests inject a transport; production pins DNS here. */
+async function sendRequest(url: string, pinned: Pinned, method: Method, timeoutMs: number, maxBytes: number): Promise<HttpReply> {
   return axios.request({
     url,
     method,
     responseType: method === 'GET' ? 'text' : undefined,
     timeout: timeoutMs,
+    // axios's timeout only fires after that long with no data; the signal ends the whole request at timeoutMs, so a site that sends a
+    // byte every few seconds cannot keep a socket (and up to maxBytes) open after the scan has given up on it (ENG-2840).
+    signal: AbortSignal.timeout(timeoutMs),
     maxContentLength: maxBytes,
     maxBodyLength: maxBytes,
     maxRedirects: 0,

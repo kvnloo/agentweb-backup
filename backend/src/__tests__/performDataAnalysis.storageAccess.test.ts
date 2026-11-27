@@ -83,6 +83,17 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
   };
 
   describe('s3:// URIs', () => {
+    it('reads an own file with a byte ceiling (what is left of the 50 MB total), and refuses an object over it without loading it', async () => {
+      const ok = await performDataAnalysis([`s3://${OUR_BUCKET}/users/me/files/1/abc/data.csv`], 'summarise', 'me');
+      expect(ok.success).toBe(true);
+      expect(readS3).toHaveBeenCalledWith('users/me/files/1/abc/data.csv', OUR_BUCKET, { maxBytes: 52428800 });
+      readS3.mockRejectedValueOnce(Object.assign(new Error('S3 object exceeds the 52428800 byte limit'), { name: 'S3ObjectTooLargeError' }));
+      post.mockClear();
+      const big = await performDataAnalysis([`s3://${OUR_BUCKET}/users/me/files/1/abc/huge.csv`], 'summarise', 'me');
+      expect(big).toMatchObject({ success: false, message: expect.stringMatching(/Total file size exceeds the 52428800 bytes limit/) });
+      expect(post).not.toHaveBeenCalled();
+    });
+
     it('refuses a bucket other than ours and reads nothing', async () => {
       const r = await performDataAnalysis(['s3://some-other-private-bucket/backups/db.sql'], 'summarise', 'me');
       refused(r);
@@ -122,7 +133,7 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
     it('follows the policy for files of anonymous plan visitors (readable by any signed-in user, as on the REST routes)', async () => {
       const key = 'users/anon_abc123/files/1/abc/plan.csv';
       await performDataAnalysis([`s3://${OUR_BUCKET}/${key}`], 'summarise', 'me');
-      expect(readS3).toHaveBeenCalledWith(key, OUR_BUCKET);
+      expect(readS3).toHaveBeenCalledWith(key, OUR_BUCKET, { maxBytes: 52428800 });
     });
 
     it('refuses the whole call when one file in the list is not the caller\'s, and sends nothing to the model', async () => {
@@ -168,20 +179,20 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
     it('reads the caller\'s own file', async () => {
       const key = 'users/me/files/1234/abc/data.csv';
       await performDataAnalysis([`s3://${OUR_BUCKET}/${key}`], 'summarise', 'me');
-      expect(readS3).toHaveBeenCalledWith(key, OUR_BUCKET);
+      expect(readS3).toHaveBeenCalledWith(key, OUR_BUCKET, { maxBytes: 52428800 });
     });
 
     it('reads a teammate\'s file of a kind shared inside the organisation (same rule as the REST routes)', async () => {
       const key = 'users/mate/files/1234/abc/data.csv';
       await performDataAnalysis([`s3://${OUR_BUCKET}/${key}`], 'summarise', 'me');
-      expect(readS3).toHaveBeenCalledWith(key, OUR_BUCKET);
+      expect(readS3).toHaveBeenCalledWith(key, OUR_BUCKET, { maxBytes: 52428800 });
     });
 
     it('follows AWS_S3_BUCKET when the deployment names another bucket as ours', async () => {
       process.env.AWS_S3_BUCKET = 'custom-user-files';
       const key = 'users/me/files/1/abc/data.csv';
       await performDataAnalysis([`s3://custom-user-files/${key}`], 'summarise', 'me');
-      expect(readS3).toHaveBeenCalledWith(key, 'custom-user-files');
+      expect(readS3).toHaveBeenCalledWith(key, 'custom-user-files', { maxBytes: 52428800 });
       readS3.mockClear();
       const r = await performDataAnalysis([`s3://${OUR_BUCKET}/${key}`], 'summarise again', 'me');
       refused(r);
@@ -207,7 +218,7 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
     it('reads a tool response of the caller\'s own session', async () => {
       const key = `tool-responses/${MY_SESSION}/call1.txt`;
       await performDataAnalysis([key], 'summarise', 'me');
-      expect(readS3).toHaveBeenCalledWith(key);
+      expect(readS3).toHaveBeenCalledWith(key, undefined, { maxBytes: 52428800 });
     });
 
     it('refuses a tool response of another user\'s session', async () => {
@@ -248,10 +259,37 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
   });
 
   describe('tool-response keys written inside the instruction text', () => {
+    it('reads an inlined key with a byte ceiling of what still fits (3 bytes a character), and refuses one over it unread', async () => {
+      const key = `tool-responses/${MY_SESSION}/call1.txt`;
+      const instruction = `Use ${key} and total the clicks.`;
+      await performDataAnalysis([], instruction, 'me');
+      expect(readS3).toHaveBeenCalledWith(key, undefined, { maxBytes: 3 * (200_000 - instruction.length) });
+      readS3.mockRejectedValueOnce(Object.assign(new Error('too large'), { name: 'S3ObjectTooLargeError' }));
+      post.mockClear();
+      const r = await performDataAnalysis([], instruction, 'me');
+      expect(r).toMatchObject({ success: false, message: expect.stringMatching(/analysis_instruction is too large/) });
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it('the ceiling is shared by every place a key is named, so the multiplied text is never built for an object that cannot fit', async () => {
+      const key = `tool-responses/${MY_SESSION}/call1.txt`;
+      const instruction = Array(10).fill(key).join(' ');
+      await performDataAnalysis([], instruction, 'me');
+      expect(readS3).toHaveBeenCalledWith(key, undefined, { maxBytes: Math.floor((3 * (200_000 - instruction.length)) / 10) });
+    });
+
+    it('a key named many times stops as soon as the instruction is over the limit', async () => {
+      const key = `tool-responses/${MY_SESSION}/call1.txt`;
+      readS3.mockResolvedValueOnce('x'.repeat(5_000));
+      const r = await performDataAnalysis([], Array(60).fill(key).join(' '), 'me');
+      expect(r).toMatchObject({ success: false, message: expect.stringMatching(/analysis_instruction is too large/) });
+      expect(post).not.toHaveBeenCalled();
+    });
+
     it('inlines the caller\'s own tool response', async () => {
       const key = `tool-responses/${MY_SESSION}/call1.txt`;
       await performDataAnalysis([], `Use ${key} and total the clicks.`, 'me');
-      expect(readS3).toHaveBeenCalledWith(key);
+      expect(readS3).toHaveBeenCalledWith(key, undefined, { maxBytes: expect.any(Number) });
       const sent = post.mock.calls[0][1].contents[0].parts.at(-1).text as string;
       expect(sent).toContain('a,b\n1,2');
     });
@@ -345,7 +383,7 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       ['agentweb-tool-responses.s3.us-west-2.amazonaws.com'],
     ])('reads the caller\'s own key by key, not by the invented host (%s)', async (host) => {
       const r = await performDataAnalysis([wrapped(host, MY_SESSION)], 'summarise', 'me');
-      expect(readS3).toHaveBeenCalledWith(`tool-responses/${MY_SESSION}/call_1.txt`);
+      expect(readS3).toHaveBeenCalledWith(`tool-responses/${MY_SESSION}/call_1.txt`, undefined, { maxBytes: 52428800 });
       expect(get).not.toHaveBeenCalled();
       expect(r.success).not.toBe(false);
     });
@@ -359,7 +397,7 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
 
     it('reads a presigned-style URL (uppercase host, query string) by key and drops the query', async () => {
       const r = await performDataAnalysis([`https://AgentWeb-Prod.S3.US-WEST-2.AMAZONAWS.COM/tool-responses/${MY_SESSION}/call_1.txt?X-Amz-Signature=abc&X-Amz-Expires=60`], 'summarise', 'me');
-      expect(readS3).toHaveBeenCalledWith(`tool-responses/${MY_SESSION}/call_1.txt`);
+      expect(readS3).toHaveBeenCalledWith(`tool-responses/${MY_SESSION}/call_1.txt`, undefined, { maxBytes: 52428800 });
       expect(get).not.toHaveBeenCalled();
       expect(r.success).not.toBe(false);
     });
