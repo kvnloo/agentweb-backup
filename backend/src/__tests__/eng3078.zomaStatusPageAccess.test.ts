@@ -24,12 +24,12 @@ const ALL_SET = [
   'Docs: https://api.agentweb.pro/api/meta-toolkit/skill.md',
   'Try asking: "Show my Meta ad spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for the last 7 days." (runs zoma_ads_report).',
 ].join('\n');
-// The exact text a fully set-up user gets on main today (Google Ads provider off).
+// The exact text a fully set-up user gets on main today (Google Ads provider off). No card is asked
+// for at setup (ZOMA_REQUIRE_PAYMENT_METHOD unset), so ENG-3195 leaves the payment line out.
 const TODAY_SUMMARY = [
   'Zoma setup:',
   '  [x] AgentWeb login (a@b.co)',
   '  [x] How familiar you are with ads (runs_ads)',
-  '  [x] Payment method on file',
   '  [x] Meta ad account connected (111, TWD)',
   '',
   ALL_SET,
