@@ -34,6 +34,7 @@ import { getJwtSecret } from '../config/jwt';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
+import { campaignBidStrategyDefault } from '../utils/metaCampaignBidStrategyDefault';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { flattenNestedCampaignCreate } from '../services/agentMode/metaCampaignCreateParams';
 import { metaPageAccessRefusalText } from './metaPageAccessRefusal';
@@ -403,6 +404,16 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   const priorId = targetId(entity, args);
   const prior = action === 'UPDATE' && priorId ? await deps.readBack(userId, accountId, entity, priorId).catch(() => null) : null;
   const diff = action === 'UPDATE' ? fieldDiffLines(params, money.params, prior) : [];
+  // ENG-2364: updateCampaign adds the no-cap bid strategy when a budget lands on a campaign
+  // with no strategy; the preview names it so what is approved is what is written.
+  if (action === 'UPDATE' && entity === 'CAMPAIGN') {
+    const added = campaignBidStrategyDefault(params, prior);
+    if (added) {
+      diff.push(prior
+        ? `- bid_strategy: ${show(prior.bid_strategy)} → ${added}`
+        : `- bid_strategy: (current value unavailable) → ${added} if the campaign has no bid strategy`);
+    }
+  }
   if (action === 'UPDATE' && params.creative_id !== undefined) {
     try {
       await deps.assertCreativeOwned(userId, accountId, String(params.creative_id));

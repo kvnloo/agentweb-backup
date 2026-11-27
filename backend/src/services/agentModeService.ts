@@ -13364,7 +13364,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           applied: asComparable(readBack?.[parameter])
         }))
         .filter(m => m.requested !== m.applied &&
-          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)));
+          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)) &&
+          // Under a campaign budget (CBO) the bid strategy lives on the campaign, so the
+          // ad set reads it back as null even when Meta applied it: not a mismatch.
+          !(m.parameter === 'bid_strategy' && campaignHasBudget && m.applied === null));
 
       if (readBackMismatches.length > 0) {
         const detail = readBackMismatches
@@ -13639,7 +13642,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             err instanceof Error ? err.message : err);
         }
       }
-      // Meta rewrites some CTAs on video creatives (BOOK_NOW → BOOK_TRAVEL); say so up front so a
+      // Meta has been observed rewriting some CTAs on video creatives (BOOK_NOW → BOOK_TRAVEL); say so up front so a
       // later read-back showing the stored type is not mistaken for a wrong write.
       const isVideoCreative = !!resolvedParams.video_id && !resolvedParams.placement_assets?.length
         && !MetaService.isMultiVariantCreative(resolvedParams);

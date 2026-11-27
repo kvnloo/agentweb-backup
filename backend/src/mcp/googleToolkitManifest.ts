@@ -71,7 +71,7 @@ export function isGoogleToolkitWrite(name: string, args: any): boolean {
 const API_ARGS = [
   'biddable', 'resource_name', 'campaign_id', 'customer_id', 'entity_type', 'action', 'name', 'type', 'budget_resource_name', 'explicitly_shared',
   'bidding_strategy', 'bidding_strategy_resource_name', 'bidding_strategy_target',
-  'location_target_ids', 'campaign_resource_name', 'ad_group_resource_name', 'query', 'status',
+  'location_target_ids', 'campaign_resource_name', 'ad_group_resource_name', 'query', 'status', 'target_search_network', 'target_content_network',
   'brand_business_name', 'brand_logo_asset_resource_name', 'keywords', 'criterion_resource_name', 'ad_resource_name',
   'headlines', 'descriptions', 'final_url', 'long_headlines', 'square_image_assets', 'landscape_image_assets',
   'logo_assets', 'video_assets', 'asset_group_resource_name',
@@ -81,9 +81,10 @@ const GOOGLE_ADS_API_DESCRIPTION =
   'Google Ads API for external agents. Reads: LIST of BUDGET, CAMPAIGN, AD_GROUP (campaign_resource_name), KEYWORD/AD (ad_group_resource_name), ' +
   'BIDDING_STRATEGY, CONVERSION_ACTION, CAMPAIGN_CONVERSION_GOAL (campaign_id?); LOCATION SEARCH (query). ' +
   'Guarded writes: BUDGET CREATE (name, amount, explicitly_shared?) / UPDATE (budget_resource_name, amount); ' +
-  'CAMPAIGN CREATE (name, type, budget_resource_name, bidding_strategy | bidding_strategy_resource_name, location_target_ids?) / UPDATE (campaign_resource_name, status | name); ' +
-  'AD_GROUP CREATE (name, campaign_resource_name, type, cpc_bid?) / UPDATE (ad_group_resource_name, status | name? cpc_bid?). ' +
-  'CAMPAIGN/AD_GROUP UPDATE: status is sent alone; a rename or ad-group max CPC change is its own preview showing current vs new (cpc_bid also in micros). ' +
+  'CAMPAIGN CREATE (name, type SEARCH|PERFORMANCE_MAX, budget_resource_name, bidding_strategy | bidding_strategy_resource_name, location_target_ids?, target_search_network?, target_content_network?) / UPDATE (campaign_resource_name, status | name | target_search_network | target_content_network); ' +
+  'Search campaigns are created on Google Search only: search partners (target_search_network) and the Display Network (target_content_network) are off unless set true; without location_target_ids a campaign can serve in every country. ' +
+  'AD_GROUP CREATE (name, campaign_resource_name, type SEARCH_STANDARD, cpc_bid?) / UPDATE (ad_group_resource_name, status | name? cpc_bid?). ' +
+  'CAMPAIGN/AD_GROUP UPDATE: status is sent alone; a rename, network change or ad-group max CPC change is its own preview showing current vs new (cpc_bid also in micros). ' +
   'CAMPAIGN_CONVERSION_GOAL UPDATE (resource_name from LIST, biddable boolean only): preview shows campaign, category, origin and current/new biddable. ' +
   'Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), show the preview to the user, ' +
   'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
@@ -98,7 +99,21 @@ const GOOGLE_ADS_API_DESCRIPTION =
   'ASSET_GROUP UPDATE status=ENABLED and CAMPAIGN UPDATE status=ENABLED. ' +
   'ASSET UPLOAD (asset_type IMAGE|LOGO with data = https image URL or zoma_prepare_upload file_url; TEXT with data = the text; VIDEO with data = YouTube video id; name) cannot spend, so it runs without a preview but is still read back. ' +
   'Keywords, ads and asset groups are always created PAUSED; enabling each is its own preview and approval. ' +
-  'A write is done only when the result says verification CONFIRMED. Other REMOVEs, display ads, campaign assets and other conversion writes are not available.';
+  'A write is done only when the result says verification CONFIRMED. Other REMOVEs, Display campaigns and ads, campaign assets and other conversion writes are not available.';
+
+/** Parameter descriptions written for the Zoma surface (the shared Emma ones name actions and tools Zoma does not offer). */
+const ZOMA_PARAM_DESCRIPTIONS: Record<string, string> = {
+  customer_id: 'Google Ads customer id (numeric, no dashes), from zoma_status.',
+  campaign_resource_name: 'customers/<id>/campaigns/<id>, from CAMPAIGN LIST. Required for CAMPAIGN UPDATE, AD_GROUP LIST / CREATE and ASSET_GROUP CREATE; for KEYWORD ADD_NEGATIVE as the alternative to ad_group_resource_name.',
+  ad_group_resource_name: 'customers/<id>/adGroups/<id>, from AD_GROUP LIST. Required for AD_GROUP UPDATE, KEYWORD LIST / ADD and AD LIST / CREATE; for KEYWORD ADD_NEGATIVE as the alternative to campaign_resource_name.',
+  ad_resource_name: 'customers/<id>/adGroupAds/<adGroupId>~<adId>, from AD LIST. Required for AD UPDATE.',
+  budget_resource_name: 'customers/<id>/campaignBudgets/<id>, from BUDGET LIST or BUDGET CREATE. Required for CAMPAIGN CREATE and BUDGET UPDATE.',
+  criterion_resource_name: 'customers/<id>/adGroupCriteria/<adGroupId>~<id>, from KEYWORD LIST. Required for KEYWORD UPDATE and KEYWORD REMOVE.',
+  asset_group_resource_name: 'customers/<id>/assetGroups/<id>, from ASSET_GROUP CREATE. Required for ASSET_GROUP UPDATE.',
+  location_target_ids: 'CAMPAIGN CREATE: Google location ids from LOCATION SEARCH. Omit only to serve in every country.',
+  target_search_network: 'SEARCH CAMPAIGN CREATE / UPDATE: also show ads on Google search partner sites. Off unless true.',
+  target_content_network: 'SEARCH CAMPAIGN CREATE / UPDATE: Display Network expansion (ads can also show on websites and apps, spending the same budget). Off unless true.',
+};
 
 function narrowApiDefinition(definition: any): any {
   const def = JSON.parse(JSON.stringify(definition));
@@ -110,7 +125,7 @@ function narrowApiDefinition(definition: any): any {
   kept.action = { type: 'string', enum: ['LIST', 'SEARCH', 'CREATE', 'UPDATE', 'ADD', 'ADD_NEGATIVE', 'REMOVE', 'UPLOAD'], description: 'See the description for which entity supports which action.' };
   kept.status = { type: 'string', enum: ['ENABLED', 'PAUSED'], description: 'CAMPAIGN/AD_GROUP/KEYWORD/AD/ASSET_GROUP UPDATE only (alone, nothing else changes in the same call). Creates are always PAUSED.' };
   kept.keywords = { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'KEYWORD ADD / ADD_NEGATIVE: 1-100 keywords (text <=80 chars, <=10 words).' };
-  kept.type = { type: 'string', description: 'CAMPAIGN CREATE: SEARCH|DISPLAY|PERFORMANCE_MAX. AD_GROUP CREATE: SEARCH_STANDARD|DISPLAY_STANDARD. AD CREATE: RESPONSIVE_SEARCH_AD (default).' };
+  kept.type = { type: 'string', description: 'CAMPAIGN CREATE: SEARCH|PERFORMANCE_MAX. AD_GROUP CREATE: SEARCH_STANDARD. AD CREATE: RESPONSIVE_SEARCH_AD (default).' };
   kept.asset_type = { type: 'string', enum: ['IMAGE', 'LOGO', 'TEXT', 'VIDEO'], description: 'ASSET UPLOAD: IMAGE (marketing image), LOGO (square logo), TEXT, or VIDEO (YouTube).' };
   kept.data = { type: 'string', description: 'ASSET UPLOAD: IMAGE/LOGO → public https image URL or the file_url from zoma_prepare_upload; TEXT → the text (<=90 chars); VIDEO → the YouTube video id.' };
   kept.amount = { type: 'number', description: 'BUDGET CREATE/UPDATE: daily budget in MAJOR units of the account currency (50 = $50.00). Converted to micros; the preview echoes both.' };
@@ -119,6 +134,10 @@ function narrowApiDefinition(definition: any): any {
   kept.biddable = { type: 'boolean', description: 'CAMPAIGN_CONVERSION_GOAL UPDATE only: whether the goal drives campaign bidding.' };
   kept.resource_name = { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL UPDATE: customers/<customer_id>/campaignConversionGoals/<campaignId>~<CATEGORY>~<ORIGIN> from LIST.' };
   kept.campaign_id = { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL LIST only: optional numeric campaign filter.' };
+  for (const [key, description] of Object.entries(ZOMA_PARAM_DESCRIPTIONS)) {
+    kept[key] = { ...(props[key] ?? {}), type: kept[key]?.type ?? props[key]?.type ?? (key.startsWith('target_') ? 'boolean' : 'string'), description };
+  }
+  kept.location_target_ids = { type: 'array', items: { type: 'number' }, description: ZOMA_PARAM_DESCRIPTIONS.location_target_ids };
   kept.confirm = { type: 'boolean', description: 'Writes only. Omit to get a PREVIEW (nothing changes). Set true only after the user explicitly approved that preview, together with its preview_token.' };
   kept.preview_token = { type: 'string', description: 'Writes only. The preview_token returned by the preview the user approved. Single use, 15 minutes; the call must repeat the previewed arguments exactly.' };
   def.description = GOOGLE_ADS_API_DESCRIPTION;
@@ -130,6 +149,9 @@ function narrowDefinition(definition: any): any {
   if (definition.name === 'call_google_ads_api') return narrowApiDefinition(definition);
   const def = JSON.parse(JSON.stringify(definition));
   delete def.inputSchema?.properties?.client_id;
+  if (def.inputSchema?.properties?.customer_id) {
+    def.inputSchema.properties.customer_id = { ...def.inputSchema.properties.customer_id, description: ZOMA_PARAM_DESCRIPTIONS.customer_id };
+  }
   return def;
 }
 
@@ -167,5 +189,30 @@ export async function executeGoogleToolkitRead(
   if (!context?.userId) throw new MetaToolkitRefusal('Google Ads toolkit calls require an authenticated user.');
   assertGoogleToolkitCall(name, args);
   if (isGoogleToolkitWrite(name, args)) throw new MetaToolkitRefusal('Writes go through the guarded write path.');
-  return registry.execute(name, args, { ...context, externalMcp: true });
+  return shapeGoogleToolkitRead(name, args, await registry.execute(name, args, { ...context, externalMcp: true }));
+}
+
+/**
+ * Zoma-facing shape of a few reads:
+ *  - serving_chain: a paused or blocked campaign is an answer, not a failure (the shared
+ *    handler reports success:false and repeats the whole report in `error`);
+ *  - CONVERSION_ACTION LIST: tag snippets (several KB of HTML per action) are dropped; the
+ *    conversion id/label stay.
+ */
+export function shapeGoogleToolkitRead(name: string, args: any, result: any): any {
+  if (name === 'call_google_ads_reporting_api' && args?.mode === 'serving_chain' && result?.report) {
+    const { error: _repeated, ...rest } = result;
+    const state = String(result.report.state ?? 'UNVERIFIED');
+    if (state === 'UNVERIFIED') {
+      // A failed read (auth, API error, unknown campaign id) is a failure, said in one line.
+      const reasons = (Array.isArray(result.report.blockers) ? result.report.blockers : [])
+        .filter((b: any) => b?.state === 'UNVERIFIED').map((b: any) => String(b.reason)).slice(0, 5);
+      return { ...rest, success: false, serving_state: state, error: `Serving status could not be verified: ${reasons.join('; ') || 'no campaigns returned'}.` };
+    }
+    return { ...rest, success: true, serving_state: state, serving: state === 'DELIVERING', ready: state === 'READY' || state === 'DELIVERING' };
+  }
+  if (name === 'call_google_ads_api' && args?.entity_type === 'CONVERSION_ACTION' && Array.isArray(result?.conversionActions)) {
+    return { ...result, conversionActions: result.conversionActions.map(({ tagSnippets: _tags, ...a }: any) => a) };
+  }
+  return result;
 }

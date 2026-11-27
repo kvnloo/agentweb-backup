@@ -96,6 +96,62 @@ describe('ENG-2927 event sources', () => {
     expect(await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '42' }, graph().deps)).toMatchObject({ state: 'NOT_FIRING', healthy: false });
   });
 
+  it('get_health: business read refused → firing state still returned, catalogs null with reason', async () => {
+    const g = graph();
+    const readGraph = g.deps.readGraph as jest.Mock;
+    const base = readGraph.getMockImplementation()!;
+    readGraph.mockImplementation(async (u: string, a: string, path: string, params: any) => {
+      if (path === 'act_111' && /business/.test(params?.fields)) {
+        throw Object.assign(new Error('(#100) Requires business_management permission to access the field'), { metaError: { code: 100, message: '(#100) Requires business_management permission to access the field' } });
+      }
+      return base(u, a, path, params);
+    });
+    const health: any = await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '41' }, g.deps);
+    expect(health).toMatchObject({
+      pixel_id: '41', state: 'ACTIVE', last_fired_time: '2026-11-11T10:00:00Z',
+      connected_catalogs: null, connected_catalogs_reason: 'missing business_management permission', healthy: null,
+    });
+    // The other event-source tools still fail on the refused business read.
+    await expect(runMetaEventSourceTool('meta_event_source_get_catalogs', 'u', '111', { pixel_id: '41' }, g.deps)).rejects.toThrow(/business_management/);
+  });
+
+  it('get_health: non-permission business read failure → reason carries Meta\'s message without the refusal wrapper', async () => {
+    const g = graph();
+    const readGraph = g.deps.readGraph as jest.Mock;
+    const base = readGraph.getMockImplementation()!;
+    readGraph.mockImplementation(async (u: string, a: string, path: string, params: any) => {
+      if (path === 'act_111' && /business/.test(params?.fields)) {
+        throw Object.assign(new Error('(#2) Service temporarily unavailable'), { metaError: { code: 2, message: '(#2) Service temporarily unavailable' } });
+      }
+      return base(u, a, path, params);
+    });
+    const health: any = await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '41' }, g.deps);
+    expect(health).toMatchObject({
+      connected_catalogs: null, healthy: null,
+      connected_catalogs_reason: 'could not read the business or its catalogs ((#2) Service temporarily unavailable)',
+    });
+    expect(health.connected_catalogs_reason).not.toMatch(/Could not read from Meta|Nothing was changed/);
+  });
+
+  it('get_health: account not in a Business portfolio → catalogs null with reason, events_last_24h kept', async () => {
+    const g = graph({
+      act_111: {},
+      '42/stats': { data: [{ aggregation: 'event', data: [{ value: 'PageView', count: 7 }] }] },
+    });
+    const health: any = await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '42' }, g.deps);
+    expect(health).toMatchObject({
+      state: 'ACTIVE', events_last_24h: 7, connected_catalogs: null,
+      connected_catalogs_reason: 'not in a Meta Business portfolio', healthy: null,
+    });
+    await expect(runMetaEventSourceTool('meta_event_source_get', 'u', '111', { catalog_id: '501' }, g.deps)).rejects.toThrow(/not in a Meta Business portfolio/);
+  });
+
+  it('get_health: normal path unchanged (catalogs listed, no reason field)', async () => {
+    const health: any = await runMetaEventSourceTool('meta_event_source_get_health', 'u', '111', { pixel_id: '41' }, graph().deps);
+    expect(health).toMatchObject({ state: 'ACTIVE', connected_catalogs: [{ catalog_id: '501', name: 'Main' }], healthy: true });
+    expect(health).not.toHaveProperty('connected_catalogs_reason');
+  });
+
   it('rejects a cross-account pixel and a foreign catalog without writing', async () => {
     const g = graph();
     await expect(runMetaEventSourceTool('meta_event_source_connect', 'u', '111', { catalog_id: '502', pixel_id: '99' }, g.deps)).rejects.toThrow(/not a pixel of this ad account/);

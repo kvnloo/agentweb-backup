@@ -8,6 +8,7 @@ import {
   captureDriftAlertScope,
   MIDDLEWARE_PATH,
   CAPTURE_ROUTE_PATH,
+  CUSTOMIZED_CAPTURE_ROUTES,
 } from '../captureDriftMonitor';
 
 const CLEAN = {
@@ -95,6 +96,70 @@ describe('runCaptureDriftSweep (ENG-3120)', () => {
     await runCaptureDriftSweep({ listSites: async () => sites, readFile: files, transport, now: 2 });
     expect(transport).toHaveBeenCalledTimes(2);
     for (const call of files.mock.calls) expect([MIDDLEWARE_PATH, CAPTURE_ROUTE_PATH]).toContain(call[1]);
+  });
+
+  describe('acknowledged capture-route customizations (ENG-3179)', () => {
+    const customized = 'org/customized';
+    const customRoute = CLEAN[CAPTURE_ROUTE_PATH] + '\n// site-specific recruitment list';
+    const ack = { [customized.toUpperCase()]: 'separate recruitment list (ENG-3179)' };
+
+    it('a customized capture route on an acknowledged repo is not an alert', async () => {
+      const transport = jest.fn(async () => {});
+      const s = await runCaptureDriftSweep({
+        listSites: async () => [{ repoFullName: customized, name: 'Custom' }],
+        readFile: repos({ [customized]: { ...CLEAN, [CAPTURE_ROUTE_PATH]: customRoute } }),
+        transport,
+        customizedCaptureRoutes: ack,
+        now: 1,
+      });
+      expect(s).toMatchObject({ sitesChecked: 1, clean: 1, drifted: 0, alertsSent: 0 });
+      expect(transport).not.toHaveBeenCalled();
+    });
+
+    it('still alerts when that repo\'s middleware drifts', async () => {
+      const transport = jest.fn(async () => {});
+      const s = await runCaptureDriftSweep({
+        listSites: async () => [{ repoFullName: customized, name: 'Custom' }],
+        readFile: repos({
+          [customized]: { [MIDDLEWARE_PATH]: CLEAN[MIDDLEWARE_PATH] + '\n// stale', [CAPTURE_ROUTE_PATH]: customRoute },
+        }),
+        transport,
+        customizedCaptureRoutes: ack,
+        now: 1,
+      });
+      expect(s).toMatchObject({ drifted: 1, alertsSent: 1 });
+      expect((transport.mock.calls[0] as any[])[2]).toMatchObject({ 'Drifted Files': 'middleware.ts' });
+    });
+
+    it('still alerts when the acknowledged capture route is missing', async () => {
+      const transport = jest.fn(async () => {});
+      const s = await runCaptureDriftSweep({
+        listSites: async () => [{ repoFullName: customized, name: 'Custom' }],
+        readFile: repos({ [customized]: { [MIDDLEWARE_PATH]: CLEAN[MIDDLEWARE_PATH], [CAPTURE_ROUTE_PATH]: null } }),
+        transport,
+        customizedCaptureRoutes: ack,
+        now: 1,
+      });
+      expect(s).toMatchObject({ drifted: 1, alertsSent: 1 });
+    });
+
+    it('the same customization on an unacknowledged repo still alerts', async () => {
+      const transport = jest.fn(async () => {});
+      const s = await runCaptureDriftSweep({
+        listSites: async () => [{ repoFullName: 'org/other', name: 'Other' }],
+        readFile: repos({ 'org/other': { ...CLEAN, [CAPTURE_ROUTE_PATH]: customRoute } }),
+        transport,
+        customizedCaptureRoutes: ack,
+        now: 1,
+      });
+      expect(s).toMatchObject({ drifted: 1, alertsSent: 1 });
+    });
+
+    it('the production default acknowledges the ENG-3179 site', () => {
+      expect(Object.keys(CUSTOMIZED_CAPTURE_ROUTES).map((k) => k.toLowerCase())).toContain(
+        'agentwebpro/lp-create-a-high-converting-mobil-f80e1869',
+      );
+    });
   });
 });
 

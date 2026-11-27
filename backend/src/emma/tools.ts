@@ -7074,7 +7074,7 @@ output_fields guidance: one entry per distinct data point. Each entry has a snak
       throw new Error('Authentication required: no user context');
     }
     const { runEmmaEnrichment, pickPreviewLeadIds } = await import('./enrichmentToolRunner');
-    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids);
+    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids, context.userId);
     const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,

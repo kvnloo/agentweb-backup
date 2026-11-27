@@ -69,7 +69,7 @@ export const META_EVENT_SOURCE_TOOL_DEFINITIONS = [
   },
   {
     name: 'meta_event_source_get_health',
-    description: 'Read-only. Health of one pixel of this ad account: whether it is available, when it last fired, and which business catalogs it is connected to.',
+    description: 'Read-only. Health of one pixel of this ad account: whether it is available, when it last fired, and which business catalogs it is connected to. If the business cannot be read, healthy and connected_catalogs are null and connected_catalogs_reason says why.',
     inputSchema: { type: 'object', properties: { ...ACCOUNT_PROP, ...PIXEL_PROP }, required: ['pixel_id'], additionalProperties: false },
   },
   {
@@ -157,6 +157,10 @@ export async function runMetaEventSourceTool(
   name: MetaEventSourceToolName, userId: string, accountId: string, rawArgs: any, deps: MetaEventSourceDeps = defaultDeps,
 ) {
   const { confirm, preview_token: previewToken, ...args } = rawArgs ?? {};
+  const rawRead = async (path: string, params: Record<string, string>) => {
+    if (!READ_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported event source read.');
+    return deps.readGraph(userId, accountId, path, params);
+  };
   const read = async (path: string, params: Record<string, string>) => {
     if (!READ_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported event source read.');
     try {
@@ -167,8 +171,13 @@ export async function runMetaEventSourceTool(
   };
   const account = `act_${String(accountId).replace(/^act_/, '')}`;
 
-  const { businessId, catalogs } = await readBusinessCatalogs(read, accountId);
-  if (!businessId) throw new MetaToolkitRefusal('This ad account is not in a Meta Business portfolio, so it has no product catalogs.');
+  // get_health reads the business best-effort, after the pixel's firing state (which needs no business).
+  let catalogs = new Map<string, any>();
+  if (name !== 'meta_event_source_get_health') {
+    const business = await readBusinessCatalogs(read, accountId);
+    if (!business.businessId) throw new MetaToolkitRefusal('This ad account is not in a Meta Business portfolio, so it has no product catalogs.');
+    catalogs = business.catalogs;
+  }
 
   const ownedCatalog = (raw: unknown): string => {
     const id = String(raw ?? '');
@@ -236,16 +245,29 @@ export async function runMetaEventSourceTool(
       assertOnlyKeys(args, ['account_id', 'pixel_id']);
       const { id, pixel } = await ownedPixel(args.pixel_id);
       const { state, events_last_24h: eventsLast24h } = await pixelState(pixel, deps.now());
-      const connectedCatalogs = await catalogsOf(id);
+      let catalogsUnavailable: string | null = null;
+      try {
+        // rawRead: the reason carries Meta's own message, not read()'s "Nothing was changed." refusal wrapper.
+        const business = await readBusinessCatalogs(rawRead, accountId);
+        if (business.businessId) catalogs = business.catalogs;
+        else catalogsUnavailable = 'not in a Meta Business portfolio';
+      } catch (error: any) {
+        const message = metaMessage(error);
+        catalogsUnavailable = /business_management/i.test(message)
+          ? 'missing business_management permission'
+          : `could not read the business or its catalogs (${message})`;
+      }
+      const connectedCatalogs = catalogsUnavailable ? null : await catalogsOf(id);
       return {
         account_id: accountId, pixel_id: id, name: pixel?.name ?? null, state,
         last_fired_time: pixel?.last_fired_time ?? null,
         ...(eventsLast24h !== null ? { events_last_24h: eventsLast24h } : {}),
-        ...(state === 'ACTIVE' && firingState(pixel, deps.now()) !== 'ACTIVE'
+        ...(state === 'ACTIVE' && eventsLast24h !== null && eventsLast24h > 0 && firingState(pixel, deps.now()) !== 'ACTIVE'
           ? { state_source: 'event_stats', note: `Meta's last_fired_time is stale, but its event stats show ${eventsLast24h} events in the last 24 hours, so the pixel is firing.` }
           : {}),
         connected_catalogs: connectedCatalogs,
-        healthy: state === 'ACTIVE' && connectedCatalogs.length > 0,
+        ...(catalogsUnavailable ? { connected_catalogs_reason: catalogsUnavailable } : {}),
+        healthy: connectedCatalogs === null ? null : state === 'ACTIVE' && connectedCatalogs.length > 0,
       };
     }
 

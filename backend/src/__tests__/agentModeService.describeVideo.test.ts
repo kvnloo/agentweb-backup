@@ -1,35 +1,22 @@
 // Consolidates: describeVideo.enhanced + describeVideo.likeness-fix
 
 import { AgentModeService, __testHooks } from '../services/agentModeService';
-import axios from 'axios';
-import { Readable } from 'stream';
 
-jest.mock('axios');
 jest.mock('../utils/secretsManager');
 jest.mock('@google/genai');
+// ENG-2840: a non-YouTube video is downloaded only through the SSRF-guarded caller-URL fetch.
+jest.mock('../utils/callerUrlFetch', () => ({
+  ...jest.requireActual('../utils/callerUrlFetch'),
+  fetchCallerUrlBuffer: jest.fn(),
+}));
+const { fetchCallerUrlBuffer, CallerUrlBlockedError, CallerUrlTooLargeError } = require('../utils/callerUrlFetch');
+const mockedFetch = fetchCallerUrlBuffer as jest.Mock;
 
 const secretsManager = require('../utils/secretsManager');
 const { GoogleGenAI } = require('@google/genai');
 
-function makeVideoStream(data = 'fake-video-data') {
-  const s = new Readable();
-  s.push(data);
-  s.push(null);
-  return s;
-}
-
-function mockAxiosVideo(stream?: Readable) {
-  (axios.get as jest.Mock).mockResolvedValue({
-    data: stream || makeVideoStream(),
-    headers: { 'content-type': 'video/mp4', 'content-length': '10240' }
-  });
-}
-
-function mockAxiosImage(contentType: string) {
-  (axios.get as jest.Mock).mockResolvedValue({
-    data: makeVideoStream(),
-    headers: { 'content-type': contentType, 'content-length': '2048' }
-  });
+function mockVideoDownload(contentType = 'video/mp4', data = 'fake-video-data') {
+  mockedFetch.mockResolvedValue({ buffer: Buffer.from(data), contentType, finalUrl: 'https://example.com/video.mp4' });
 }
 
 function mockGemini(responseText: string) {
@@ -43,7 +30,7 @@ function mockGemini(responseText: string) {
     models: { generateContent: mockGenerateContent }
   }));
 
-  return { mockGenerateContent };
+  return { mockGenerateContent, mockFilesUpload };
 }
 
 describe('AgentModeService - describeVideo', () => {
@@ -68,7 +55,7 @@ describe('AgentModeService - describeVideo', () => {
 
     it.each(['image/jpeg', 'image/png'])('should reject by Content-Type header (%s)', async (contentType) => {
       secretsManager.getSecret.mockResolvedValue('test-api-key');
-      mockAxiosImage(contentType);
+      mockVideoDownload(contentType);
       const result = await service.describeVideo('https://example.com/video.mp4');
       expect(result.success).toBe(false);
       expect(result.message).toContain('appears to be an image');
@@ -78,7 +65,7 @@ describe('AgentModeService - describeVideo', () => {
 
     it('should allow video files with .mp4 extension and no Content-Type header', async () => {
       secretsManager.getSecret.mockResolvedValue('test-api-key');
-      (axios.get as jest.Mock).mockResolvedValue({ data: makeVideoStream(), headers: { 'content-type': '', 'content-length': '10240' } });
+      mockVideoDownload('');
       const result = await service.describeVideo('https://example.com/video.mp4');
       if (!result.success) {
         expect(result.message).not.toContain('appears to be an image');
@@ -88,7 +75,7 @@ describe('AgentModeService - describeVideo', () => {
 
     it('should allow video files with video/mp4 Content-Type', async () => {
       secretsManager.getSecret.mockResolvedValue('test-api-key');
-      mockAxiosVideo();
+      mockVideoDownload();
       const result = await service.describeVideo('https://example.com/video.mp4');
       if (!result.success) {
         expect(result.message).not.toContain('appears to be an image');
@@ -109,6 +96,65 @@ describe('AgentModeService - describeVideo', () => {
     });
   });
 
+  // ── ENG-2840: the caller's video URL is fetched only through the SSRF-guarded fetch ──────────
+
+  describe('guarded download', () => {
+    it('downloads through the guarded fetch with the size cap, a total time limit and the caller', async () => {
+      mockVideoDownload();
+      mockGemini('A short clip.');
+      await service.describeVideo('https://example.com/video.mp4', undefined, { userId: 'user-1' });
+      expect(mockedFetch).toHaveBeenCalledWith('https://example.com/video.mp4', {
+        tool: 'describe_video',
+        userId: 'user-1',
+        maxBytes: 100 * 1024 * 1024,
+        timeoutMs: 180_000,
+      });
+    });
+
+    it('answers a plain refusal for an internal address and sends nothing to Gemini', async () => {
+      mockedFetch.mockRejectedValue(new CallerUrlBlockedError());
+      const { mockGenerateContent, mockFilesUpload } = mockGemini('should not be used');
+      const result = await service.describeVideo('http://169.254.169.254/latest/meta-data/video.mp4');
+      expect(result).toEqual({ success: false, message: 'That URL cannot be fetched. Use a public https link.' });
+      expect(mockFilesUpload).not.toHaveBeenCalled();
+      expect(mockGenerateContent).not.toHaveBeenCalled();
+    });
+
+    it('answers the size limit when the video is too large', async () => {
+      mockedFetch.mockRejectedValue(new CallerUrlTooLargeError(100 * 1024 * 1024));
+      const result = await service.describeVideo('https://example.com/huge.mp4');
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Video file too large for analysis: it exceeds the limit of 100 MB');
+    });
+
+    it('says plainly when the download hits its time limit', async () => {
+      mockedFetch.mockRejectedValue(Object.assign(new Error('canceled'), { name: 'CanceledError', code: 'ERR_CANCELED' }));
+      const result = await service.describeVideo('https://example.com/slow.mp4');
+      expect(result).toEqual({ success: false, message: 'The video did not download within 180 s. Use a smaller file or a faster host.' });
+    });
+
+    it('keeps the 100 MB cap when MAX_DOWNLOADED_VIDEO_SIZE_MB is not a number', async () => {
+      const saved = process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB;
+      process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB = 'lots';
+      try {
+        mockVideoDownload();
+        mockGemini('A short clip.');
+        await service.describeVideo('https://example.com/video.mp4');
+        expect(mockedFetch).toHaveBeenCalledWith('https://example.com/video.mp4', expect.objectContaining({ maxBytes: 100 * 1024 * 1024 }));
+      } finally {
+        if (saved === undefined) delete process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB;
+        else process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB = saved;
+      }
+    });
+
+    it('refuses an empty download', async () => {
+      mockVideoDownload('video/mp4', '');
+      mockGemini('unused');
+      const result = await service.describeVideo('https://example.com/empty.mp4');
+      expect(result).toEqual({ success: false, message: 'Downloaded video file is empty' });
+    });
+  });
+
   // ── Enhanced features ─────────────────────────────────────────────────────
 
   describe('return_transcript parameter', () => {
@@ -121,7 +167,7 @@ describe('AgentModeService - describeVideo', () => {
         ],
         duration: 10
       });
-      mockAxiosVideo();
+      mockVideoDownload();
       const { mockGenerateContent } = mockGemini(fakeResponse);
 
       const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
@@ -141,7 +187,7 @@ describe('AgentModeService - describeVideo', () => {
     });
 
     it('should NOT include transcript when return_transcript is not set', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini('A simple video description.');
       const result = await service.describeVideo('https://example.com/demo.mp4');
       expect(result.success).toBe(true);
@@ -151,7 +197,7 @@ describe('AgentModeService - describeVideo', () => {
 
   describe('timestamp accuracy (MM:SS prompt + parsing)', () => {
     it('should ask Gemini for MM:SS timestamps when transcript is requested', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       const { mockGenerateContent } = mockGemini(JSON.stringify({
         description: 'demo', transcript: [{ start: '00:00', end: '00:05', text: 'hi' }], duration: '00:05'
       }));
@@ -163,7 +209,7 @@ describe('AgentModeService - describeVideo', () => {
     });
 
     it('should normalize MM:SS transcript timestamps to numeric seconds', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini(JSON.stringify({
         description: 'A demo video.',
         transcript: [
@@ -184,7 +230,7 @@ describe('AgentModeService - describeVideo', () => {
     });
 
     it('should normalize HH:MM:SS scene timestamps to numeric seconds', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini(JSON.stringify({
         description: 'A long video.',
         scenes: [{ start: '01:00:30', end: '01:01:00', title: 'Late scene', description: 'x' }],
@@ -199,7 +245,7 @@ describe('AgentModeService - describeVideo', () => {
     });
 
     it('should leave already-numeric timestamps unchanged (backward compatible)', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini(JSON.stringify({
         description: 'A demo video.',
         transcript: [{ start: 0, end: 5.5, text: 'Welcome.' }],
@@ -251,7 +297,7 @@ describe('AgentModeService - describeVideo', () => {
         ],
         duration: 20
       });
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini(fakeResponse);
 
       const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_scenes: true });
@@ -264,7 +310,7 @@ describe('AgentModeService - describeVideo', () => {
     });
 
     it('should NOT include scenes when return_scenes is not set', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini('A simple video description.');
       const result = await service.describeVideo('https://example.com/demo.mp4');
       expect(result.success).toBe(true);
@@ -274,7 +320,7 @@ describe('AgentModeService - describeVideo', () => {
 
   describe('start_time / end_time parameters', () => {
     it('should include time range in Gemini prompt when start_time and end_time are provided', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       const { mockGenerateContent } = mockGemini('Focused description of the 0:30–1:00 segment.');
 
       const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { start_time: '0:30', end_time: '1:00' });
@@ -286,7 +332,7 @@ describe('AgentModeService - describeVideo', () => {
     });
 
     it('should work with only start_time', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       const { mockGenerateContent } = mockGemini('Description from 1:00 onwards.');
 
       const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { start_time: '1:00' });
@@ -299,7 +345,7 @@ describe('AgentModeService - describeVideo', () => {
 
   describe('duration return field', () => {
     it('should return duration when Gemini response includes it', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini(JSON.stringify({ description: 'A short video.', duration: 45.5 }));
       const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
       expect(result.success).toBe(true);
@@ -309,7 +355,7 @@ describe('AgentModeService - describeVideo', () => {
 
   describe('combined structured output', () => {
     it('should return both transcript and scenes when both flags are set', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini(JSON.stringify({
         description: 'A marketing video.',
         transcript: [{ start: 0, end: 4, text: 'Buy our product today.' }],
@@ -337,8 +383,8 @@ describe('AgentModeService - describeVideo', () => {
       const result = await service.describeVideo(ytUrl);
 
       expect(result.success).toBe(true);
-      // YouTube URLs must NOT be downloaded via axios — Gemini fetches them natively
-      expect(axios.get as jest.Mock).not.toHaveBeenCalled();
+      // YouTube URLs must NOT be downloaded by the server — Gemini fetches them natively
+      expect(mockedFetch).not.toHaveBeenCalled();
       // The raw YouTube URL is handed to Gemini as fileData.fileUri
       const parts = mockGenerateContent.mock.calls[0][0].contents[0].parts;
       const fileDataPart = parts.find((p: any) => p.fileData);
@@ -362,7 +408,7 @@ describe('AgentModeService - describeVideo', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(axios.get as jest.Mock).not.toHaveBeenCalled();
+      expect(mockedFetch).not.toHaveBeenCalled();
       expect(Array.isArray(result.transcript)).toBe(true);
       expect(result.transcript[0]).toHaveProperty('text');
     });
@@ -370,7 +416,7 @@ describe('AgentModeService - describeVideo', () => {
 
   describe('backward compatibility', () => {
     it('should work with no options (original signature)', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini('This is a product demo video showing the main features.');
       const result = await service.describeVideo('https://example.com/demo.mp4');
       expect(result.success).toBe(true);
@@ -379,7 +425,7 @@ describe('AgentModeService - describeVideo', () => {
     });
 
     it('should work with prompt only (original signature)', async () => {
-      mockAxiosVideo();
+      mockVideoDownload();
       mockGemini('Description with custom focus.');
       const result = await service.describeVideo('https://example.com/demo.mp4', 'Focus on the branding elements only.');
       expect(result.success).toBe(true);
