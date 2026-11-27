@@ -28,7 +28,8 @@ import { approvalDb } from '../services/approvalDb';
 import { getWorkspaceAssets, resolveWorkspaceMembers, getWorkspaceApprovalStatusByUrl, WorkspaceCaller } from '../utils/workspaceAssets';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { isS3Url, uploadFileToS3 } from '../utils/s3Utils';
+import { CALLER_URL_MAX_TEXT_BYTES, fetchCallerUrlText } from '../utils/callerUrlFetch';
 import { classifyReport, ReportType } from '../services/reportClassificationService';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -2574,7 +2575,7 @@ export async function getExecutionsWithAssets(
   // cached values are already populated so this only runs for brand-new reports).
   if (assetType === 'html-reports' && backfill) {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
-    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
+    enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich, userId)
       .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
       .catch(() => {/* non-fatal */});
   }
@@ -2582,13 +2583,16 @@ export async function getExecutionsWithAssets(
   return result;
 }
 
+/** Total time for reading one HTML report for its searchable text (ENG-2840; the old per-read idle timeout was 5 s). */
+const HTML_REPORT_FETCH_TIMEOUT_MS = 15_000;
+
 /**
  * Fetch HTML content for report files that lack searchableText and attach extracted plain text.
  * Persists newly-fetched searchableText back to DynamoDB (session assetCache or task execution
  * result_files) so subsequent loads skip the S3 fetch entirely.
  * Runs concurrently (up to 10 at a time) so it doesn't block the response for long.
  */
-async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, chatbotDb: ChatbotDB): Promise<void> {
+async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, chatbotDb: ChatbotDB, userId?: string): Promise<void> {
   const CONCURRENCY = 10;
   const MAX_TEXT_LENGTH = 3000;
 
@@ -2609,8 +2613,16 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, 
     const batch = filesToEnrich.slice(i, i + CONCURRENCY);
     await Promise.all(batch.map(async ({ file }) => {
       try {
-        const response = await axios.get(file.url, { timeout: 5000, responseType: 'text' });
-        const html: string = typeof response.data === 'string' ? response.data : '';
+        // ENG-2840: a session's report URLs are scraped from chat message text, so the URL is effectively the user's choice. Only a
+        // report in our own bucket is read, and only through the SSRF-guarded fetch (public address pinned, redirects re-checked, size
+        // and total time bounded). Before, any URL that matched the scrape pattern was fetched with plain axios.
+        if (!isS3Url(file.url)) return;
+        const html = await fetchCallerUrlText(file.url, {
+          tool: 'html_report_backfill',
+          userId,
+          maxBytes: CALLER_URL_MAX_TEXT_BYTES,
+          timeoutMs: HTML_REPORT_FETCH_TIMEOUT_MS,
+        });
         // Strip tags, collapse whitespace, truncate
         const text = html
           .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
