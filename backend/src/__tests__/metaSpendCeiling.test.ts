@@ -27,7 +27,16 @@ describe('evaluateMetaSpendCeiling (ENG-2046 A4)', () => {
     expect(evaluateMetaSpendCeiling({ maxChangeRatio: 3 }, { field: 'spend_cap', proposed, prior }).allowed).toBe(allowed);
   });
 
-  it('skips the ratio check for a zero prior (adding a budget); maxDailyBudget still caps it', () => {
+  it.each([
+    ['lifetime_budget', { maxDailyBudget: 50_000, maxChangeRatio: 2 }],
+    ['spend_cap', { maxDailyBudget: 50_000, maxChangeRatio: 2 }],
+    ['daily_budget', { maxChangeRatio: 2 }],
+  ] as const)('still refuses %s 0 -> X when no cap applies (policy %j)', (field, policy) => {
+    expect(evaluateMetaSpendCeiling(policy, { field, proposed: 5_000, prior: 0 }))
+      .toMatchObject({ allowed: false, code: 'SPEND_CEILING_EXCEEDED', ceiling: 'maxChangeRatio' });
+  });
+
+  it('skips the ratio check for a zero-prior daily_budget when maxDailyBudget caps it', () => {
     const policy = { maxDailyBudget: 50_000, maxChangeRatio: 2 };
     expect(evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: 5_000, prior: 0 })).toEqual({ allowed: true });
     expect(evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: 60_000, prior: 0 }))
