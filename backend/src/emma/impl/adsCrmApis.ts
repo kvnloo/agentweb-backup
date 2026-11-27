@@ -510,6 +510,37 @@ async function runGoogleAdsTrackingGate(
   };
 }
 
+/**
+ * The policy topics Google attaches to a POLICY_FINDING / POLICY_VIOLATION error, and the
+ * field that failed. Without them the caller sees only "PROHIBITED" and cannot tell which
+ * headline or rule to fix.
+ *
+ * The advertiser's own text (evidences, violatingText, trigger) is deliberately NOT quoted:
+ * this string is read by error classifiers (toolErrorClassifier, zomaErrorNextStep), and ad
+ * copy such as "Save 500 today" or "Sign in for free" would be misread as a 5xx or a
+ * setup failure. The field path already names the headline to rewrite.
+ */
+export function googleAdsPolicyReasons(e: any): string | undefined {
+  const reasons: string[] = [];
+  const entries: any[] = e?.details?.policyFindingDetails?.policyTopicEntries ?? [];
+  for (const entry of entries) {
+    if (/^[A-Z0-9_]+$/.test(String(entry?.topic ?? ''))) reasons.push(`${entry.topic}${/^[A-Z_]+$/.test(String(entry.type ?? '')) ? ` (${entry.type})` : ''}`);
+  }
+  const v = e?.details?.policyViolationDetails;
+  if (v?.key?.policyName && /^[a-z0-9_]+$/i.test(String(v.key.policyName))) reasons.push(String(v.key.policyName));
+  // Google's own policy title (no digits, so it cannot read as an HTTP status), when no key is given.
+  else if (v?.externalPolicyName && /^[A-Za-z][A-Za-z &/'-]{0,80}$/.test(String(v.externalPolicyName))) reasons.push(String(v.externalPolicyName));
+  // Which field failed, e.g. headlines[2]: tells the caller which line to rewrite.
+  const path = (e?.location?.fieldPathElements ?? [])
+    .map((p: any) => (/^[a-z_]+$/.test(String(p?.fieldName ?? '')) ? `${p.fieldName}${Number.isInteger(p.index) ? `[${p.index}]` : ''}` : ''))
+    .filter(Boolean).join('.');
+  // A policy error with no readable topic still names the field; other errors never get a "Policy:" suffix.
+  const isPolicy = !!(e?.details?.policyFindingDetails || e?.details?.policyViolationDetails
+    || e?.errorCode?.policyFindingError || e?.errorCode?.policyViolationError);
+  if (path && (reasons.length || isPolicy)) reasons.push(`at ${path}`);
+  return reasons.length ? [...new Set(reasons)].join(', ') : undefined;
+}
+
 export async function handleCallGoogleAdsApi(userId: string, args: {
   customer_id: string;
   entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION' | 'CAMPAIGN_CONVERSION_GOAL' | 'CUSTOMER_CONVERSION_GOAL';
@@ -689,6 +720,12 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           status: args.status || 'PAUSED',
           brandBusinessName: args.brand_business_name,
           brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
+          // Network settings exist on Search campaigns only (another type would be rejected by Google).
+          ...(args.type === 'SEARCH' ? {
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+          } : {}),
         });
         return { success: true, campaignResourceName: campaign.resourceName };
       }
@@ -1368,7 +1405,9 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
     const gadsError = gadsErrors.length
       ? gadsErrors.map((e: any) => {
           const code = Object.values(e.errorCode || {})[0];
-          return code ? `${code}: ${e.message}` : e.message;
+          const text = code ? `${code}: ${e.message}` : e.message;
+          const reasons = googleAdsPolicyReasons(e);
+          return reasons ? `${text} Policy: ${reasons}.` : text;
         }).join('; ')
       : undefined;
     if (args.entity_type === 'CAMPAIGN_CRITERION') {

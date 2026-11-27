@@ -98,5 +98,12 @@ export function zomaNextStep(toolName: string, args: any, result: unknown): stri
   if (toolName === 'zoma_usage') return 'Ask about results with zoma_ads_report, e.g. spend and ROAS by campaign for the last 7 days.';
   if (toolName === 'zoma_prepare_upload') return 'Run the upload_command with the real file path, then pass file_url to the creative upload call.';
   if (args?.confirm === true) return 'Read the object back (GET) to confirm the change, then tell the user what changed.';
+  // zoma_ads_report is Meta-only: a Google answer points at the Google report instead.
+  if (toolName === 'call_google_ads_api' || toolName === 'call_google_ads_reporting_api') {
+    return 'Summarize this for the user, then offer the next useful question (e.g. "How did my Google campaigns do this month?" via call_google_ads_reporting_api mode=dashboard) or a change — every change is previewed before it runs.';
+  }
+  if (toolName === 'x_ads_read' || toolName === 'x_ads_write') {
+    return 'Summarize this for the user, then offer the next useful question or a change — every change is previewed before it runs.';
+  }
   return 'Summarize this for the user, then offer the next useful question (e.g. "Which campaign had the best ROAS this week?" via zoma_ads_report) or a change — every change is previewed before it runs.';
 }
