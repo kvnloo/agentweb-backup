@@ -122,10 +122,22 @@ describe('ENG-2279 budget anomaly confirmation', () => {
     expect(result.confirmationDetail).toMatch(/pause.*first/i);
     expect(write).not.toHaveBeenCalled();
   });
-  it.each([undefined, null, {}, [], true, 'garbage', -1, Infinity])('fails closed on malformed prior %p', async prior => {
+  // undefined / null are not malformed: a campaign Meta read back with no budget field has no
+  // budget, so adding one is 0 -> new (reviewed below), not unverifiable (Zoma/Haven launch).
+  it.each([{}, [], true, 'garbage', -1, Infinity])('fails closed on malformed prior %p', async prior => {
     read.mockResolvedValue({ id: 'campaign', daily_budget: prior });
     const result: any = await invoke({ budget_amount: 210 });
     expect(result.blocked).toBe(true);
+    expect(write).not.toHaveBeenCalled();
+  });
+  it.each([undefined, null])('adding a budget to a campaign with none (prior %p) is a reviewed 0 -> new change, not META_BUDGET_UNVERIFIED', async prior => {
+    read.mockResolvedValue({ id: 'campaign', daily_budget: prior });
+    const result: any = await invoke({ budget_amount: 50 });
+    expect(result.blocked).toBeUndefined();
+    expect(String(result.error ?? '')).not.toContain('META_BUDGET_UNVERIFIED');
+    // Still goes through the normal budget review before anything is written.
+    expect(result.awaitingUserConfirmation).toBe(true);
+    expect(result.budgetAnomaly.changes[0]).toMatchObject({ field: 'daily_budget', prior: 0, ratio: null, severity: 'critical' });
     expect(write).not.toHaveBeenCalled();
   });
   it('fails closed when the prior read fails', async () => {

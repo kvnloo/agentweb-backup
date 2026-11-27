@@ -517,6 +517,228 @@ describe('GTM Plan Notification Service', () => {
     });
   });
 
+  // ENG-2840 PR B (review): one mailbox is one person whatever case it was typed in, and a title can never add a header to the email it names.
+  describe('Distinct people and one-line subjects', () => {
+    const plan = (over: any = {}): any => ({
+      planId: 'plan-d', userId: 'user-1', title: 'Distinct Plan', status: 'in_progress', dri: 'Same@Example.com',
+      phases: [
+        { id: 'p1', title: 'Phase One', dri: 'same@example.com', status: 'in_progress', workItems: [{ id: 'i1', title: 'Item', status: 'pending', dri: 'SAME@EXAMPLE.COM' }] },
+        { id: 'p2', title: 'Phase Two', dri: ' same@example.com ', status: 'in_progress', workItems: [] },
+        { id: 'p3', title: 'Phase Three', dri: 'other@example.com', status: 'in_progress', workItems: [] },
+      ],
+      ...over,
+    });
+
+    beforeEach(() => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockReset().mockResolvedValue({ id: 'email-1' });
+      mockUserDb.getUserById.mockReset().mockResolvedValue({ userId: 'user-1', email: 'SAME@example.com' } as any);
+    });
+
+    it('a plan report sends one email to a mailbox written in different cases, keeping the first spelling', async () => {
+      const result = await sendPlanStatusReport(plan(), { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true });
+      expect(result).toEqual({ recipients: 2, sent: 2, failed: 0 });
+      expect((mockResendService.sendSystemEmail as jest.Mock).mock.calls.map((c) => c[0].to)).toEqual(['SAME@example.com', 'other@example.com']);
+    });
+
+    it('a phase report does too', async () => {
+      const result = await sendPhaseStatusReport(plan(), 'p1', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true });
+      expect(result).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('update notifications do too', async () => {
+      await sendGTMPlanUpdateNotifications(plan(), 'p1', 'i1', { dueDate: '2026-12-31' }, { notifyUser: true, notifyItemPoc: true, notifyPhasePoc: true, notifyPlanPoc: true });
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('the recipient cap counts people, not spellings: three spellings of one mailbox and one other is 2 people', async () => {
+      const result = await sendPlanStatusReport(plan(), { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 2 });
+      expect(result).toEqual({ recipients: 2, sent: 2, failed: 0 });
+      const over = await sendPlanStatusReport(plan(), { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 1 });
+      expect(over).toEqual({ recipients: 2, sent: 0, failed: 0, overCap: 1 });
+    });
+
+    it('addresses that are only spaces are not people', async () => {
+      const result = await sendPlanStatusReport(plan({ dri: '   ', phases: [{ id: 'p', title: 'P', dri: '  ', workItems: [] }] }), { notifyPlanPoc: true, notifyPhasePocs: true });
+      expect(result).toEqual({ recipients: 0, sent: 0, failed: 0 });
+    });
+
+    it('a subject is one line: a line break, a control character or a line separator in a title becomes a space, in all three emails', async () => {
+      const title = 'Launch\r\nBcc: x@y.test\u2028 \u0007  now';
+      await sendPlanStatusReport(plan({ title }), { notifyPlanPoc: true });
+      await sendPhaseStatusReport(plan(), 'p1', { notifyPhasePoc: true });
+      await sendGTMPlanUpdateNotifications(plan({ title }), 'p1', 'i1', { dueDate: '2026-12-31' }, { notifyPlanPoc: true });
+      const subjects = (mockResendService.sendSystemEmail as jest.Mock).mock.calls.map((c) => c[0].subject);
+      expect(subjects[0]).toBe('GTM Plan Status Report: Launch Bcc: x@y.test now');
+      expect(subjects[1]).toBe('GTM Plan Phase Status Report: Phase One');
+      expect(subjects[2]).toBe('GTM Plan Update: Launch Bcc: x@y.test now');
+      for (const s of subjects) expect(s).not.toMatch(/[\r\n\u2028\u2029\u0000-\u001f]/);
+    });
+
+    it('a phase title with a line break is cleaned the same way', async () => {
+      const p = plan();
+      p.phases[0].title = 'Phase\nOne';
+      await sendPhaseStatusReport(p, 'p1', { notifyPhasePoc: true });
+      expect((mockResendService.sendSystemEmail as jest.Mock).mock.calls[0][0].subject).toBe('GTM Plan Phase Status Report: Phase One');
+    });
+
+    it('a normal title is left exactly as written', async () => {
+      await sendPlanStatusReport(plan({ title: "Q1 launch: Emma's  \"big\" push" }), { notifyPlanPoc: true });
+      expect((mockResendService.sendSystemEmail as jest.Mock).mock.calls[0][0].subject).toBe("GTM Plan Status Report: Q1 launch: Emma's \"big\" push");
+    });
+  });
+
+  // ENG-2840 PR B: an outside agent's key may email at most 10 people in one call. The cap is checked after the recipients are resolved and
+  // before anything is sent, so it is a promise about the whole report and never a partial send.
+  describe('The recipient cap (maxRecipients)', () => {
+    const wide: any = {
+      planId: 'plan-w', userId: 'user-1', title: 'Wide Plan', status: 'in_progress', dri: 'plan-poc@example.com',
+      phases: Array.from({ length: 12 }, (_, i) => ({ id: `phase-${i}`, title: `P${i}`, dri: `poc${i}@example.com`, status: 'in_progress', workItems: [] })),
+    };
+
+    beforeEach(() => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockReset().mockResolvedValue({ id: 'email-1' });
+      mockUserDb.getUserById.mockReset().mockResolvedValue({ userId: 'user-1', email: 'owner@example.com' } as any);
+    });
+
+    it('sends nothing and says why when a plan report would reach more people than the cap', async () => {
+      // plan contact + 12 phase contacts + the owner = 14 distinct people
+      const result = await sendPlanStatusReport(wide, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 10 });
+      expect(result).toEqual({ recipients: 14, sent: 0, failed: 0, overCap: 10 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('sends the whole report when it reaches exactly the cap, and when it is under it', async () => {
+      const atCap = await sendPlanStatusReport(wide, { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 13 }); // 1 + 12
+      expect(atCap).toEqual({ recipients: 13, sent: 13, failed: 0 });
+      expect(atCap.overCap).toBeUndefined();
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(13);
+
+      (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+      const under = await sendPlanStatusReport(wide, { notifyPlanPoc: true, maxRecipients: 10 });
+      expect(under).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('counts distinct people, not addresses written: a duplicate address is one person', async () => {
+      const dup: any = { ...wide, phases: wide.phases.map((p: any) => ({ ...p, dri: 'same@example.com' })) };
+      const result = await sendPlanStatusReport(dup, { notifyPhasePocs: true, maxRecipients: 1 });
+      expect(result).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('applies to a phase report too', async () => {
+      const phasePlan: any = { ...wide, phases: [{ id: 'phase-a', title: 'A', dri: 'a@example.com', status: 'in_progress', workItems: [] }] };
+      const over = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 2 }); // 3 people
+      expect(over).toEqual({ recipients: 3, sent: 0, failed: 0, overCap: 2 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+
+      const ok = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 3 });
+      expect(ok).toEqual({ recipients: 3, sent: 3, failed: 0 });
+    });
+
+    it('a cap of 0 refuses every report that has a recipient', async () => {
+      const result = await sendPlanStatusReport(wide, { notifyPlanPoc: true, maxRecipients: 0 });
+      expect(result).toEqual({ recipients: 1, sent: 0, failed: 0, overCap: 0 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('no cap, or a value that is not a usable cap, is no cap (the portal and Emma set none)', async () => {
+      for (const cap of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -1, '2', '', true, {}]) {
+        (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+        const result = await sendPlanStatusReport(wide, { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: cap as any });
+        expect(result).toEqual({ recipients: 13, sent: 13, failed: 0 });
+      }
+    });
+
+    it('with a cap, a contact that holds more than one address is refused before anything is sent, whatever the cap (a list is one send to several people)', async () => {
+      const lists = [
+        'a@x.test, b@x.test, c@x.test', 'a@x.test;b@x.test;c@x.test', 'a@x.test b@x.test c@x.test', ['a@x.test', 'b@x.test'] as any,
+        'a@x.test\uff0cb@x.test', 'a@x.test\uff1bb@x.test', 'a@x.test\u3001b@x.test', 'a@x.test\u200bb@x.test', 'a@x.test\u2028b@x.test', 'a@x.test\nb@x.test', 'a@x.test\tb@x.test',
+        'a@x.test (primary), b@x.test',
+      ];
+      for (const dri of lists) {
+        (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+        const result = await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: 100 });
+        expect(result).toEqual({ recipients: 1, sent: 0, failed: 0, multiAddressContacts: 1 });
+        expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+      }
+    });
+
+    it('thirty addresses in one contact are one contact that is a list: refused, nothing sent', async () => {
+      const dri = Array.from({ length: 30 }, (_, i) => `u${i}@x.test`).join(',');
+      const result = await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: 10 });
+      expect(result).toEqual({ recipients: 1, sent: 0, failed: 0, multiAddressContacts: 1 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('every list contact is counted: a list in the plan contact and a list in a phase contact are 2', async () => {
+      const plan2: any = { ...wide, dri: 'a@x.test, b@x.test', phases: [{ id: 'p1', title: 'One', dri: 'c@x.test;d@x.test', status: 'in_progress', workItems: [] }, ...wide.phases.slice(1, 3)] };
+      const result = await sendPlanStatusReport(plan2, { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 10 });
+      expect(result).toMatchObject({ sent: 0, failed: 0, multiAddressContacts: 2 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('a contact that is one address, with or without a name around it, still sends', async () => {
+      for (const dri of ['jane@x.test', 'Jane Doe <jane@x.test>', '"Doe, Jane" <jane@x.test>', '  jane@x.test  ']) {
+        (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+        expect(await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: 1 })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+      }
+    });
+
+    it('a list is refused only when a cap is set: without one it is one send exactly as before (the portal and Emma are unchanged)', async () => {
+      const dri = 'a@x.test, b@x.test';
+      expect(await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+      expect(await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: Number.NaN })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+      expect(await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: -1 })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('a list contact that nobody chose does not block the report', async () => {
+      const result = await sendPlanStatusReport({ ...wide, phases: [{ id: 'p1', title: 'One', dri: 'a@x.test, b@x.test', status: 'in_progress', workItems: [] }] }, { notifyPlanPoc: true, maxRecipients: 10 });
+      expect(result).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('a list contact is refused before the cap is looked at (a list under a report that is also over the cap is still a list)', async () => {
+      const plan2: any = { ...wide, dri: 'a@x.test, b@x.test' };
+      const result = await sendPlanStatusReport(plan2, { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 3 }); // 1 list + 12 phase contacts
+      expect(result).toMatchObject({ multiAddressContacts: 1 });
+      expect(result.overCap).toBeUndefined();
+    });
+
+    it('an entry with no @ counts as one person, never as zero', async () => {
+      const over = await sendPlanStatusReport({ ...wide, dri: 'not-an-address' }, { notifyPlanPoc: true, maxRecipients: 0 });
+      expect(over).toEqual({ recipients: 1, sent: 0, failed: 0, overCap: 0 });
+    });
+
+    it('a phase report without a cap still sends a list contact as one message, exactly as before', async () => {
+      const phasePlan: any = { ...wide, phases: [{ id: 'phase-a', title: 'A', dri: 'a@x.test, b@x.test', status: 'in_progress', workItems: [] }] };
+      expect(await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPhasePoc: true })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('a phase report that has a list contact AND would reach too many people says it is a list (the list rule comes first)', async () => {
+      const phasePlan: any = { ...wide, dri: 'a@x.test, b@x.test', phases: [{ id: 'phase-a', title: 'A', dri: 'c@x.test', status: 'in_progress', workItems: [] }] };
+      const result = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 1 });
+      expect(result).toMatchObject({ multiAddressContacts: 1 });
+      expect(result.overCap).toBeUndefined();
+    });
+
+    it('a phase report counts every list contact: the plan contact and the phase contact, 2', async () => {
+      const phasePlan: any = { ...wide, dri: 'a@x.test, b@x.test', phases: [{ id: 'phase-a', title: 'A', dri: 'c@x.test;d@x.test', status: 'in_progress', workItems: [] }] };
+      const result = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 10 });
+      expect(result).toMatchObject({ sent: 0, failed: 0, multiAddressContacts: 2 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('a phase report refuses a list contact too', async () => {
+      const phasePlan: any = { ...wide, phases: [{ id: 'phase-a', title: 'A', dri: 'a@x.test,b@x.test,c@x.test', status: 'in_progress', workItems: [] }] };
+      const result = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPhasePoc: true, maxRecipients: 10 });
+      expect(result).toEqual({ recipients: 1, sent: 0, failed: 0, multiAddressContacts: 1 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('a report to nobody is still "nobody" (recipients 0), not over any cap', async () => {
+      const result = await sendPlanStatusReport({ ...wide, dri: undefined }, { notifyPlanPoc: true, maxRecipients: 0 });
+      expect(result).toEqual({ recipients: 0, sent: 0, failed: 0 });
+    });
+  });
+
   // ENG-2840 PR A: automated mail can wait a few seconds, so the GTM emails go in the bulk lane of the shared email queue: several
   // reports at once can never delay a password reset or a support reply. A full bulk lane refuses at once; that is one failed recipient, never a throw.
   describe('Emails wait in the bulk lane', () => {

@@ -106,3 +106,50 @@ describe('emma_search_tools and the memory tools (the apiKeyOnly filter of the s
     }
   });
 });
+
+import '../mcp/server/gtmEmailTool';
+
+describe('gtm:email (ENG-2840, emailing GTM reports over MCP)', () => {
+  const KEY = (scopes: string[]) => ({ externalMcp: true, authMethod: 'api_key', apiKeyScopes: scopes });
+  const find = (caller: any) => searchTools('email a gtm status report', 20, caller).map((d: any) => d.name);
+
+  it('lists send_gtm_status_report for a key holding gtm:email', () => {
+    expect(names(['tools:read', 'tools:execute', 'gtm:email'])).toContain('send_gtm_status_report');
+  });
+
+  it('hides it for default keys, read-only keys and non-key callers', () => {
+    for (const scopes of [undefined, ['tools:read', 'tools:execute'], ['tools:read']]) {
+      expect(names(scopes)).not.toContain('send_gtm_status_report');
+    }
+  });
+
+  it('no other opt-in scope lists it: a key holding only memory:org, email:read or a Smartlead scope is not offered a tool it would be refused', () => {
+    for (const scope of ['memory:org', 'email:read', 'smartlead:read', 'smartlead:control']) {
+      expect(names(['tools:read', 'tools:execute', scope])).not.toContain('send_gtm_status_report');
+      expect(names([scope])).not.toContain('send_gtm_status_report');
+    }
+  });
+
+  it('the scope lists only that tool (the org memory, Smartlead and mailbox tools stay hidden from a gtm:email key)', () => {
+    const listed = names(['tools:read', 'tools:execute', 'gtm:email']);
+    for (const hidden of ['save_org_memory', 'delete_org_memory', 'read_email', 'list_smartlead_campaigns']) expect(listed).not.toContain(hidden);
+  });
+
+  it('a key that holds only gtm:email is offered the tool it can call, and no read it could not make', () => {
+    const listed = names(['gtm:email']);
+    expect(listed).toContain('send_gtm_status_report');
+    expect(listed).not.toContain('list_memories');
+  });
+
+  it('search does not offer it to a default key, an OAuth client or an anonymous caller (they would be refused)', () => {
+    for (const caller of [KEY(['tools:read', 'tools:execute']), { externalMcp: true, authMethod: 'oauth' }, { externalMcp: true, authMethod: 'anonymous' }]) {
+      expect(find(caller)).not.toContain('send_gtm_status_report');
+    }
+  });
+
+  it('search offers it to a key that holds gtm:email, and to an in-process caller', () => {
+    for (const caller of [KEY(['tools:read', 'tools:execute', 'gtm:email']), undefined, { externalMcp: false }]) {
+      expect(find(caller)).toContain('send_gtm_status_report');
+    }
+  });
+});

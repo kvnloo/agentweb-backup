@@ -457,6 +457,14 @@ export class HubSpotService {
     return this._accountId;
   }
 
+  /**
+   * ENG-2840 (W2-9): the user whose connected account this instance was built from (for an org-shared account, the teammate who
+   * owns it, not the caller), or undefined on the pasted-token path. Read-only; lets the MCP read route say whose account answered.
+   */
+  get ownerUserId(): string | undefined {
+    return this._userId;
+  }
+
   get portalId(): string | undefined {
     return this._portalId;
   }
@@ -1105,13 +1113,17 @@ export class HubSpotService {
   /**
    * Get the IDs of all contacts associated with a deal.
    * Follows pagination cursors to return all contacts, not just the first 100.
+   *
+   * `stopAfter` (ENG-2840 W2-9, the MCP read route): stop paging as soon as MORE than this many ids are held, so the caller can cut to
+   * `stopAfter` and know (from the extra id) that the deal has more, without reading every page. Absent: every page, as before.
    */
-  async getDealContactAssociations(dealId: string): Promise<string[]> {
+  async getDealContactAssociations(dealId: string, opts: { stopAfter?: number } = {}): Promise<string[]> {
     const allIds: string[] = [];
     let after: string | undefined;
     let pages = 0;
     const MAX_PAGES = 20;
     do {
+      if (opts.stopAfter !== undefined && allIds.length > opts.stopAfter) break;
       if (pages++ >= MAX_PAGES) {
         console.warn(`[HubSpot] getDealContactAssociations hit ${MAX_PAGES}-page cap for deal ${dealId}`);
         break;

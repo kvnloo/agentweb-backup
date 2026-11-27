@@ -11,6 +11,7 @@
  * Everything else is refused before any account or X call.
  */
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { withUseWhen } from './zomaUseWhen';
 import { xAdsListAll, xAdsRequest, type XFetch } from '../services/xAdsClient';
 import type { OAuth1Credentials } from '../utils/oauth1';
 
@@ -74,7 +75,7 @@ export function assertXAdsToolkitCall(name: string, args: any): void {
 const ACCOUNT_ID = { type: 'string', description: 'X Ads account id; needed only when more than one is connected.' };
 
 export function getXAdsToolkitManifest() {
-  return [
+  return withUseWhen([
     {
       name: X_ADS_READ_TOOL,
       description:
@@ -151,7 +152,7 @@ export function getXAdsToolkitManifest() {
         additionalProperties: false,
       },
     },
-  ];
+  ]);
 }
 
 // ── Reads ──────────────────────────────────────────────────────────────────────

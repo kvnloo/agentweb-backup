@@ -89,6 +89,24 @@ describe('catalog critical invariants', () => {
     // A missing slug is a loud "unmatched", never a silent wrong match.
     expect(refreshScores(settled, { data: [aa('deepseek-v4-pro', 36)] }, '2026-10-07').reports.join()).toContain(`${old}: AA unmatched`);
   });
+  it('labels a refreshed score with the feed index version so the version-mix warning sees it (ENG-3054)', () => {
+    const id = 'openrouter/z-ai/glm-9.9';
+    const reg = { [id]: { client: null, supportsTemperature: true, provider: 'zai' as const, qualityScore: 1 } };
+    const row = { slug: 'glm-9-9', model_creator: { slug: 'zai' }, evaluations: { artificial_analysis_intelligence_index: 36 } };
+    const v5 = refreshScores(reg, { data: [row], intelligence_index_version: 5 }, '2026-11-25').changes[id].qualityScoreSource;
+    expect(v5).toBe('Artificial Analysis Intelligence Index v5, API v2, snapshot 2026-11-25, glm-9-9 (https://artificialanalysis.ai/)');
+    // No version in the feed: unchanged legacy string.
+    expect(refreshScores(reg, { data: [row] }, '2026-11-25').changes[id].qualityScoreSource)
+      .toBe('Artificial Analysis Intelligence Index, API v2, snapshot 2026-11-25, glm-9-9 (https://artificialanalysis.ai/)');
+    // A refreshed v5 score mixed with a labelled v4 score is now visible to the warning, both ways.
+    const mixed = {
+      fresh: { client: null, supportsTemperature: true, provider: 'deepseek' as const, qualityScore: 36, qualityScoreSource: v5 },
+      old: { client: null, supportsTemperature: true, provider: 'deepseek' as const, qualityScore: 30,
+        qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-10-07, Old, Max' },
+    };
+    expect(refreshScores(mixed, { data: [], intelligence_index_version: 5 }, 'd').reports.join()).toMatch(/AA INDEX VERSION.*1 registry score.*\(old\)/);
+    expect(refreshScores(mixed, { data: [], intelligence_index_version: 4 }, 'd').reports.join()).toMatch(/AA INDEX VERSION.*1 registry score.*\(fresh\)/);
+  });
   it('merges additions into an override Set regardless of existing quote style, and is idempotent (ENG-2293)', () => {
     const singleQuoted = "const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1']);";
     const merged = mergeSetLiteral(singleQuoted, 'explicitCacheOverrides', ['openrouter/new/model-x']);

@@ -6580,7 +6580,7 @@ emmaToolRegistry.register({
               },
               notes: {
                 type: 'string',
-                description: 'Optional notes about what was accomplished or why the step was skipped'
+                description: 'Optional notes about what was accomplished or why the step was skipped. If a required API key is missing, keep status pending and record the exact token reason=no_key in notes; never mark unfinished work completed or skipped.'
               }
             },
             required: ['stepCount', 'status']
@@ -7074,7 +7074,7 @@ output_fields guidance: one entry per distinct data point. Each entry has a snak
       throw new Error('Authentication required: no user context');
     }
     const { runEmmaEnrichment, pickPreviewLeadIds } = await import('./enrichmentToolRunner');
-    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids);
+    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids, context.userId);
     const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,

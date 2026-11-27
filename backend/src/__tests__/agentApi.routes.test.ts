@@ -211,6 +211,48 @@ describe('Agent API Routes', () => {
     });
   });
 
+  describe('POST /api/v1/agent/api-keys gtm:email scope (ENG-2840, emailing GTM reports over MCP)', () => {
+    beforeEach(() => {
+      mockGenerateKey.mockResolvedValue({ rawKey: 'aw_key', keyRecord: { keyId: 'k', keyName: 'K', status: 'active' } });
+    });
+
+    it('grants gtm:email on a regular session, next to the default scopes, deduped', async () => {
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'Hermes', scopes: ['tools:read', 'tools:execute', 'gtm:email', 'gtm:email'] });
+      expect(res.status).toBe(201);
+      expect(mockGenerateKey).toHaveBeenCalledWith('test-user-id', 'Hermes', ['tools:read', 'tools:execute', 'gtm:email'], undefined, undefined);
+    });
+
+    it('refuses gtm:email from a delegated (admin-as-customer) session with 403 and creates no key', async () => {
+      const delegated = express();
+      delegated.use(express.json());
+      delegated.use((req: any, _res, next) => {
+        req.delegateInfo = { adminUserId: 'admin-1', adminEmail: 'a@x.com', isDelegated: true };
+        next();
+      });
+      delegated.use('/api/v1/agent', agentApiRoutes);
+      const res = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read', 'gtm:email'] });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("The 'gtm:email' scope cannot be granted from a delegated session.");
+      expect(mockGenerateKey).not.toHaveBeenCalled();
+      // A delegated session may still mint a key without it.
+      const ok = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read'] });
+      expect(ok.status).toBe(201);
+    });
+
+    it('is not a default scope: a key minted without scopes does not get it', async () => {
+      await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K' });
+      expect(mockGenerateKey.mock.calls[0][2]).toBeUndefined();
+    });
+
+    it('is on the closed list of scopes a key may be minted with, and a made-up scope still is not', async () => {
+      const bad = await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read', 'gtm:everything'] });
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toContain('gtm:email');
+    });
+  });
+
   describe('POST /api/v1/agent/api-keys rateLimitPerMin validation (ENG-2840 W2-2)', () => {
     beforeEach(() => {
       mockGenerateKey.mockResolvedValue({ rawKey: 'aw_key', keyRecord: { keyId: 'k', keyName: 'K', status: 'active' } });

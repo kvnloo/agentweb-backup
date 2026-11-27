@@ -38,7 +38,7 @@ Alternative (no token): `claude mcp add --transport http zoma https://api.agentw
 
 Every tool response ends with the next step to take.
 
-Reads work without a payment method. Changes to ads need a payment method on file and a connected Meta ad account whose connection granted ads management.
+Reads work without a payment method. Changes to ads need a connected Meta ad account whose connection granted ads management, plus a payment method only when the `zoma_status` checklist lists one. `payment.required: false` means no card is needed at this step: never tell the user a payment method is on file unless the checklist says so.
 
 ## Reporting: `zoma_ads_report`
 The first tool for "how are my ads doing?". Spend, impressions, clicks, CTR, CPC, conversions and ROAS per campaign (or `level: "account"` for one total), read-only.
@@ -53,7 +53,7 @@ The first tool for "how are my ads doing?". Spend, impressions, clicks, CTR, CPC
 - With more than one connected ad account, pass `account_id`.
 
 ## Creatives: upload your own images and videos
-Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Canva, a designer). You don't need Ads Manager. These calls need no preview because an asset or creative can't spend anything until an ad uses it. They still need the payment method, the Meta connection and ads management.
+Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Canva, a designer). You don't need Ads Manager. These calls need no preview because an asset or creative can't spend anything until an ad uses it. They still need the Meta connection and ads management, plus a payment method only when `zoma_status` lists one.
 
 1. **Get the file to Meta.**
    - The file already has a public `https` URL (a CDN link, or the direct `.mp4` link of a UGC video): skip to step 2 and pass that URL. A link to a post page (TikTok, Instagram, YouTube) is a web page, not a file; Zoma refuses it, so download the file and use `zoma_prepare_upload`.

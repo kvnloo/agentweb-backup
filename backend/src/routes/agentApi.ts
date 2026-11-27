@@ -4,6 +4,7 @@ import { agentApiKeyService } from "../services/agentApiKeyService";
 import {
   API_KEY_SCOPE_EMAIL_READ,
   API_KEY_SCOPE_EXECUTE,
+  API_KEY_SCOPE_GTM_EMAIL,
   API_KEY_SCOPE_MEMORY_ORG,
   API_KEY_SCOPE_READ,
   API_KEY_SCOPE_SMARTLEAD_CONTROL,
@@ -17,6 +18,7 @@ const GRANTABLE_API_KEY_SCOPES: readonly string[] = [
   API_KEY_SCOPE_SMARTLEAD_READ,
   API_KEY_SCOPE_SMARTLEAD_CONTROL,
   API_KEY_SCOPE_MEMORY_ORG,
+  API_KEY_SCOPE_GTM_EMAIL,
 ];
 
 /** Highest per-minute rate a key may be minted with: ten times the default of 60, far above what any agent has used (prod: 60 and 10). */
@@ -76,6 +78,12 @@ router.post(
         if (scopes.includes(API_KEY_SCOPE_MEMORY_ORG) && authReq.delegateInfo?.isDelegated) {
           return res.status(403).json({
             error: `The '${API_KEY_SCOPE_MEMORY_ORG}' scope cannot be granted from a delegated session.`,
+          });
+        }
+        // A GTM report is emailed from AgentWeb to the people on the customer's plan: the account owner grants that, not someone acting for them.
+        if (scopes.includes(API_KEY_SCOPE_GTM_EMAIL) && authReq.delegateInfo?.isDelegated) {
+          return res.status(403).json({
+            error: `The '${API_KEY_SCOPE_GTM_EMAIL}' scope cannot be granted from a delegated session.`,
           });
         }
         // Same for the customer's own Smartlead account: the customer grants it, not someone acting for them.

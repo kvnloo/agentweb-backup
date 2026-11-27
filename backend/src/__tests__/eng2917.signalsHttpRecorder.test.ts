@@ -77,7 +77,8 @@ describe('ENG-2917 HTTP signals recorder and local-error boundary', () => {
       const response = await request(app).post('/tools/ads_get_datasets/call').set('Authorization', 'Bearer aw_fixture').send({ args: { account_id: '123' } });
       expect(response.status).toBe(500);
       expect(paths).toHaveLength(0);
-      expect(response.body).toEqual({ error: 'Meta Toolkit call failed.' });
+      expect(response.body.error).toMatch(/^Meta Toolkit call failed: internal error \(TypeError\)/);
+      expect(response.body.error).not.toMatch(/local implementation defect/);
     } finally { spy.mockRestore(); log.mockRestore(); }
   });
 

@@ -11,6 +11,16 @@ import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
 import { McpOAuthClientProvider, getServerConfig } from "./mcpOAuthClientProvider";
 import { buildMcpToolTelemetry } from "./mcpToolTelemetry";
+import { buildStdioChildEnv } from "./stdioChildEnv";
+import {
+  PLAYWRIGHT_WORK_ROOT,
+  browserNavigationRefusal,
+  isAbandonedPlaywrightWorkDir,
+  playwrightChildEnv,
+  playwrightWorkDirPrefix,
+  processIsAlive,
+  withoutBrowserClientMeta,
+} from "./playwrightContainment";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -258,6 +268,10 @@ export class McpClientService {
   // Generated Playwright --config / stealth-script files, by pool key, so they can be
   // deleted along with the pool that owns them.
   private playwrightConfigFiles: Map<string, Set<string>> = new Map();
+  /** ENG-3187: each browser server's own fresh working and output folder, found again by its transport so releasing a pool removes exactly its own folder. */
+  private playwrightTransportDirs: WeakMap<object, string> = new WeakMap();
+  /** Every working folder this process made and has not removed yet (what a shutdown must clean up). */
+  private playwrightLiveWorkDirs: Set<string> = new Set();
 
   // Session cleanup timeout (default: 1 hour)
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
@@ -377,20 +391,24 @@ export class McpClientService {
         timeout,
       ]);
     } catch (error) {
-      await this.closeClient(client);
+      await this.closeClient(client, transport);
       throw error;
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
 
-  private async closeClient(client: Client): Promise<void> {
+  private async closeClient(client: Client, transport?: unknown): Promise<void> {
+    // ENG-3187: the client forgets its transport when it closes (or when the child process exits by itself), so the caller's own transport is preferred
+    // and the client's is taken before closing; the working folder goes with it.
+    const ownTransport = transport ?? (client as any)._transport;
     try {
       await client.close();
     } catch (error) {
       // Preserve the original lifecycle error while making cleanup failures visible.
       console.error('MCP: Failed to close client during lifecycle cleanup:', error);
     }
+    this.removePlaywrightWorkDirOf(ownTransport);
   }
 
   private async evictSessionClient(poolKey: string, serverName: string, expectedClient?: Client): Promise<void> {
@@ -399,11 +417,13 @@ export class McpClientService {
     if (!pool || !client || (expectedClient && client !== expectedClient)) return;
 
     pool.clients.delete(serverName);
+    const transport = (client as any)._transport;
     try {
       await client.close();
     } catch (error) {
       console.error(`[MCP-SESSION] Error closing evicted client for ${serverName}:`, error);
     }
+    this.removePlaywrightWorkDirOf(transport);
   }
 
   /**
@@ -416,6 +436,7 @@ export class McpClientService {
     // Clear Playwright configs orphaned by a previous process that died without releasing
     // its pools; the per-pool cleanup can't reach those.
     this.sweepStalePlaywrightConfigs();
+    this.sweepStalePlaywrightWorkDirs();
     try {
       // 1. Load Internal Config (from code)
       // Skip servers marked isInternal: true — they connect back to ourselves
@@ -561,6 +582,60 @@ export class McpClientService {
   }
 
   /**
+   * ENG-3187: what a browser tool call may send. The navigate tool opens public web pages only (a refusal throws, and is never retried), and a browser call
+   * carries no `_meta` (see withoutBrowserClientMeta). Any other tool's arguments come back as an unchanged copy.
+   */
+  private async prepareBrowserCall(toolName: string, args: unknown, who?: { userId?: string; sessionId?: string }): Promise<Record<string, unknown>> {
+    const refusal = await browserNavigationRefusal(toolName, args, { who: who ? { userId: who.userId, sessionId: who.sessionId } : undefined });
+    if (refusal) throw new Error(refusal);
+    return withoutBrowserClientMeta(toolName, args);
+  }
+
+  /**
+   * ENG-3187: make the browser server's own fresh working and output folder (mode 0700). The server runs inside it, and Playwright confines the
+   * browser's file tools to its working folder, so they no longer reach the backend's own folder. Every server gets a folder of its own, named after
+   * this process, so releasing one pool never touches another's and a sweep can tell a live owner from a dead one.
+   */
+  private createPlaywrightWorkDir(poolKey: string | undefined, name: string): string {
+    fs.mkdirSync(PLAYWRIGHT_WORK_ROOT, { recursive: true, mode: 0o700 });
+    const root = fs.lstatSync(PLAYWRIGHT_WORK_ROOT);
+    // /tmp is shared: refuse a root that is a link, or that someone else made.
+    if (!root.isDirectory() || (typeof process.getuid === 'function' && root.uid !== process.getuid())) {
+      throw new Error(`MCP: ${PLAYWRIGHT_WORK_ROOT} is not a folder owned by this process; refusing to start the browser server in it`);
+    }
+    const dir = fs.mkdtempSync(path.join(PLAYWRIGHT_WORK_ROOT, playwrightWorkDirPrefix(poolKey || name)));
+    this.playwrightLiveWorkDirs.add(dir);
+    return dir;
+  }
+
+  /** Best-effort delete of one working folder. */
+  private removePlaywrightWorkDir(dir: string): void {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      this.playwrightLiveWorkDirs.delete(dir);
+    } catch (error) {
+      console.warn(`MCP: Could not remove Playwright working folder ${dir}:`, (error as Error).message);
+    }
+  }
+
+  /** For a caller that built a transport with createTransport and manages its client itself: remove that transport's working folder once it is done. */
+  public releaseTransportResources(transport: unknown): void {
+    this.removePlaywrightWorkDirOf(transport);
+  }
+
+  /** Delete the folder that belongs to this transport (a no-op for any other). */
+  private removePlaywrightWorkDirOf(transport: unknown): void {
+    if (!transport || typeof transport !== 'object') return;
+    const dir = this.playwrightTransportDirs.get(transport);
+    if (dir) this.removePlaywrightWorkDir(dir);
+  }
+
+  /** Delete every working folder this process made (shutdown). */
+  private removeAllPlaywrightWorkDirs(): void {
+    for (const dir of Array.from(this.playwrightLiveWorkDirs)) this.removePlaywrightWorkDir(dir);
+  }
+
+  /**
    * Sweep Playwright config files old enough that no live process can still be reading them.
    * Covers the case our per-pool cleanup cannot: a hard kill (SIGKILL/OOM) that leaves the
    * files with no pool to release them.
@@ -587,6 +662,37 @@ export class McpClientService {
       }
     } catch (error) {
       console.warn('MCP: Failed to sweep stale Playwright MCP config files:', (error as Error).message);
+    }
+  }
+
+  /**
+   * ENG-3187: the same hard-kill leftovers sweep for the browser servers' working folders. A folder is removed only when the process that made it is gone
+   * (a live process's folders are never touched, however old); a folder with no owner in its name is removed when it is a week old.
+   */
+  private sweepStalePlaywrightWorkDirs(): void {
+    const root = PLAYWRIGHT_WORK_ROOT;
+    try {
+      if (!fs.existsSync(root)) return;
+      const now = Date.now();
+      const processStartMs = now - process.uptime() * 1000;
+      const liveNames = new Set(Array.from(this.playwrightLiveWorkDirs).map((dir) => path.basename(dir)));
+      let removed = 0;
+      for (const entry of fs.readdirSync(root)) {
+        const dir = path.join(root, entry);
+        try {
+          if (isAbandonedPlaywrightWorkDir(entry, fs.statSync(dir).mtimeMs, now, process.pid, processIsAlive, liveNames, processStartMs)) {
+            fs.rmSync(dir, { recursive: true, force: true });
+            removed++;
+          }
+        } catch {
+          // Raced with another process cleaning the same folder — nothing to do.
+        }
+      }
+      if (removed > 0) {
+        console.log(`MCP: Swept ${removed} abandoned Playwright working folder(s) from ${root}`);
+      }
+    } catch (error) {
+      console.warn('MCP: Failed to sweep abandoned Playwright working folders:', (error as Error).message);
     }
   }
 
@@ -910,6 +1016,8 @@ export class McpClientService {
     const transportType = getTransportType(serverConfig.config);
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
     transport.onclose = () => {
+      // ENG-3187: the child process is gone, so its working folder is too (the client forgets its transport on this event, so nothing else could find it).
+      this.removePlaywrightWorkDirOf(transport);
       console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
       const pool = this.sessionClientPools.get(poolKey);
       if (pool?.clients.get(serverName) === client) {
@@ -983,6 +1091,8 @@ export class McpClientService {
               }
             },
             execute: async (args: any, context: ToolContext) => {
+              // ENG-3187: the navigate tool opens public web pages only, and a browser call carries no `_meta`. Done once, before the retry loop, so a refusal is never retried.
+              const callArgs = await this.prepareBrowserCall(originalToolName, args, context);
               const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
               let lastError: unknown;
               // ENG-3170: a browser call of a share-link visitor who may not use the owner's logins is pooled under a session id of its own.
@@ -990,7 +1100,7 @@ export class McpClientService {
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 let sessionClient: Client | undefined;
                 try {
-                  const toolArgs = { ...args };
+                  const toolArgs = { ...callArgs };
                   if (isInternal) {
                     Object.assign(toolArgs, {
                       userId: context.userId,
@@ -1073,13 +1183,13 @@ export class McpClientService {
         console.log(`[MCP-SESSION] Discovered tools for secret-placeholder server "${serverName}"`);
       } catch (error) {
         console.error(`[MCP-SESSION] Failed to discover tools for "${serverName}":`, error);
-        await this.closeClient(client);
+        await this.closeClient(client, transport);
         throw error;
       }
     }
 
     if (sessionPool.released) {
-      await this.closeClient(client);
+      await this.closeClient(client, transport);
       throw new Error(`MCP: Client pool "${poolKey}" was released while connecting to "${serverName}"`);
     }
 
@@ -1138,11 +1248,15 @@ export class McpClientService {
     console.log(`[MCP-SESSION] Releasing ${sessionPool.clients.size} client(s) for session: ${poolKey.substring(0, 8)}`);
 
     for (const [serverName, client] of sessionPool.clients.entries()) {
+      // The client forgets its transport when it closes, so take it first.
+      const transport = (client as any)._transport;
       try {
         await client.close();
       } catch (error) {
         console.error(`[MCP-SESSION] Error closing client for ${serverName}:`, error);
       }
+      // ENG-3187: only this client's own working folder, never one a newer pool of the same session has made since.
+      this.removePlaywrightWorkDirOf(transport);
     }
 
     await Promise.allSettled(sessionPool.pendingClients.values());
@@ -1323,6 +1437,7 @@ export class McpClientService {
   private createStdioTransport(name: string, config: StdioTransportConfig, poolKey?: string): Transport {
     let resolvedCommand = resolveEnvPlaceholders(config.command);
     let resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
+    let playwrightWorkDir: string | undefined;
 
     // Auto-configure Playwright MCP for headless server environments
     const isPlaywrightMcp =
@@ -1419,6 +1534,11 @@ export class McpClientService {
         // chat session, not per user, so leaving them behind grows /tmp without bound.
         this.trackPlaywrightConfigFiles(poolKey, [configPath, stealthScriptPath]);
       }
+      // ENG-3187: the browser server works in its own fresh folder (also its output folder), not in the backend's.
+      playwrightWorkDir = this.createPlaywrightWorkDir(poolKey, name);
+      if (!resolvedArgs.some(arg => arg === '--output-dir' || arg.startsWith('--output-dir='))) {
+        resolvedArgs.push('--output-dir', playwrightWorkDir);
+      }
       console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox --isolated and --config for ${name}`);
     }
 
@@ -1432,11 +1552,17 @@ export class McpClientService {
 
     console.log(`MCP: Creating Stdio transport for ${name} with command: ${resolvedCommand} ${resolvedArgs.join(' ')}`);
     
-    return new StdioClientTransport({
+    const transport = new StdioClientTransport({
       command: resolvedCommand,
       args: resolvedArgs,
-      env: { ...process.env, ...resolvedEnv } as Record<string, string>
+      // ENG-3187: a browser server gets only the variables a headless browser needs (and its own folder); every other stdio server gets the shared allow-list. Neither is handed the backend's secrets.
+      env: isPlaywrightMcp
+        ? playwrightChildEnv(process.env, resolvedEnv)
+        : buildStdioChildEnv(process.env, resolvedEnv),
+      ...(playwrightWorkDir ? { cwd: playwrightWorkDir } : {}),
     });
+    if (playwrightWorkDir) this.playwrightTransportDirs.set(transport, playwrightWorkDir);
+    return transport;
   }
 
   /**
@@ -1575,7 +1701,11 @@ export class McpClientService {
 
     // Stdio subprocesses (e.g. Playwright) need more time to start than HTTP servers
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
-    transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
+    transport.onclose = () => {
+      // ENG-3187: the child process is gone, so its working folder is too.
+      this.removePlaywrightWorkDirOf(transport);
+      console.warn(`MCP: Transport for ${name} closed`);
+    };
     transport.onerror = (err: any) => {
       // Suppress expected errors during shutdown/reload
       const errorMessage = err?.message || '';
@@ -1611,7 +1741,7 @@ export class McpClientService {
 
     // Discover tools
     const response = await client.listTools().catch(async error => {
-      await this.closeClient(client);
+      await this.closeClient(client, transport);
       throw error;
     });
     this.clients.set(name, client);
@@ -1633,6 +1763,8 @@ export class McpClientService {
           }
         },
         execute: async (args: any, context: ToolContext) => {
+          // ENG-3187: the navigate tool opens public web pages only, and a browser call carries no `_meta`. Done once, before the retry loop, so a refusal is never retried.
+          const callArgs = await this.prepareBrowserCall(originalToolName, args, context);
           const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
           let lastError: unknown;
           // ENG-3170: a browser call of a share-link visitor who may not use the owner's logins is pooled under a session id of its own.
@@ -1641,7 +1773,7 @@ export class McpClientService {
             let sessionClient: Client | undefined;
             try {
               // Conditionally inject technical parameters if server is internal
-              const toolArgs = { ...args };
+              const toolArgs = { ...callArgs };
               if (isInternal) {
                 Object.assign(toolArgs, {
                   userId: context.userId,
@@ -1799,6 +1931,8 @@ export class McpClientService {
       throw new Error(`MCP server not found: ${serverName}`);
     }
 
+    // ENG-3187: a refused call must not start a server first.
+    const preparedArgs = await this.prepareBrowserCall(toolName, args);
     const transport = await this.createTransport(serverName, config as any);
     const client = new Client(
       { name: "AgentWeb-Backend", version: "1.0.0" },
@@ -1811,12 +1945,12 @@ export class McpClientService {
       connected = true;
 
       return await client.callTool(
-        { name: toolName, arguments: args },
+        { name: toolName, arguments: preparedArgs },
         undefined,
         { timeout: options?.timeoutMs ?? 3600000 }
       );
     } finally {
-      if (connected) await this.closeClient(client);
+      if (connected) await this.closeClient(client, transport);
     }
   }
 
@@ -1853,6 +1987,7 @@ export class McpClientService {
       // app-level cap. We race against our own timer that both aborts the request
       // (via signal) AND rejects, so a dead/aborted stream fails deterministically.
       const callTool = async (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) => {
+        const preparedArgs = await this.prepareBrowserCall(toolName, args);
         const timeoutMs = opts?.timeoutMs ?? 3600000;
         const controller = new AbortController();
         let timer: NodeJS.Timeout | undefined;
@@ -1864,7 +1999,7 @@ export class McpClientService {
         });
         try {
           return await Promise.race([
-            client.callTool({ name: toolName, arguments: args }, undefined, {
+            client.callTool({ name: toolName, arguments: preparedArgs }, undefined, {
               timeout: timeoutMs,
               signal: controller.signal,
             }),
@@ -1877,7 +2012,7 @@ export class McpClientService {
 
       return await fn(callTool);
     } finally {
-      if (connected) await this.closeClient(client);
+      if (connected) await this.closeClient(client, transport);
     }
   }
 
@@ -1916,6 +2051,8 @@ export class McpClientService {
       }
     }
     this.clients.clear();
+    // ENG-3187: the shared servers' folders, and any folder of a client that never made it into a pool.
+    this.removeAllPlaywrightWorkDirs();
     this.mcpTools = [];
     this.serverConfigs.clear();
     this.serversWithSecretPlaceholders.clear();
