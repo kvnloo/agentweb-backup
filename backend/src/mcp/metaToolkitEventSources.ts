@@ -167,8 +167,13 @@ export async function runMetaEventSourceTool(
   };
   const account = `act_${String(accountId).replace(/^act_/, '')}`;
 
-  const { businessId, catalogs } = await readBusinessCatalogs(read, accountId);
-  if (!businessId) throw new MetaToolkitRefusal('This ad account is not in a Meta Business portfolio, so it has no product catalogs.');
+  // get_health reads the business best-effort, after the pixel's firing state (which needs no business).
+  let catalogs = new Map<string, any>();
+  if (name !== 'meta_event_source_get_health') {
+    const business = await readBusinessCatalogs(read, accountId);
+    if (!business.businessId) throw new MetaToolkitRefusal('This ad account is not in a Meta Business portfolio, so it has no product catalogs.');
+    catalogs = business.catalogs;
+  }
 
   const ownedCatalog = (raw: unknown): string => {
     const id = String(raw ?? '');
@@ -236,7 +241,17 @@ export async function runMetaEventSourceTool(
       assertOnlyKeys(args, ['account_id', 'pixel_id']);
       const { id, pixel } = await ownedPixel(args.pixel_id);
       const { state, events_last_24h: eventsLast24h } = await pixelState(pixel, deps.now());
-      const connectedCatalogs = await catalogsOf(id);
+      let catalogsUnavailable: string | null = null;
+      try {
+        const business = await readBusinessCatalogs(read, accountId);
+        if (business.businessId) catalogs = business.catalogs;
+        else catalogsUnavailable = 'not in a Meta Business portfolio';
+      } catch (error: any) {
+        catalogsUnavailable = /business_management/i.test(String(error?.message))
+          ? 'missing business_management permission'
+          : `could not read the ad account's business (${String(error?.message ?? 'Meta request failed')})`;
+      }
+      const connectedCatalogs = catalogsUnavailable ? null : await catalogsOf(id);
       return {
         account_id: accountId, pixel_id: id, name: pixel?.name ?? null, state,
         last_fired_time: pixel?.last_fired_time ?? null,
@@ -245,7 +260,8 @@ export async function runMetaEventSourceTool(
           ? { state_source: 'event_stats', note: `Meta's last_fired_time is stale, but its event stats show ${eventsLast24h} events in the last 24 hours, so the pixel is firing.` }
           : {}),
         connected_catalogs: connectedCatalogs,
-        healthy: state === 'ACTIVE' && connectedCatalogs.length > 0,
+        ...(catalogsUnavailable ? { connected_catalogs_reason: catalogsUnavailable } : {}),
+        healthy: connectedCatalogs === null ? null : state === 'ACTIVE' && connectedCatalogs.length > 0,
       };
     }
 
