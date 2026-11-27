@@ -45,10 +45,14 @@ export type GoogleReadKind =
   | 'budget' | 'campaign' | 'ad_group' | 'campaign_conversion_goal'
   | 'keyword' | 'ad' | 'asset' | 'asset_group'
   /** Multi-row reads (arrays / aggregates), keyed by the parent's resource name. */
-  | 'ad_group_keywords' | 'campaign_negative_keywords' | 'campaign_brand';
+  | 'ad_group_keywords' | 'campaign_negative_keywords' | 'campaign_brand' | 'campaign_conversion_goals';
 
 export interface GoogleBudgetState { resourceName: string; name?: string; amountMicros: number; explicitlyShared: boolean; referenceCount: number; status?: string }
-export interface GoogleCampaignState { resourceName: string; name?: string; status: string; budget?: string; channelType?: string }
+export interface GoogleCampaignState {
+  resourceName: string; name?: string; status: string; budget?: string; channelType?: string;
+  /** network_settings (proto3 JSON omits false, so absent reads as false). */
+  searchPartners?: boolean; displayNetwork?: boolean;
+}
 export interface GoogleAdGroupState { resourceName: string; name?: string; status: string; campaign?: string; cpcBidMicros?: number }
 export interface GoogleKeywordState { resourceName: string; text: string; matchType: string; status?: string; negative: boolean; adGroup?: string }
 export interface GoogleAdState { resourceName: string; status: string; type?: string; adGroup?: string; finalUrls?: string[]; headlines?: string[]; descriptions?: string[] }
@@ -88,15 +92,17 @@ const RESOURCE: Record<GoogleReadKind, string> = {
   budget: 'campaignBudgets', campaign: 'campaigns', ad_group: 'adGroups', campaign_conversion_goal: 'campaignConversionGoals',
   keyword: 'adGroupCriteria', ad: 'adGroupAds', asset: 'assets', asset_group: 'assetGroups',
   ad_group_keywords: 'adGroups', campaign_negative_keywords: 'campaigns', campaign_brand: 'campaigns',
+  campaign_conversion_goals: 'campaigns',
 };
 /** Composite ids (`<adGroupId>~<id>`); every other resource is a bare numeric id. */
 const COMPOSITE_ID: Partial<Record<GoogleReadKind, true>> = { keyword: true, ad: true };
-const MULTI_ROW: Partial<Record<GoogleReadKind, true>> = { ad_group_keywords: true, campaign_negative_keywords: true, campaign_brand: true };
+const MULTI_ROW: Partial<Record<GoogleReadKind, true>> = { ad_group_keywords: true, campaign_negative_keywords: true, campaign_brand: true, campaign_conversion_goals: true };
 const KEYWORD_FIELDS = 'ad_group_criterion.resource_name, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group_criterion.negative, ad_group_criterion.ad_group';
 const GAQL: Record<GoogleReadKind, string> = {
   campaign_conversion_goal: 'SELECT campaign.name, campaign_conversion_goal.resource_name, campaign_conversion_goal.campaign, campaign_conversion_goal.category, campaign_conversion_goal.origin, campaign_conversion_goal.biddable FROM campaign_conversion_goal WHERE campaign_conversion_goal.resource_name = ',
   budget: 'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count, campaign_budget.status FROM campaign_budget WHERE campaign_budget.resource_name = ',
-  campaign: 'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.campaign_budget, campaign.advertising_channel_type FROM campaign WHERE campaign.resource_name = ',
+  campaign: 'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.campaign_budget, campaign.advertising_channel_type, campaign.network_settings.target_search_network, campaign.network_settings.target_content_network FROM campaign WHERE campaign.resource_name = ',
+  campaign_conversion_goals: 'SELECT campaign.name, campaign_conversion_goal.resource_name, campaign_conversion_goal.campaign, campaign_conversion_goal.category, campaign_conversion_goal.origin, campaign_conversion_goal.biddable FROM campaign_conversion_goal WHERE campaign_conversion_goal.campaign = ',
   ad_group: 'SELECT ad_group.resource_name, ad_group.name, ad_group.status, ad_group.campaign, ad_group.cpc_bid_micros FROM ad_group WHERE ad_group.resource_name = ',
   keyword: `SELECT ${KEYWORD_FIELDS} FROM ad_group_criterion WHERE ad_group_criterion.resource_name = `,
   ad: 'SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad_group, ad_group_ad.ad.type, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.resource_name = ',
@@ -117,7 +123,7 @@ export function isCustomerResource(customerId: string, kind: GoogleReadKind, val
 
 export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
   if (!row) return null;
-  if (kind === 'campaign_conversion_goal') {
+  if (kind === 'campaign_conversion_goal' || kind === 'campaign_conversion_goals') {
     const g = row.campaignConversionGoal;
     // ENG-2995: Google Ads REST (proto3 JSON) omits `false` booleans, so a non-biddable goal
     // arrives with no `biddable` field. The query selects it, so absent means false.
@@ -134,7 +140,10 @@ export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
   }
   if (kind === 'campaign') {
     const c = row.campaign;
-    return c?.resourceName ? ({ resourceName: c.resourceName, name: c.name, status: c.status, budget: c.campaignBudget, channelType: c.advertisingChannelType } as GoogleCampaignState) : null;
+    return c?.resourceName ? ({
+      resourceName: c.resourceName, name: c.name, status: c.status, budget: c.campaignBudget, channelType: c.advertisingChannelType,
+      searchPartners: c.networkSettings?.targetSearchNetwork === true, displayNetwork: c.networkSettings?.targetContentNetwork === true,
+    } as GoogleCampaignState) : null;
   }
   if (kind === 'keyword' || kind === 'ad_group_keywords') {
     const k = row.adGroupCriterion;
@@ -196,6 +205,22 @@ const defaultDeps: GoogleToolkitWriteDeps = {
   consumedTokens: defaultConsumedTokenStore,
 };
 
+/** CAMPAIGN CREATE preview: the strategy with its target and CPC cap, in the account currency. */
+function biddingLabel(args: any, currency: string): string {
+  if (args.bidding_strategy_resource_name) return `portfolio strategy ${args.bidding_strategy_resource_name}`;
+  const s = String(args.bidding_strategy);
+  const t = args.bidding_strategy_target;
+  const money = (major: number) => formatMicros(Math.round(major * 1_000_000), currency);
+  const parts: string[] = [];
+  if (t !== undefined && (s === 'MAXIMIZE_CONVERSIONS' || s === 'TARGET_CPA')) parts.push(`target CPA ${money(Number(t))}`);
+  if (t !== undefined && (s === 'MAXIMIZE_CONVERSION_VALUE' || s === 'TARGET_ROAS')) parts.push(`target ROAS ${t} (${Math.round(Number(t) * 100)}%)`);
+  if (s === 'TARGET_IMPRESSION_SHARE') parts.push(`${Math.round(Number(t ?? 1) * 100)}% impression share`);
+  if (args.cpc_bid_ceiling !== undefined) parts.push(`max CPC cap ${money(Number(args.cpc_bid_ceiling))}`);
+  else if (s === 'TARGET_IMPRESSION_SHARE') parts.push(`max CPC cap ${money(100)} (default)`);
+  else if (s === 'TARGET_SPEND') parts.push('no max CPC cap');
+  return `${s}${parts.length ? ` (${parts.join(', ')})` : ''}`;
+}
+
 function currencyDigits(currency: string): number {
   try {
     return new Intl.NumberFormat('en-US', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
@@ -243,7 +268,7 @@ interface ValidatedWrite {
   budgetMicros?: number;
   expectedStatus?: 'ENABLED' | 'PAUSED';
   /** ENG-2959: CAMPAIGN / AD_GROUP non-status UPDATE — the values the read-back must show. */
-  expectedEdit?: { name?: string; cpcBidMicros?: number };
+  expectedEdit?: { name?: string; cpcBidMicros?: number; searchPartners?: boolean; displayNetwork?: boolean };
   /** ENG-2979: AD UPDATE responsive search ad content — the values the read-back must show. */
   expectedAdContent?: { headlines?: string[]; descriptions?: string[]; finalUrl?: string };
   /** KEYWORD ADD / ADD_NEGATIVE: what the read-back of the parent's keyword list must contain. */
@@ -274,8 +299,8 @@ const ALLOWED: Record<string, string[]> = {
   'CAMPAIGN_CONVERSION_GOAL UPDATE': ['resource_name', 'biddable'],
   'BUDGET CREATE': ['name', 'amount', 'explicitly_shared'],
   'BUDGET UPDATE': ['budget_resource_name', 'amount'],
-  'CAMPAIGN CREATE': ['name', 'type', 'budget_resource_name', 'bidding_strategy', 'bidding_strategy_resource_name', 'bidding_strategy_target', 'cpc_bid_ceiling', 'location_target_ids', 'status', 'brand_business_name', 'brand_logo_asset_resource_name'],
-  'CAMPAIGN UPDATE': ['campaign_resource_name', 'status', 'name'],
+  'CAMPAIGN CREATE': ['name', 'type', 'budget_resource_name', 'bidding_strategy', 'bidding_strategy_resource_name', 'bidding_strategy_target', 'cpc_bid_ceiling', 'location_target_ids', 'status', 'brand_business_name', 'brand_logo_asset_resource_name', 'target_search_network', 'target_content_network'],
+  'CAMPAIGN UPDATE': ['campaign_resource_name', 'status', 'name', 'target_search_network', 'target_content_network'],
   'AD_GROUP CREATE': ['name', 'campaign_resource_name', 'type', 'cpc_bid', 'status'],
   'AD_GROUP UPDATE': ['ad_group_resource_name', 'status', 'name', 'cpc_bid'],
   'KEYWORD ADD': ['ad_group_resource_name', 'keywords', 'status'],
@@ -382,16 +407,23 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
   };
   /** ENG-2959: CAMPAIGN UPDATE (status | name) and AD_GROUP UPDATE (status | name and/or cpc_bid). */
   const statusOrEdit = (kind: 'campaign' | 'ad_group', field: string): ValidatedWrite => {
-    const edits = kind === 'campaign' ? ['name'] : ['name', 'cpc_bid'];
+    const edits = kind === 'campaign' ? ['name', 'target_search_network', 'target_content_network'] : ['name', 'cpc_bid'];
     const present = edits.filter((k) => args[k] !== undefined);
     if (args.status !== undefined) {
       need(!present.length, `status must be sent alone. Change ${present.join(' / ')} in a separate ${op} preview and approval.`);
       return statusOnly(kind, field);
     }
-    need(present.length > 0, `${op} requires status${kind === 'campaign' ? ' or name' : ', name or cpc_bid'}.`);
+    need(present.length > 0, `${op} requires status${kind === 'campaign' ? ', name, target_search_network or target_content_network' : ', name or cpc_bid'}.`);
     const rn = resource(kind, field);
     const dispatchArgs: Record<string, unknown> = { ...base, [field]: rn };
-    const expectedEdit: { name?: string; cpcBidMicros?: number } = {};
+    const expectedEdit: NonNullable<ValidatedWrite['expectedEdit']> = {};
+    for (const key of ['target_search_network', 'target_content_network'] as const) {
+      if (args[key] === undefined) continue;
+      need(typeof args[key] === 'boolean', `${key} must be true or false.`);
+      dispatchArgs[key] = args[key];
+      if (key === 'target_search_network') expectedEdit.searchPartners = args[key];
+      else expectedEdit.displayNetwork = args[key];
+    }
     if (args.name !== undefined) {
       need(nonBlank(args.name) && chars(args.name.trim()) <= 255, 'name must be a non-empty string of at most 255 characters.');
       dispatchArgs.name = expectedEdit.name = (args.name as string).trim();
@@ -423,7 +455,11 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     case 'CAMPAIGN CREATE': {
       createdPaused();
       need(nonBlank(args.name), 'CAMPAIGN CREATE requires name.');
-      need(['SEARCH', 'DISPLAY', 'PERFORMANCE_MAX'].includes(args.type), 'type must be SEARCH, DISPLAY or PERFORMANCE_MAX.');
+      // Display is not offered: Zoma cannot create Display ads, so a Display campaign could never serve.
+      need(['SEARCH', 'PERFORMANCE_MAX'].includes(args.type), 'type must be SEARCH or PERFORMANCE_MAX (Display campaigns are not available in Zoma).');
+      for (const key of ['target_search_network', 'target_content_network']) {
+        need(args[key] === undefined || (args.type === 'SEARCH' && typeof args[key] === 'boolean'), `${key} applies to SEARCH campaigns only and must be true or false.`);
+      }
       // Performance Max requires its brand (business name + logo) at the campaign level, created
       // atomically with the campaign — without them the campaign can never serve (ENG-2928).
       if (args.type === 'PERFORMANCE_MAX') {
@@ -451,6 +487,13 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
           cpc_bid_ceiling_micros: args.cpc_bid_ceiling === undefined ? undefined : positiveMicros(args.cpc_bid_ceiling, currency, 'cpc_bid_ceiling'),
           location_target_ids: args.location_target_ids, status: 'PAUSED',
           brand_business_name: args.brand_business_name, brand_logo_asset_resource_name: args.brand_logo_asset_resource_name,
+          // Search campaigns are Google Search only unless the caller opts in: Google's own create
+          // default also serves on search partners and the Display Network.
+          ...(args.type === 'SEARCH' ? {
+            target_google_search: true,
+            target_search_network: args.target_search_network === true,
+            target_content_network: args.target_content_network === true,
+          } : {}),
         },
         expectedStatus: 'PAUSED',
       };
@@ -460,7 +503,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     case 'AD_GROUP CREATE': {
       createdPaused();
       need(nonBlank(args.name), 'AD_GROUP CREATE requires name.');
-      need(['SEARCH_STANDARD', 'DISPLAY_STANDARD'].includes(args.type), 'type must be SEARCH_STANDARD or DISPLAY_STANDARD.');
+      need(args.type === 'SEARCH_STANDARD', 'type must be SEARCH_STANDARD (Display ad groups are not available in Zoma).');
       const campaign = resource('campaign', 'campaign_resource_name');
       return {
         dispatchArgs: {
@@ -637,6 +680,8 @@ function verify(validated: ValidatedWrite, entity: string, readBack: any | null)
   if (validated.expectedEdit) {
     const e = validated.expectedEdit;
     if (e.name !== undefined && readBack.name !== e.name) return 'MISMATCH';
+    if (e.searchPartners !== undefined && (readBack.searchPartners === true) !== e.searchPartners) return 'MISMATCH';
+    if (e.displayNetwork !== undefined && (readBack.displayNetwork === true) !== e.displayNetwork) return 'MISMATCH';
     if (e.cpcBidMicros !== undefined) {
       if (!Number.isFinite(readBack.cpcBidMicros)) return 'UNCONFIRMED';
       if (readBack.cpcBidMicros !== e.cpcBidMicros) return 'MISMATCH';
@@ -644,6 +689,11 @@ function verify(validated: ValidatedWrite, entity: string, readBack: any | null)
     return 'CONFIRMED';
   }
   if (readBack.status !== validated.expectedStatus) return 'MISMATCH';
+  if (entity === 'CAMPAIGN' && validated.dispatchArgs.action === 'CREATE' && validated.dispatchArgs.target_content_network !== undefined) {
+    // Google's REST JSON omits false booleans, so an absent setting reads as off.
+    if ((readBack.searchPartners === true) !== validated.dispatchArgs.target_search_network) return 'MISMATCH';
+    if ((readBack.displayNetwork === true) !== validated.dispatchArgs.target_content_network) return 'MISMATCH';
+  }
   if (entity === 'AD' && validated.dispatchArgs.action === 'CREATE' && readBack.type !== 'RESPONSIVE_SEARCH_AD') return 'MISMATCH';
   if (entity === 'ASSET_GROUP' && validated.parent && readBack.campaign !== validated.parent.resourceName) return 'MISMATCH';
   return 'CONFIRMED';
@@ -678,6 +728,14 @@ const dispatchOnce = (deps: GoogleToolkitWriteDeps, userId: string, args: Record
 const readSettled = (deps: GoogleToolkitWriteDeps, userId: string, cid: string, kind: GoogleReadKind, rn: string) => deps.read(userId, cid, kind, rn)
   .then((value) => ({ ok: true as const, value }), () => ({ ok: false as const, value: null }));
 
+/** Where each uploaded asset type is used (ASSET_GROUP CREATE takes headlines and descriptions as plain text). */
+const ASSET_USE: Record<string, string> = {
+  IMAGE: 'Use it in ASSET_GROUP CREATE square_image_assets or landscape_image_assets.',
+  LOGO: 'Use it in ASSET_GROUP CREATE logo_assets or as brand_logo_asset_resource_name on a PERFORMANCE_MAX CAMPAIGN CREATE.',
+  VIDEO: 'Use it in ASSET_GROUP CREATE video_assets.',
+  TEXT: 'It is stored in the account library; ASSET_GROUP CREATE and AD CREATE take headlines and descriptions as plain text, not asset ids.',
+};
+
 /**
  * ASSET UPLOAD (ENG-2928): an asset cannot spend on its own, so there is no preview token —
  * but it is still gated (readiness checked by the caller), URL-checked, dispatched once through
@@ -703,7 +761,7 @@ async function executeAssetUpload(userId: string, cid: string, validated: Valida
   return {
     success: verification === 'CONFIRMED', verification, id: id ?? null, asset_type: readBack?.type ?? null,
     message: verification === 'CONFIRMED'
-      ? `ASSET ${type} confirmed by read-back: ${id}. Use it in an ASSET_GROUP CREATE${type === 'LOGO' ? ' or as brand_logo_asset_resource_name on a PERFORMANCE_MAX CAMPAIGN CREATE' : ''}.`
+      ? `ASSET ${type} confirmed by read-back: ${id}. ${ASSET_USE[type] ?? ''}`.trim()
       : verification === 'MISMATCH'
         ? `Google accepted the upload, but the read-back of ${id} does not match what was sent. Review it before using it.`
         : `UNCONFIRMED: Google accepted the upload${id ? ` (${id})` : ''}, but the read-back could not confirm it. Check the asset before using it or uploading again.`,
@@ -744,6 +802,8 @@ export async function executeGoogleToolkitWrite(
     : '');
   const op = `${entity} ${action}`;
   let enableBudgetMicros: number | undefined;
+  /** Enabling a child of a paused campaign: it cannot spend until the campaign is enabled too. */
+  let parentPaused = false;
   const readParent = async <T>(what: string): Promise<T> => {
     const parent = await deps.read(userId, cid, validated.parent!.kind, validated.parent!.resourceName);
     if (!parent) refuseNotFound(what, validated.parent!.resourceName);
@@ -766,6 +826,13 @@ export async function executeGoogleToolkitWrite(
     if (!prior || typeof prior.biddable !== 'boolean') refuseNotFound('Campaign conversion goal', validated.target!.resourceName);
     state = { prior };
     lines.push(`Campaign "${prior.name ?? prior.campaign ?? prior.resourceName}", category ${prior.category}, origin ${prior.origin}: biddable ${prior.biddable} → ${args.biddable}.`);
+    if (args.biddable === false && prior.biddable === true && isCustomerResource(cid, 'campaign_conversion_goals', prior.campaign)) {
+      const goals = await deps.read(userId, cid, 'campaign_conversion_goals', prior.campaign);
+      if (Array.isArray(goals) && !goals.some((g: any) => g.biddable === true && g.resourceName !== prior.resourceName)) {
+        throw new MetaToolkitRefusal(`This is the only conversion goal campaign "${prior.name ?? prior.campaign}" bids on. Google rejects a campaign with no goal (EMPTY_CONVERSION_GOALS), so turn another goal on first. Nothing was sent.`);
+      }
+      state = { ...state, goals };
+    }
     lines.push('This changes which conversion goal drives campaign bidding; it does not change the account default or campaign status.');
   } else if (op === 'BUDGET CREATE') {
     lines.push(`Create budget "${args.name}": ${money(validated.budgetMicros!)}${validated.dispatchArgs.explicitly_shared ? ', SHARED (can be attached to several campaigns; it caps their combined spend)' : ''}.`);
@@ -786,7 +853,19 @@ export async function executeGoogleToolkitWrite(
     lines.push(`Create ${args.type} campaign "${args.name}" on budget "${budget!.name ?? budget!.resourceName}" (${money(budget!.amountMicros)}).`);
     const note = sharedNote(budget!);
     if (note) lines.push(`${note} This campaign would be added to it.`);
-    lines.push(`Bidding: ${args.bidding_strategy ?? args.bidding_strategy_resource_name}${args.bidding_strategy_target !== undefined ? ` (target ${args.bidding_strategy_target})` : ''}.`);
+    if (!budget!.explicitlyShared && budget!.name !== args.name) {
+      lines.push(`Google renames this (unshared) budget to "${args.name}" when the campaign is created.`);
+    }
+    lines.push(`Bidding: ${biddingLabel(args, currency)}.`);
+    const d = validated.dispatchArgs;
+    if (args.type === 'SEARCH') {
+      lines.push(`Networks: Google Search${d.target_search_network ? ' + search partners' : ''}${d.target_content_network ? ' + Display Network (ads can also show on websites and apps)' : ''}`
+        + `${!d.target_search_network || !d.target_content_network ? ` (off: ${[!d.target_search_network && 'search partners', !d.target_content_network && 'Display Network'].filter(Boolean).join(', ')})` : ''}.`);
+    }
+    const locations = (d.location_target_ids as number[] | undefined) ?? [];
+    lines.push(locations.length
+      ? `Locations: ${locations.join(', ')} (Google location ids) — people in, or showing interest in, these locations (Google's default).`
+      : 'Locations: none set — the campaign can serve in every country.');
     if (args.type === 'PERFORMANCE_MAX') {
       const logoRn = String(validated.dispatchArgs.brand_logo_asset_resource_name);
       const logo: GoogleAssetState | null = await deps.read(userId, cid, 'asset', logoRn);
@@ -876,6 +955,17 @@ export async function executeGoogleToolkitWrite(
       const e = validated.expectedEdit;
       lines.push(`${noun} "${prior.name ?? prior.resourceName}" (status ${prior.status}, unchanged):`);
       if (e.name !== undefined) lines.push(`Name: "${prior.name ?? ''}" → "${e.name}".`);
+      if (e.searchPartners !== undefined || e.displayNetwork !== undefined) {
+        if (prior.channelType !== 'SEARCH') {
+          throw new MetaToolkitRefusal(`Campaign "${prior.name ?? prior.resourceName}" is ${prior.channelType ?? 'not confirmed as'} SEARCH; network settings apply to Search campaigns only. Nothing was sent.`);
+        }
+        const onOff = (v: unknown) => (v === true ? 'on' : 'off');
+        if (e.searchPartners !== undefined) lines.push(`Search partners: ${onOff(prior.searchPartners)} → ${onOff(e.searchPartners)}.`);
+        if (e.displayNetwork !== undefined) {
+          lines.push(`Display Network (ads on websites and apps): ${onOff(prior.displayNetwork)} → ${onOff(e.displayNetwork)}.`);
+          if (e.displayNetwork && !prior.displayNetwork) lines.push('Turning the Display Network on lets this budget also spend on display placements.');
+        }
+      }
       if (e.cpcBidMicros !== undefined) {
         const cur = Number.isFinite(prior.cpcBidMicros) ? `${formatMicros(prior.cpcBidMicros, currency)} (= ${prior.cpcBidMicros} micros)` : 'not set';
         lines.push(`Max CPC: ${cur} → ${formatMicros(e.cpcBidMicros, currency)} (= ${e.cpcBidMicros} micros).`);
@@ -910,11 +1000,14 @@ export async function executeGoogleToolkitWrite(
     }
     if (validated.expectedStatus === 'ENABLED' && kind !== 'campaign' && campaign && campaign.status !== 'ENABLED') {
       lines.push(`Its campaign "${campaign.name ?? campaign.resourceName}" is ${campaign.status}, so this alone does not start delivery.`);
+      parentPaused = true;
     }
   }
   const adds = action === 'CREATE' || action === 'ADD';
   lines.push(validated.expectedStatus === 'ENABLED'
-    ? 'Status: ENABLED — this can start delivery and spending as soon as Google applies it.'
+    ? parentPaused
+      ? 'Status: ENABLED — it starts delivery and spending once its campaign is also enabled.'
+      : 'Status: ENABLED — this can start delivery and spending as soon as Google applies it.'
     : validated.expectedStatus === 'PAUSED' && adds
       ? 'Status: PAUSED — new campaigns, ad groups, keywords, ads and asset groups are always created paused; enabling is a separate preview and approval.'
       : validated.expectedStatus === 'PAUSED'

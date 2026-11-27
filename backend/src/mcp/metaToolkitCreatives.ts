@@ -339,7 +339,9 @@ export async function prepareZomaUpload(userId: string, args: any, depsIn: MetaT
     upload_command: `curl -sS --fail -X PUT -H 'Content-Type: ${contentType}' --upload-file '<path to ${filename}>' '${uploadUrl}'`,
     next_step:
       `Run upload_command with the real local path (it prints nothing on success). Then call call_meta_marketing_api with ` +
-      `entity_type AD_CREATIVE, action ${action}, params.${urlParam} = file_url. The upload URL expires in 15 minutes and only accepts Content-Type ${contentType}.`,
+      `entity_type AD_CREATIVE, action ${action}, params.${urlParam} = file_url` +
+      (kind === 'image' && googleToolkitEnabled() ? ' (Meta), or call_google_ads_api entity_type ASSET, action UPLOAD, asset_type IMAGE or LOGO, data = file_url (Google Ads)' : '') +
+      `. The upload URL expires in 15 minutes and only accepts Content-Type ${contentType}.`,
   };
 }
 
