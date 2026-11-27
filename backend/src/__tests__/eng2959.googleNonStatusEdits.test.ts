@@ -197,7 +197,7 @@ describe('ENG-2959 shape rules', () => {
 
   it('advertised schema/description document the edits', () => {
     const tool = getGoogleToolkitManifest().find((t: any) => t.name === 'call_google_ads_api') as any;
-    expect(tool.description).toContain('UPDATE (campaign_resource_name, status | name)');
+    expect(tool.description).toContain('UPDATE (campaign_resource_name, status | name | target_search_network | target_content_network)');
     expect(tool.description).toContain('UPDATE (ad_group_resource_name, status | name? cpc_bid?)');
     expect(tool.inputSchema?.properties?.cpc_bid_micros ?? tool.input_schema?.properties?.cpc_bid_micros).toBeUndefined();
   });
