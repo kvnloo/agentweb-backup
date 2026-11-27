@@ -91,6 +91,24 @@ describe('6 — next step after a failure', () => {
     }
   });
 
+  it('a Meta Graph permission error gets Meta\'s error hint, not zoma_status (which reports "All set")', () => {
+    for (const m of [
+      '(#200) Requires business_management permission to manage the object',
+      'Requires business_management permission to manage the object (code 200, fbtrace_id AbC)',
+      'Meta refused the CREATE: Requires business_management permission (code 10, subcode 2069007)',
+      'OAuthException: (#3) Application does not have the capability to make this API call.',
+      describeMetaError({ structuredError: { message: 'Requires pages_manage_ads permission', type: 'OAuthException', code: 200, fbtrace_id: 'Zz' } }),
+    ]) {
+      expect(zomaErrorNextStep(m)).not.toMatch(ZOMA_STATUS);
+      expect(zomaErrorNextStep(m)).toMatch(/error_user_title \/ error_user_msg/);
+    }
+  });
+
+  it('an invalid Meta token still gets the zoma_status fix even as an OAuthException', () => {
+    expect(zomaErrorNextStep(describeMetaError({ structuredError: { message: 'Error validating access token: The session has been invalidated', type: 'OAuthException', code: 190, fbtrace_id: 'Zz' } }))).toMatch(ZOMA_STATUS);
+    expect(zomaErrorNextStep('OAuthException: Error validating access token: Session has expired on Monday')).toMatch(ZOMA_STATUS);
+  });
+
   it('an unrelated failure does not claim zoma_status has the exact fix', () => {
     expect(zomaErrorNextStep('Write blocked by anomaly gate.')).not.toMatch(ZOMA_STATUS);
   });
