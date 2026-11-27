@@ -100,11 +100,17 @@ const fail = (status: number, code: string, message?: string, extra: Record<stri
 });
 const NOT_FOUND: ServiceResult = { status: 404, body: { code: 'not_found' } };
 
+/** Untrusted request JSON; every field is validated before use. */
+export type SlackStartRequestBody =
+  | { email?: unknown; utm?: unknown; captchaToken?: unknown; website?: unknown; answers?: unknown; step?: unknown }
+  | null
+  | undefined;
+
 export interface SlackStartService {
   config(): ServiceResult;
-  start(input: { body: unknown; idempotencyKey: unknown; ip: string | undefined }): Promise<ServiceResult>;
+  start(input: { body: SlackStartRequestBody; idempotencyKey: unknown; ip: string | undefined }): Promise<ServiceResult>;
   read(intakeId: string, bearer: string | undefined): Promise<ServiceResult>;
-  answer(intakeId: string, bearer: string | undefined, body: unknown): Promise<ServiceResult>;
+  answer(intakeId: string, bearer: string | undefined, body: SlackStartRequestBody): Promise<ServiceResult>;
   complete(intakeId: string, bearer: string | undefined): Promise<ServiceResult>;
 }
 
@@ -317,7 +323,7 @@ export function createSlackStartService(deps: SlackStartDeps): SlackStartService
       }
       const fields = Object.keys(accepted) as AnswerField[];
       const step = body?.step === undefined ? Math.max(...fields.map((f) => STEP_FOR_FIELD[f])) : body.step;
-      if (!Number.isInteger(step) || step < 1 || step > 6) return fail(400, 'invalid_step', errors().generic);
+      if (typeof step !== 'number' || !Number.isInteger(step) || step < 1 || step > 6) return fail(400, 'invalid_step', errors().generic);
 
       const now = iso();
       const furthestStep = Math.max(intake.furthestStep ?? 1, step);
