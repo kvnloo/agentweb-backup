@@ -1,5 +1,6 @@
 import { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
 export { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
+import { campaignBidStrategyDefault } from '../utils/metaCampaignBidStrategyDefault';
 import {
   normaliseUserDataField,
   NormalisableUserDataField,
@@ -1654,15 +1655,15 @@ export class MetaService {
       const campaign = new Campaign(campaignId);
       const setsBudget = params?.daily_budget !== undefined || params?.lifetime_budget !== undefined;
       const current = await MetaService.verifyWriteOwnership(
-        campaign, campaignId, 'Campaign', adAccountId, setsBudget ? ['daily_budget', 'lifetime_budget'] : [],
+        campaign, campaignId, 'Campaign', adAccountId, setsBudget ? ['daily_budget', 'lifetime_budget', 'bid_strategy'] : [],
       );
-      // ENG-2364, mirrored from createCampaign: giving a campaign a budget without a bid strategy
-      // leaves Meta on LOWEST_COST_WITH_BID_CAP, and every ad set create/copy then fails with
-      // subcode 1815857 ("Bid amount required"). An explicit bid_strategy is never overridden, and
-      // a campaign that already has a budget keeps the strategy it is on (e.g. a deliberate COST_CAP).
-      const hadBudget = Number(current.daily_budget) > 0 || Number(current.lifetime_budget) > 0;
-      if (setsBudget && params.bid_strategy === undefined && !hadBudget) {
-        params = { ...params, bid_strategy: 'LOWEST_COST_WITHOUT_CAP' };
+      // ENG-2364, mirrored from createCampaign: a new campaign budget with no bid strategy breaks
+      // every ad set create/copy (subcode 1815857). The default is added only when neither the
+      // caller nor the campaign has a strategy (a deliberate COST_CAP is kept); the Toolkit
+      // preview uses the same function so it shows what is sent.
+      const defaultStrategy = campaignBidStrategyDefault(params, current);
+      if (defaultStrategy) {
+        params = { ...params, bid_strategy: defaultStrategy };
       }
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
