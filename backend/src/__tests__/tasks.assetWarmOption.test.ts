@@ -13,6 +13,12 @@ import { classifyReport } from '../services/reportClassificationService';
 
 jest.mock('axios');
 const mockedAxios = axios as jest.Mocked<typeof axios>;
+// Since #4272 the report backfill reads only our own bucket, through the SSRF-guarded caller-URL fetch.
+jest.mock('../utils/callerUrlFetch', () => ({
+  ...jest.requireActual('../utils/callerUrlFetch'),
+  fetchCallerUrlText: jest.fn(),
+}));
+const mockedFetchText = require('../utils/callerUrlFetch').fetchCallerUrlText as jest.Mock;
 
 jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
@@ -56,9 +62,9 @@ const { getExecutionsWithAssets } = require('../routes/tasks');
 const { registerAssetAndOutreachAccountRoutes } = require('../routes/emmaAssetRoutes');
 
 const proto = ChatbotDB.prototype as unknown as Record<string, jest.Mock>;
-const REPORT_URL = 'https://bucket.s3.amazonaws.com/u/report.html';
-const TASK_REPORT_URL = 'https://bucket.s3.amazonaws.com/u/task-report.html';
-const IMAGE_URL = 'https://bucket.s3.amazonaws.com/u/new.png';
+const REPORT_URL = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/u/report.html';
+const TASK_REPORT_URL = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/u/task-report.html';
+const IMAGE_URL = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/u/new.png';
 
 /** A message that holds a generated image (the scanner finds it in toolCalls). */
 const imageMessage = (index: number) => ({
@@ -88,12 +94,14 @@ function expectNoWriteNoFetchNoClassifier() {
   expect(proto.persistReportTypes).not.toHaveBeenCalled();
   expect(taskDb.updateTaskExecutionResultFiles).not.toHaveBeenCalled();
   expect(mockedAxios.get).not.toHaveBeenCalled();
+  expect(mockedFetchText).not.toHaveBeenCalled();
   expect(classifyReport).not.toHaveBeenCalled();
 }
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockedAxios.get.mockResolvedValue({ data: '<html><body>Report</body></html>', status: 200, statusText: 'OK', headers: {}, config: {} as any });
+  mockedFetchText.mockResolvedValue('<html><body>Report</body></html>');
   proto.getSessionsWithoutMessages.mockResolvedValue([uncached, cached].map((s) => JSON.parse(JSON.stringify(s))));
   proto.getMessagesFromMessagesTable.mockResolvedValue([imageMessage(0)]);
   proto.getMessagesFromIndex.mockResolvedValue([imageMessage(2)]);
@@ -151,7 +159,7 @@ describe('getExecutionsWithAssets warm option', () => {
   it('control: backfill on (the reports page default) does fetch and classify, so the test above would catch a regression', async () => {
     await getExecutionsWithAssets('user123', 'html-reports', '');
     await settle();
-    expect(mockedAxios.get).toHaveBeenCalled();
+    expect(mockedFetchText).toHaveBeenCalled();
     expect(classifyReport).toHaveBeenCalled();
   });
 });
