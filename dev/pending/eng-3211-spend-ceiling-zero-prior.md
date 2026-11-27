@@ -1,0 +1,3 @@
+## ENG-3211: spend-ceiling ratio check skips a zero prior (2026-11-27)
+
+With `META_TOOLKIT_SPEND_CEILING` set on prod-3 (`{maxDailyBudget:50000,maxChangeRatio:2}`), `evaluateMetaSpendCeiling` (`services/agentMode/metaSpendCeiling.ts`) treated any increase from a 0 prior as an infinite ratio and refused it, so a campaign or ad set with no budget could never be given one through the Toolkit, which re-blocked the case #4266 fixed. A zero prior now skips only the ratio check, the same as a create (no prior). `maxDailyBudget` still caps `daily_budget`, and non-zero priors are still ratio-checked. `lifetime_budget` has no maxDailyBudget-style cap; that was already true for creates.
