@@ -27,8 +27,23 @@ describe('evaluateMetaSpendCeiling (ENG-2046 A4)', () => {
     expect(evaluateMetaSpendCeiling({ maxChangeRatio: 3 }, { field: 'spend_cap', proposed, prior }).allowed).toBe(allowed);
   });
 
-  it('treats an increase from zero as exceeding the ratio ceiling', () => {
-    expect(evaluateMetaSpendCeiling({ maxChangeRatio: 3 }, { field: 'daily_budget', proposed: 1, prior: 0 }))
+  it.each([
+    ['lifetime_budget', { maxDailyBudget: 50_000, maxChangeRatio: 2 }],
+    ['spend_cap', { maxDailyBudget: 50_000, maxChangeRatio: 2 }],
+    ['daily_budget', { maxChangeRatio: 2 }],
+  ] as const)('still refuses %s 0 -> X when no cap applies (policy %j)', (field, policy) => {
+    expect(evaluateMetaSpendCeiling(policy, { field, proposed: 5_000, prior: 0 }))
+      .toMatchObject({ allowed: false, code: 'SPEND_CEILING_EXCEEDED', ceiling: 'maxChangeRatio' });
+  });
+
+  it('skips the ratio check for a zero-prior daily_budget when maxDailyBudget caps it', () => {
+    const policy = { maxDailyBudget: 50_000, maxChangeRatio: 2 };
+    expect(evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: 5_000, prior: 0 })).toEqual({ allowed: true });
+    expect(evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: 60_000, prior: 0 }))
+      .toMatchObject({ allowed: false, code: 'SPEND_CEILING_EXCEEDED', ceiling: 'maxDailyBudget' });
+    expect(evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: '5000', prior: '0' })).toEqual({ allowed: true });
+    // a non-zero prior is still ratio-checked
+    expect(evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: 1_001, prior: 500 }))
       .toMatchObject({ allowed: false, ceiling: 'maxChangeRatio' });
   });
 
