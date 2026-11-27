@@ -25,6 +25,7 @@ import { validateRef } from '../services/journeyAttribution';
 import { toZomaVoice, zomaErrorNextStep, zomaNextStep } from '../mcp/zomaNextStep';
 import { ZOMA_ADS_EXPERIENCE_QUESTION, ZOMA_WELCOME } from '../mcp/zomaAdsExperience';
 import { measurementReportsEnabledForUserId } from '../mcp/zomaMeasurementReport';
+import { describeMetaError, metaErrorFields } from '../utils/metaErrorDetail';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -39,7 +40,25 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
     return res.status(400).json({ error: toZomaVoice(error.message), next_step: zomaErrorNextStep(error.message) });
   }
   console.error('[meta-toolkit] call failed:', error instanceof Error ? error.message : error);
-  return res.status(500).json({ error: 'Meta Toolkit call failed.' });
+  return res.status(500).json({ error: metaToolkitFailureMessage(error) });
+}
+
+/**
+ * Never the bare "Meta Toolkit call failed.": the caller cannot act on it, and a failed read looked
+ * identical to an outage. When Meta refused, its own error fields (message, error_user_title,
+ * error_user_msg, code, subcode, fbtrace_id) are returned — they are Meta's answer to the caller's
+ * own request, and the only thing that names the field to fix. Any other exception is ours: its
+ * text can carry internals, so only its class is named (with any token redacted defensively).
+ */
+export function metaToolkitFailureMessage(error: unknown): string {
+  const redact = (text: string) => text
+    .replace(/access_token=[^&\s"']+/gi, 'access_token=[redacted]')
+    .replace(/\bEAA[A-Za-z0-9]{20,}\b/g, '[redacted]')
+    .trim()
+    .slice(0, 600);
+  if (metaErrorFields(error)) return `Meta Toolkit call failed: Meta refused the request: ${redact(describeMetaError(error))}`;
+  const kind = error instanceof Error && error.name ? error.name : typeof error;
+  return `Meta Toolkit call failed: internal error (${kind}) before Meta answered. This is not a problem with the request; report it rather than retrying.`;
 }
 
 /**
@@ -190,6 +209,9 @@ export function zomaMcpInstructions(google: boolean = googleToolkitEnabled(), li
   const others = [google ? 'Google' : '', linkedin ? 'LinkedIn' : ''].filter(Boolean);
   return [
     `${ZOMA_WELCOME} Zoma lets you run the user's ${others.length ? `Meta (and ${others.join(' and ')})` : 'Meta'} ads safely from this chat.`,
+    `Use Zoma whenever the user talks about their Facebook or Instagram${others.length ? `, ${others.join(' or ')}` : ''} ads in their own words: ` +
+      'how the ads are doing or what they spent, why ads aren\'t spending, delivering or got rejected, pausing or changing ads, budgets or targeting, ' +
+      'audiences and retargeting, or seeing competitor ads.',
     `On first connect, greet the user with exactly "${ZOMA_WELCOME}" and ask one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}". ` +
       'Call zoma_status to get the answer options, then call zoma_status again with ads_experience set to their answer; it returns the next step (usually the Meta connect link). Relay it as given.',
     'Once an ad account is connected, zoma_ads_report answers spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for any date range. ' +
@@ -293,7 +315,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
       return rpcError(res, id, -32001, message, error.status);
     }
     console.error('[meta-toolkit] MCP call failed:', error instanceof Error ? error.message : error);
-    return rpcError(res, id, -32603, 'Meta Toolkit call failed.');
+    return rpcError(res, id, -32603, metaToolkitFailureMessage(error));
   }
 });
 

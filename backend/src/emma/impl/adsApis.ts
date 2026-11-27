@@ -262,6 +262,7 @@ import { assertMetaAccountAllowed } from '../../services/metaTestAccountGuard';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../../services/metaAudienceCampaignTokenStore';
 import { getJwtSecret } from '../../config/jwt';
 import { metaWriteRateShaper } from '../../services/agentMode/metaWriteRateShaper';
+import { flattenNestedCampaignCreate } from '../../services/agentMode/metaCampaignCreateParams';
 import { describeMetaWriteParamDrift, formatMetaWriteParamDriftMessage } from '../../services/agentMode/core/approvalDeck';
 
 /** Local copy of `AgentModeService`'s private `MetaApiResult` type — never exported there. */
@@ -1930,6 +1931,20 @@ export async function callMetaMarketingApi(
 
   // Ensure params is an object
   params = params || {};
+
+  // CAMPAIGN CREATE accepts the campaign's fields nested as params.campaign (the schema shows that
+  // shape for the bundle); lifted here, before validation, so "requires name" never fires on a
+  // name that was sent nested.
+  if (entity_type === 'CAMPAIGN' && action === 'CREATE') {
+    const flat = flattenNestedCampaignCreate(
+      params,
+      'To create a campaign, ad set and ads together use CAMPAIGN CREATE_PAUSED_BUNDLE; otherwise create the campaign, then AD_SET CREATE with its campaign_id, then AD CREATE.',
+    );
+    if (flat.error !== undefined) {
+      return { success: false, message: flat.error, error: `PARAM_VALIDATION_ERROR: ${flat.error}`, hint: 'Fix the listed parameters and retry.' } as any;
+    }
+    params = flat.params;
+  }
 
   // ENG-400: a Meta campaign objective is IMMUTABLE — the one hard rule this
   // gate exists to enforce is that a CAMPAIGN CREATE never executes with an
