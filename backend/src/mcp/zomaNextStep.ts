@@ -24,10 +24,23 @@ const SETUP_NEXT = 'Call zoma_status: it returns the exact fix (with a link if o
 const META_FIX_NEXT =
   "Meta rejected a value in this request; the setup is not the problem. Read Meta's error_user_title / error_user_msg and the code / subcode in the error above, " +
   'correct the field they name (ads_get_errors explains a code), then preview the corrected call again. Do not retry it unchanged.';
+/** A Meta-side permission/role: no field fixes it and zoma_status (which checks only ads_management) answers "All set". */
+const META_PERMISSION_NEXT =
+  'Meta refused this for a permission on its side; there is no field in this request to correct, and zoma_status will not show it (it only checks the ads_management connection). ' +
+  'Tell the user which permission or object Meta names in the error above: it has to be granted in Meta, e.g. access to that business, ad account or Page in Meta Business settings. Do not retry until it is granted.';
 const OTHER_NEXT = 'Fix what the error above names, then retry once. Only if it names a connection, permission or payment problem, call zoma_status for the fix.';
 
-/** Meta's auth / permission codes: a setup problem even when Meta words it as a request error. */
-const META_AUTH_CODE = /\bcode (190|102|10|2\d\d)\b/i;
+/** Meta's invalid / expired token: a reconnect, so a setup problem even when Meta words it as a request error. */
+const META_TOKEN_ERROR = /\bcode (190|102)\b|error validating access token|session has expired/i;
+/** A Graph error from Meta itself, including its permission codes (10, 2xx). */
+const META_GRAPH_ERROR = /\(#\d+\)|OAuthException|\bcode (10|2\d\d)\b/i;
+/**
+ * Within a Meta error, a permission refusal. ads_management is the one zoma_status checks (a
+ * reconnect fixes it); any other ("(#200) Requires business_management permission", "(#10) ...")
+ * names a role or asset grant on the Meta side that zoma_status cannot see.
+ */
+const META_PERMISSION_ERROR = /permission|\(#(10|2\d\d)\)|\bcode (10|2\d\d)\b/i;
+const ADS_MANAGEMENT = /\bads_management\b/i;
 /** Meta (or our own pre-validation) refused the request's content. */
 const META_VALIDATION = /Invalid parameter|Meta refused|PARAM_VALIDATION_ERROR|subcode \d+|\(code \d+|\bcode 100\b|error_user_msg|fbtrace_id/i;
 /** Connection / auth / onboarding: the only failures zoma_status can actually fix. */
@@ -62,8 +75,11 @@ export function zomaErrorNextStep(message: string): string {
   }
   if (/payment method/i.test(message)) return 'Call zoma_status for the link to add a payment method (nothing is charged), then retry.';
   if (/read-only/i.test(message)) return 'Use a read tool here (e.g. zoma_ads_report), or make this change from Claude, ChatGPT, Codex or Cursor.';
-  if (META_AUTH_CODE.test(message)) return SETUP_NEXT;
-  if (META_VALIDATION.test(message)) return META_FIX_NEXT;
+  if (META_TOKEN_ERROR.test(message)) return SETUP_NEXT;
+  if (META_GRAPH_ERROR.test(message) || META_VALIDATION.test(message)) {
+    if (!META_PERMISSION_ERROR.test(message)) return META_FIX_NEXT;
+    return ADS_MANAGEMENT.test(message) ? SETUP_NEXT : META_PERMISSION_NEXT;
+  }
   if (SETUP_FAILURE.test(message)) return SETUP_NEXT;
   return OTHER_NEXT;
 }

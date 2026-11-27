@@ -287,4 +287,59 @@ describe('ENG-838 AC4 — the applied ad set settings are read back from Meta, n
     expect(result.bidStrategyWasDefaulted).toBe(true);
     expect(result.readBackVerified).toBe(true);
   });
+
+  describe('under a campaign budget (CBO)', () => {
+    const { daily_budget: _omit, ...cboAdSetParams } = baseAdSetParams;
+
+    beforeEach(() => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({
+        id: 'camp_123',
+        objective: 'OUTCOME_TRAFFIC',
+        daily_budget: '5000',
+        bid_strategy: 'LOWEST_COST_WITHOUT_CAP'
+      });
+    });
+
+    it('does not flag an explicit bid_strategy as unapplied when the ad set reads it back as null', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set', bid_strategy: null });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...cboAdSetParams,
+        bid_strategy: 'LOWEST_COST_WITHOUT_CAP'
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.readBackMismatch).toBeUndefined();
+      expect(result.readBackMismatches).toEqual([]);
+      expect(String(result.message)).not.toMatch(/did not apply/);
+    });
+
+    it('still flags a bid_strategy the ad set reads back as a different value', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set', bid_strategy: 'COST_CAP' });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...cboAdSetParams,
+        bid_strategy: 'LOWEST_COST_WITHOUT_CAP'
+      });
+
+      expect(result.readBackMismatch).toBe(true);
+      expect(result.readBackMismatches).toEqual([
+        { parameter: 'bid_strategy', requested: 'LOWEST_COST_WITHOUT_CAP', applied: 'COST_CAP' }
+      ]);
+    });
+  });
+
+  it('still flags a null bid_strategy read-back when the ad set has its own budget', async () => {
+    (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set', bid_strategy: null, daily_budget: '1000' });
+
+    const result = await service.createMetaAdsAdSet('user123', {
+      ...baseAdSetParams,
+      bid_strategy: 'LOWEST_COST_WITHOUT_CAP'
+    });
+
+    expect(result.readBackMismatch).toBe(true);
+    expect(result.readBackMismatches).toEqual([
+      { parameter: 'bid_strategy', requested: 'LOWEST_COST_WITHOUT_CAP', applied: null }
+    ]);
+  });
 });
