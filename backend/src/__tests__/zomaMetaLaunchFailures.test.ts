@@ -91,16 +91,43 @@ describe('6 — next step after a failure', () => {
     }
   });
 
-  it('a Meta Graph permission error gets Meta\'s error hint, not zoma_status (which reports "All set")', () => {
+  it('a Meta Graph ads_management permission error is a setup problem: zoma_status checks it', () => {
+    for (const m of [
+      '(#200) Requires ads_management permission to manage the object',
+      'Meta refused the UPDATE: (#10) Application does not have permission for this action, ads_management not granted',
+      describeMetaError({ structuredError: { message: 'Requires ads_management permission', type: 'OAuthException', code: 200, fbtrace_id: 'Zz' } }),
+    ]) {
+      expect(zomaErrorNextStep(m)).toMatch(ZOMA_STATUS);
+    }
+  });
+
+  it('any other Meta permission error says it is granted on Meta\'s side: no field to correct, zoma_status will not show it', () => {
     for (const m of [
       '(#200) Requires business_management permission to manage the object',
       'Requires business_management permission to manage the object (code 200, fbtrace_id AbC)',
       'Meta refused the CREATE: Requires business_management permission (code 10, subcode 2069007)',
-      'OAuthException: (#3) Application does not have the capability to make this API call.',
+      '(#10) Application does not have permission for this action',
       describeMetaError({ structuredError: { message: 'Requires pages_manage_ads permission', type: 'OAuthException', code: 200, fbtrace_id: 'Zz' } }),
     ]) {
-      expect(zomaErrorNextStep(m)).not.toMatch(ZOMA_STATUS);
-      expect(zomaErrorNextStep(m)).toMatch(/error_user_title \/ error_user_msg/);
+      const next = zomaErrorNextStep(m);
+      expect(next).not.toMatch(ZOMA_STATUS);
+      expect(next).not.toMatch(/correct the field/);
+      expect(next).toMatch(/no field in this request to correct/);
+      expect(next).toMatch(/zoma_status will not show it/);
+      expect(next).toMatch(/Meta Business settings/);
+    }
+  });
+
+  it('a non-permission Meta Graph error keeps Meta\'s fix-the-field hint', () => {
+    for (const m of [
+      'OAuthException: (#3) Application does not have the capability to make this API call.',
+      '(#100) Invalid parameter: daily_budget must be at least 100',
+      describeMetaError({ structuredError: GRAPH_BODY }),
+    ]) {
+      const next = zomaErrorNextStep(m);
+      expect(next).not.toMatch(ZOMA_STATUS);
+      expect(next).toMatch(/error_user_title \/ error_user_msg/);
+      expect(next).toMatch(/correct the field they name/);
     }
   });
 
