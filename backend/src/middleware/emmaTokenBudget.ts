@@ -87,6 +87,13 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
   'POST /hubspot-read': 'metered',
   'POST /linkedin-ads/insights': 'metered',
   'POST /linkedin-ads/read': 'metered',
+
+  // ─── Calendar, assets, LinkedIn outreach account, lead drafts, KB file reads for MCP tools (ENG-2840 W2-10) ───
+  'POST /google-calendar-read': 'metered',
+  'POST /user-assets': 'metered',
+  'POST /linkedin-outreach-account': 'metered',
+  'POST /lead-email-draft': 'metered',
+  'POST /kb-file-read': 'metered',
   'POST /data-analysis': 'metered',
 
   // ─── Files & HTML ─────────────────────────────────────────────────────────

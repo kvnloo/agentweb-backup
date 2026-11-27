@@ -66,7 +66,7 @@ describe('enrich_leads_preview', () => {
       { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
       { userId: 'user1', socketId: 'sock-1' },
     );
-    expect(pickPreviewLeadIds).toHaveBeenCalledWith('list-abc', undefined);
+    expect(pickPreviewLeadIds).toHaveBeenCalledWith('list-abc', undefined, 'user1');
     expect(runEmmaEnrichment).toHaveBeenCalledWith(expect.objectContaining({
       listId: 'list-abc',
       userId: 'user1',

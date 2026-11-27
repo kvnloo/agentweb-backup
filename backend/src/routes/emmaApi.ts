@@ -9,6 +9,10 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { registerMeetingEventRoutes } from './emmaMeetingEventRoutes';
 import { registerHubspotReadRoutes } from './emmaHubspotReadRoutes';
 import { registerLinkedInAdsReadRoutes } from './emmaLinkedInAdsReadRoutes';
+import { registerGoogleCalendarRoutes } from './emmaGoogleCalendarRoutes';
+import { registerAssetAndOutreachAccountRoutes } from './emmaAssetRoutes';
+import { registerLeadDraftRoutes } from './emmaLeadDraftRoutes';
+import { registerKbFileReadRoutes } from './emmaKbFileReadRoutes';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { MCP_ENGAGEMENTS_PER_LEAD, MCP_ENGAGEMENT_MAX_LEAD_BYTES } from '../utils/agentEngagementLimits';
 import { chatbotDb } from '../services/chatbotService';
@@ -56,6 +60,11 @@ router.use(requireEmmaTokenBudget);
 registerMeetingEventRoutes(router);
 registerHubspotReadRoutes(router);
 registerLinkedInAdsReadRoutes(router);
+// ENG-2840 (W2-10): Calendar reads, asset search, the LinkedIn outreach account, lead email drafts, knowledge-base file reads.
+registerGoogleCalendarRoutes(router);
+registerAssetAndOutreachAccountRoutes(router);
+registerLeadDraftRoutes(router);
+registerKbFileReadRoutes(router);
 
 // ─── Lazy service imports ───────────────────────────────────────────────────
 

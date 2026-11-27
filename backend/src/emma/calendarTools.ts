@@ -33,6 +33,9 @@ const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // refresh 5 min before expiry
  *   scope (calendar.events). Read-only connections return
  *   `{ error: 'write_scope_not_granted' }` so the caller can prompt a reconnect.
  */
+
+/** ENG-2840: each Google Calendar read gives up after this long (they had no limit; a self-call over MCP waits 60 s). */
+const CALENDAR_READ_TIMEOUT_MS = 30_000;
 async function getCalendarClient(userId: string, requireWrite = false) {
   // ENG-1277: lazy load — `googleapis` pulls ~990 modules (~613ms cold) on require.
   const { google } = await import('googleapis');
@@ -154,7 +157,7 @@ emmaToolRegistry.register({
         singleEvents: true,
         orderBy: 'startTime',
         ...(args.query && { q: args.query }),
-      });
+      }, { timeout: CALENDAR_READ_TIMEOUT_MS });
 
       const items = response.data.items || [];
       const events = items.map((e: any) => ({
@@ -259,7 +262,7 @@ emmaToolRegistry.register({
     const calendarId = args.calendar_id || 'primary';
 
     try {
-      const response = await client.events.get({ calendarId, eventId: args.event_id });
+      const response = await client.events.get({ calendarId, eventId: args.event_id }, { timeout: CALENDAR_READ_TIMEOUT_MS });
       const e = response.data;
       return {
         success: true,
@@ -346,7 +349,7 @@ emmaToolRegistry.register({
     const { client } = result;
 
     try {
-      const response = await client.calendarList.list({ maxResults: 100 });
+      const response = await client.calendarList.list({ maxResults: 100 }, { timeout: CALENDAR_READ_TIMEOUT_MS });
       const items = response.data.items || [];
       const calendars = items.map((c: any) => ({
         id: c.id,

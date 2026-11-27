@@ -7,14 +7,18 @@
 //   - assetCache.htmlReports entries in DynamoDB (agent-mode reports)
 //   - result_files entries on AW-TaskExecutions (task reports)
 
-import axios from 'axios';
 import express from 'express';
 import request from 'supertest';
 import { ChatbotDB } from '../services/chatbotService';
 import { taskDb } from '../services/db';
 
-jest.mock('axios');
-const mockedAxios = axios as jest.Mocked<typeof axios>;
+// ENG-2840: reports are read only from our own bucket, through the SSRF-guarded caller-URL fetch.
+jest.mock('../utils/callerUrlFetch', () => ({
+  ...jest.requireActual('../utils/callerUrlFetch'),
+  fetchCallerUrlText: jest.fn(),
+}));
+const { fetchCallerUrlText } = require('../utils/callerUrlFetch');
+const mockedFetchText = fetchCallerUrlText as jest.Mock;
 
 jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
@@ -72,7 +76,7 @@ describe('Tasks Routes - searchableText persistence', () => {
     app.use(express.json());
     app.use('/api/tasks', router);
 
-    mockedAxios.get.mockResolvedValue({ data: HTML_CONTENT, status: 200, statusText: 'OK', headers: {}, config: {} as any });
+    mockedFetchText.mockResolvedValue(HTML_CONTENT);
     (ChatbotDB.prototype.getMessagesFromIndex as jest.Mock).mockResolvedValue([]);
     (ChatbotDB.prototype.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
     (ChatbotDB.prototype.updateAssetCache as jest.Mock).mockResolvedValue(undefined);
@@ -83,7 +87,7 @@ describe('Tasks Routes - searchableText persistence', () => {
   describe('agent-mode HTML reports', () => {
     it('should NOT fetch from S3 when searchableText is already cached in assetCache', async () => {
       const sessionId = 'session-with-cache';
-      const reportUrl = 'https://s3.example.com/reports/report.html';
+      const reportUrl = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/report.html';
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
         sessionId,
@@ -115,7 +119,7 @@ describe('Tasks Routes - searchableText persistence', () => {
         .expect(200);
 
       // S3 fetch should be skipped when searchableText is already cached
-      expect(mockedAxios.get).not.toHaveBeenCalledWith(reportUrl, expect.anything());
+      expect(mockedFetchText).not.toHaveBeenCalledWith(reportUrl, expect.anything());
 
       // searchableText is stripped from the response to keep payload small
       const taskKey = `agent-mode-${sessionId}`;
@@ -127,7 +131,7 @@ describe('Tasks Routes - searchableText persistence', () => {
 
     it('should background-fetch from S3 and persist searchableText for agent-mode report without cached text', async () => {
       const sessionId = 'session-no-text';
-      const reportUrl = 'https://s3.example.com/reports/new-report.html';
+      const reportUrl = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/new-report.html';
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
         sessionId,
@@ -161,7 +165,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       await new Promise(resolve => setImmediate(resolve));
 
       // Should have fetched the HTML in the background
-      expect(mockedAxios.get).toHaveBeenCalledWith(reportUrl, expect.objectContaining({ timeout: 5000 }));
+      expect(mockedFetchText).toHaveBeenCalledWith(reportUrl, expect.objectContaining({ tool: 'html_report_backfill', timeoutMs: 15_000 }));
 
       // Should have persisted the searchableText back to the assetCache
       expect(ChatbotDB.prototype.persistSearchableTexts).toHaveBeenCalledWith(
@@ -174,6 +178,40 @@ describe('Tasks Routes - searchableText persistence', () => {
       const files = response.body[taskKey]?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
       expect(file).toBeDefined();
+    });
+
+    // ENG-2840: session report URLs are scraped from chat text, and the scrape pattern accepts any host as long as
+    // ".amazonaws.com/" appears later in the URL. Such a URL (an internal address here) must never be fetched.
+    it.each([
+      'http://169.254.169.254/latest/x.amazonaws.com/report.html',
+      'https://attacker.example/x.amazonaws.com/report.html',
+      'https://other-bucket.s3.us-west-2.amazonaws.com/report.html',
+    ])('never fetches a report URL outside our own bucket (%s)', async (reportUrl) => {
+      const sessionId = 'session-foreign-url';
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
+        sessionId,
+        userId: 'user123',
+        title: 'Report Session',
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T12:00:00Z',
+        archived: false,
+        messageCount: 3,
+        assetScanIndex: 3,
+        assetCache: {
+          images: [],
+          videos: [],
+          htmlReports: [{ url: reportUrl, filename: 'report.html', generatedAt: '2024-01-01T12:00:00Z' }],
+        },
+        messages: [],
+      }]);
+      (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
+      (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
+
+      await request(app).get('/api/tasks/executions/with-html-reports').expect(200);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(mockedFetchText).not.toHaveBeenCalled();
+      expect(ChatbotDB.prototype.persistSearchableTexts).not.toHaveBeenCalled();
     });
 
     it('should persist searchableTexts for multiple agent-mode sessions in one call per session', async () => {
@@ -190,8 +228,8 @@ describe('Tasks Routes - searchableText persistence', () => {
           images: [],
           videos: [],
           htmlReports: [
-            { url: `https://s3.example.com/${sessionId}/r1.html`, filename: 'r1.html', generatedAt: '2024-01-01T12:00:00Z' },
-            { url: `https://s3.example.com/${sessionId}/r2.html`, filename: 'r2.html', generatedAt: '2024-01-01T12:00:00Z' },
+            { url: `https://agentweb-user-files.s3.us-west-2.amazonaws.com/${sessionId}/r1.html`, filename: 'r1.html', generatedAt: '2024-01-01T12:00:00Z' },
+            { url: `https://agentweb-user-files.s3.us-west-2.amazonaws.com/${sessionId}/r2.html`, filename: 'r2.html', generatedAt: '2024-01-01T12:00:00Z' },
           ],
         },
         messages: [],
@@ -209,15 +247,15 @@ describe('Tasks Routes - searchableText persistence', () => {
       expect(ChatbotDB.prototype.persistSearchableTexts).toHaveBeenCalledWith(
         'session-a',
         expect.arrayContaining([
-          expect.objectContaining({ url: 'https://s3.example.com/session-a/r1.html' }),
-          expect.objectContaining({ url: 'https://s3.example.com/session-a/r2.html' }),
+          expect.objectContaining({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/session-a/r1.html' }),
+          expect.objectContaining({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/session-a/r2.html' }),
         ])
       );
       expect(ChatbotDB.prototype.persistSearchableTexts).toHaveBeenCalledWith(
         'session-b',
         expect.arrayContaining([
-          expect.objectContaining({ url: 'https://s3.example.com/session-b/r1.html' }),
-          expect.objectContaining({ url: 'https://s3.example.com/session-b/r2.html' }),
+          expect.objectContaining({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/session-b/r1.html' }),
+          expect.objectContaining({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/session-b/r2.html' }),
         ])
       );
     });
@@ -226,7 +264,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       // Uncached session (no assetCache/assetScanIndex) — should NOT be fetched synchronously
       const uncachedSessionId = 'session-no-cache';
       const cachedSessionId = 'session-with-cache';
-      const cachedReportUrl = 'https://s3.example.com/cached/report.html';
+      const cachedReportUrl = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/cached/report.html';
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([
         {
@@ -283,7 +321,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       const sessionId = 'session-many';
       // 15 reports with distinct timestamps so sort order is deterministic
       const htmlReports = Array.from({ length: 15 }, (_, i) => ({
-        url: `https://s3.example.com/many/r${String(i).padStart(2, '0')}.html`,
+        url: `https://agentweb-user-files.s3.us-west-2.amazonaws.com/many/r${String(i).padStart(2, '0')}.html`,
         filename: `r${i}.html`,
         generatedAt: `2024-01-${String(i + 1).padStart(2, '0')}T12:00:00Z`,
       }));
@@ -313,15 +351,15 @@ describe('Tasks Routes - searchableText persistence', () => {
       expect(persistedUpdates).toHaveLength(10);
       // They should be the 10 most recent (r05..r14 by generatedAt desc)
       const persistedUrls: string[] = persistedUpdates.map((u: any) => u.url);
-      expect(persistedUrls).toContain('https://s3.example.com/many/r14.html');
-      expect(persistedUrls).toContain('https://s3.example.com/many/r05.html');
-      expect(persistedUrls).not.toContain('https://s3.example.com/many/r04.html');
+      expect(persistedUrls).toContain('https://agentweb-user-files.s3.us-west-2.amazonaws.com/many/r14.html');
+      expect(persistedUrls).toContain('https://agentweb-user-files.s3.us-west-2.amazonaws.com/many/r05.html');
+      expect(persistedUrls).not.toContain('https://agentweb-user-files.s3.us-west-2.amazonaws.com/many/r04.html');
     });
   });
 
   describe('task-execution HTML reports', () => {
     it('should NOT fetch from S3 when searchableText already present on result_file', async () => {
-      const reportUrl = 'https://s3.example.com/task-reports/exec.html';
+      const reportUrl = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/task-reports/exec.html';
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([]);
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([{
@@ -349,7 +387,7 @@ describe('Tasks Routes - searchableText persistence', () => {
         .get('/api/tasks/executions/with-html-reports')
         .expect(200);
 
-      expect(mockedAxios.get).not.toHaveBeenCalledWith(reportUrl, expect.anything());
+      expect(mockedFetchText).not.toHaveBeenCalledWith(reportUrl, expect.anything());
 
       const files = response.body['task-1']?.executions?.[0]?.result_files || [];
       const file = files.find((f: any) => f.url === reportUrl);
@@ -358,7 +396,7 @@ describe('Tasks Routes - searchableText persistence', () => {
     });
 
     it('should background-fetch from S3 and persist searchableText for task execution report without cached text', async () => {
-      const reportUrl = 'https://s3.example.com/task-reports/new-exec.html';
+      const reportUrl = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/task-reports/new-exec.html';
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([]);
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([{
@@ -388,7 +426,7 @@ describe('Tasks Routes - searchableText persistence', () => {
       // Flush fire-and-forget microtasks
       await new Promise(resolve => setImmediate(resolve));
 
-      expect(mockedAxios.get).toHaveBeenCalledWith(reportUrl, expect.objectContaining({ timeout: 5000 }));
+      expect(mockedFetchText).toHaveBeenCalledWith(reportUrl, expect.objectContaining({ tool: 'html_report_backfill', timeoutMs: 15_000 }));
 
       // Should persist back to the execution
       expect(taskDb.updateTaskExecutionResultFiles).toHaveBeenCalledWith(
@@ -412,8 +450,8 @@ describe('Tasks Routes - searchableText persistence', () => {
           startTime: '2024-01-01T12:00:00Z',
           archived: false,
           result_files: [
-            { url: 'https://s3.example.com/a/r1.html', filename: 'r1.html', token: '', is_html: true },
-            { url: 'https://s3.example.com/a/r2.html', filename: 'r2.html', token: '', is_html: true },
+            { url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/a/r1.html', filename: 'r1.html', token: '', is_html: true },
+            { url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/a/r2.html', filename: 'r2.html', token: '', is_html: true },
           ],
         },
         {
@@ -423,7 +461,7 @@ describe('Tasks Routes - searchableText persistence', () => {
           startTime: '2024-01-01T13:00:00Z',
           archived: false,
           result_files: [
-            { url: 'https://s3.example.com/b/r1.html', filename: 'r1.html', token: '', is_html: true },
+            { url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/b/r1.html', filename: 'r1.html', token: '', is_html: true },
           ],
         },
       ]);
@@ -441,14 +479,14 @@ describe('Tasks Routes - searchableText persistence', () => {
       expect(taskDb.updateTaskExecutionResultFiles).toHaveBeenCalledWith(
         'exec-a',
         expect.arrayContaining([
-          expect.objectContaining({ url: 'https://s3.example.com/a/r1.html', searchableText: expect.any(String) }),
-          expect.objectContaining({ url: 'https://s3.example.com/a/r2.html', searchableText: expect.any(String) }),
+          expect.objectContaining({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/a/r1.html', searchableText: expect.any(String) }),
+          expect.objectContaining({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/a/r2.html', searchableText: expect.any(String) }),
         ])
       );
       expect(taskDb.updateTaskExecutionResultFiles).toHaveBeenCalledWith(
         'exec-b',
         expect.arrayContaining([
-          expect.objectContaining({ url: 'https://s3.example.com/b/r1.html', searchableText: expect.any(String) }),
+          expect.objectContaining({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/b/r1.html', searchableText: expect.any(String) }),
         ])
       );
     });
@@ -456,7 +494,7 @@ describe('Tasks Routes - searchableText persistence', () => {
 
   describe('error handling', () => {
     it('should not call persistSearchableTexts when S3 fetch fails for all reports', async () => {
-      mockedAxios.get.mockRejectedValue(new Error('Network error'));
+      mockedFetchText.mockRejectedValue(new Error('Network error'));
 
       const sessionId = 'session-fail';
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
@@ -471,7 +509,7 @@ describe('Tasks Routes - searchableText persistence', () => {
         assetCache: {
           images: [],
           videos: [],
-          htmlReports: [{ url: 'https://s3.example.com/fail.html', filename: 'fail.html', generatedAt: '2024-01-01T12:00:00Z' }],
+          htmlReports: [{ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/fail.html', filename: 'fail.html', generatedAt: '2024-01-01T12:00:00Z' }],
         },
         messages: [],
       }]);
@@ -486,7 +524,7 @@ describe('Tasks Routes - searchableText persistence', () => {
     });
 
     it('should not call updateTaskExecutionResultFiles when S3 fetch fails for task report', async () => {
-      mockedAxios.get.mockRejectedValue(new Error('Timeout'));
+      mockedFetchText.mockRejectedValue(new Error('Timeout'));
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([]);
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([{
@@ -495,7 +533,7 @@ describe('Tasks Routes - searchableText persistence', () => {
         userId: 'user123',
         startTime: '2024-01-01T12:00:00Z',
         archived: false,
-        result_files: [{ url: 'https://s3.example.com/fail.html', filename: 'fail.html', token: '', is_html: true }],
+        result_files: [{ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/fail.html', filename: 'fail.html', token: '', is_html: true }],
       }]);
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([{
         taskId: 'task-fail',
@@ -512,7 +550,7 @@ describe('Tasks Routes - searchableText persistence', () => {
 
   describe('response payload size', () => {
     it('strips searchableText entirely from the response to keep payload small (long text)', async () => {
-      const reportUrl = 'https://s3.example.com/reports/large-report.html';
+      const reportUrl = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/large-report.html';
       const longSearchableText = 'A'.repeat(3000);
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
@@ -550,7 +588,7 @@ describe('Tasks Routes - searchableText persistence', () => {
     });
 
     it('strips searchableText entirely from the response even for short text', async () => {
-      const reportUrl = 'https://s3.example.com/reports/small-report.html';
+      const reportUrl = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/small-report.html';
       const shortSearchableText = 'Short content';
 
       (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
