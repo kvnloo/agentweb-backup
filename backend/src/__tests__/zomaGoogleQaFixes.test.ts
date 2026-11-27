@@ -74,6 +74,12 @@ describe('1. Search campaigns are Google Search only unless the caller opts in',
     expect(p.preview).toContain('Display Network (ads on websites and apps): on → off.');
     const r: any = await executeGoogleToolkitWrite('u', { ...update, confirm: true, preview_token: p.preview_token }, 'INR', d);
     expect(r).toMatchObject({ success: true, verification: 'CONFIRMED' });
+    const on = { ...update, target_content_network: undefined, target_search_network: true };
+    objects[`campaign:${CAMPAIGN}`] = { ...campaign, searchPartners: false };
+    const po: any = await executeGoogleToolkitWrite('u', on, 'INR', d);
+    await executeGoogleToolkitWrite('u', { ...on, confirm: true, preview_token: po.preview_token }, 'INR', d);
+    // Search partners on needs Google Search on in the same request, or the service refuses it.
+    expect((d.dispatch as jest.Mock).mock.calls[1][1]).toMatchObject({ target_search_network: true, target_google_search: true });
     objects[`campaign:${CAMPAIGN}`] = { ...campaign, channelType: 'PERFORMANCE_MAX' };
     await expect(executeGoogleToolkitWrite('u', update, 'INR', d)).rejects.toThrow(/Search campaigns only/);
   });
@@ -118,19 +124,18 @@ describe('4. Campaign create preview names what matters', () => {
   });
 });
 
-describe('5. The last biddable conversion goal cannot be turned off', () => {
+describe('5. Turning off the last biddable conversion goal is warned about', () => {
   const goal = `customers/${CID}/campaignConversionGoals/22~SUBMIT_LEAD_FORM~WEBSITE`;
   const prior = { resourceName: goal, campaign: CAMPAIGN, name: 'Spring', category: 'SUBMIT_LEAD_FORM', origin: 'WEBSITE', biddable: true };
   const args = { customer_id: CID, entity_type: 'CAMPAIGN_CONVERSION_GOAL', action: 'UPDATE', resource_name: goal, biddable: false };
-  it('refuses before sending when no other goal is biddable', async () => {
-    const d = deps({ [`campaign_conversion_goal:${goal}`]: prior, [`campaign_conversion_goals:${CAMPAIGN}`]: [prior] });
-    await expect(executeGoogleToolkitWrite('u', args, 'INR', d)).rejects.toThrow(/only conversion goal/);
-    expect(d.dispatch).not.toHaveBeenCalled();
+  it('warns in the preview when no other standard goal is biddable (custom goals may still make it valid)', async () => {
+    const p: any = await executeGoogleToolkitWrite('u', args, 'INR', deps({ [`campaign_conversion_goal:${goal}`]: prior, [`campaign_conversion_goals:${CAMPAIGN}`]: [prior] }));
+    expect(p.preview).toContain('EMPTY_CONVERSION_GOALS');
   });
-  it('previews normally when another goal still bids', async () => {
+  it('no warning when another goal still bids', async () => {
     const other = { ...prior, resourceName: `customers/${CID}/campaignConversionGoals/22~PURCHASE~WEBSITE`, category: 'PURCHASE' };
     const p: any = await executeGoogleToolkitWrite('u', args, 'INR', deps({ [`campaign_conversion_goal:${goal}`]: prior, [`campaign_conversion_goals:${CAMPAIGN}`]: [prior, other] }));
-    expect(p.status).toBe('PREVIEW');
+    expect(p.preview).not.toContain('Warning');
   });
 });
 
@@ -139,6 +144,11 @@ describe('6/8. Read shapes', () => {
     const report = { state: 'BLOCKED_BY_CAMPAIGN', campaigns: [] };
     const out = shapeGoogleToolkitRead('call_google_ads_reporting_api', { mode: 'serving_chain' }, { success: false, report, error: JSON.stringify(report) });
     expect(out).toEqual({ success: true, report, serving_state: 'BLOCKED_BY_CAMPAIGN', serving: false, ready: false });
+  });
+  it('a failed serving read stays a failure, in one line', () => {
+    const report = { state: 'UNVERIFIED', campaigns: [], blockers: [{ state: 'UNVERIFIED', reason: 'API or permission failure' }] };
+    const out = shapeGoogleToolkitRead('call_google_ads_reporting_api', { mode: 'serving_chain' }, { success: false, report, error: JSON.stringify(report) });
+    expect(out).toMatchObject({ success: false, serving_state: 'UNVERIFIED', error: 'Serving status could not be verified: API or permission failure.' });
   });
   it('conversion actions drop tag snippets but keep the conversion tag ids', () => {
     const out = shapeGoogleToolkitRead('call_google_ads_api', { entity_type: 'CONVERSION_ACTION', action: 'LIST' },

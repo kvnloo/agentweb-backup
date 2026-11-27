@@ -203,6 +203,12 @@ export function shapeGoogleToolkitRead(name: string, args: any, result: any): an
   if (name === 'call_google_ads_reporting_api' && args?.mode === 'serving_chain' && result?.report) {
     const { error: _repeated, ...rest } = result;
     const state = String(result.report.state ?? 'UNVERIFIED');
+    if (state === 'UNVERIFIED') {
+      // A failed read (auth, API error, unknown campaign id) is a failure, said in one line.
+      const reasons = (Array.isArray(result.report.blockers) ? result.report.blockers : [])
+        .filter((b: any) => b?.state === 'UNVERIFIED').map((b: any) => String(b.reason)).slice(0, 5);
+      return { ...rest, success: false, serving_state: state, error: `Serving status could not be verified: ${reasons.join('; ') || 'no campaigns returned'}.` };
+    }
     return { ...rest, success: true, serving_state: state, serving: state === 'DELIVERING', ready: state === 'READY' || state === 'DELIVERING' };
   }
   if (name === 'call_google_ads_api' && args?.entity_type === 'CONVERSION_ACTION' && Array.isArray(result?.conversionActions)) {

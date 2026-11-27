@@ -421,6 +421,8 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
       if (args[key] === undefined) continue;
       need(typeof args[key] === 'boolean', `${key} must be true or false.`);
       dispatchArgs[key] = args[key];
+      // Google requires Google Search on with search partners (the service refuses otherwise).
+      if (key === 'target_search_network' && args[key] === true) dispatchArgs.target_google_search = true;
       if (key === 'target_search_network') expectedEdit.searchPartners = args[key];
       else expectedEdit.displayNetwork = args[key];
     }
@@ -828,8 +830,10 @@ export async function executeGoogleToolkitWrite(
     lines.push(`Campaign "${prior.name ?? prior.campaign ?? prior.resourceName}", category ${prior.category}, origin ${prior.origin}: biddable ${prior.biddable} → ${args.biddable}.`);
     if (args.biddable === false && prior.biddable === true && isCustomerResource(cid, 'campaign_conversion_goals', prior.campaign)) {
       const goals = await deps.read(userId, cid, 'campaign_conversion_goals', prior.campaign);
+      // A warning, not a refusal: a custom conversion goal or a non-conversion bid strategy can
+      // make this valid, and Google's own rejection still stops an invalid one.
       if (Array.isArray(goals) && !goals.some((g: any) => g.biddable === true && g.resourceName !== prior.resourceName)) {
-        throw new MetaToolkitRefusal(`This is the only conversion goal campaign "${prior.name ?? prior.campaign}" bids on. Google rejects a campaign with no goal (EMPTY_CONVERSION_GOALS), so turn another goal on first. Nothing was sent.`);
+        lines.push(`Warning: this is the only standard conversion goal campaign "${prior.name ?? prior.campaign}" bids on. Unless the campaign uses a custom conversion goal, Google rejects this with EMPTY_CONVERSION_GOALS; turn another goal on first.`);
       }
       state = { ...state, goals };
     }

@@ -710,9 +710,12 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           status: args.status || 'PAUSED',
           brandBusinessName: args.brand_business_name,
           brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
-          targetGoogleSearch: args.target_google_search,
-          targetSearchNetwork: args.target_search_network,
-          targetContentNetwork: args.target_content_network,
+          // Network settings exist on Search campaigns only (another type would be rejected by Google).
+          ...(args.type === 'SEARCH' ? {
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+          } : {}),
         });
         return { success: true, campaignResourceName: campaign.resourceName };
       }
