@@ -1,5 +1,39 @@
 import { resendService } from './resendService';
 import { userDb } from './db';
+import type { StatusReportResult } from './gtmStatusReportOutcome';
+import { isSuppressedSendResult } from '../utils/nonProdEmailGuard';
+import { escapeHtml as escapeText } from '../emma/impl/shared/htmlEscaping';
+
+/**
+ * Escapes text a person (or an agent) wrote before it goes into the HTML part of an email. Plan, phase and work item titles, descriptions,
+ * notes, contacts, statuses and the optional message are all caller text; without this a title such as `<a href="https://x">reset your
+ * password</a>` arrives as a live link in a message from AgentWeb's system sender. The plain-text part of each email is not HTML and is left as written.
+ * The escaping itself is the shared helper's (emma/impl/shared/htmlEscaping.ts); this only makes it total (null and undefined are empty text).
+ */
+const esc = (value: unknown): string => escapeText(String(value ?? ''));
+
+/** A single header-safe line: a title written with a line break must not be able to add a header to the email it names. */
+const oneLine = (value: unknown): string => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/ {2,}/g, ' ').trim();
+
+/**
+ * How many email addresses one contact entry holds. Contacts (`dri`) are stored as written, with no validation in the portal, so an entry
+ * can be "a@x.com, b@x.com", a list, or use separators such as a fullwidth comma or a zero-width space. Separators are any whitespace,
+ * comma or semicolon (ASCII or fullwidth) and the invisible characters; only the parts that contain an "@" are addresses, so
+ * "Jane Doe <jane@x.com>" is one. An entry with no "@" counts as one.
+ */
+function addressesIn(entry: string): number {
+  return Math.max(1, String(entry).split(/[\s,;\uff0c\uff1b\u3001\u200b-\u200f\u2028\u2029\u2060\ufeff]+/).filter((part) => part.includes('@')).length);
+}
+
+/** Distinct people: the same mailbox written in another case is one person, and gets one email. The first spelling is kept. */
+function distinctRecipients(addresses: string[]): string[] {
+  const seen = new Map<string, string>();
+  for (const address of addresses) {
+    const clean = String(address).trim();
+    if (clean !== '' && !seen.has(clean.toLowerCase())) seen.set(clean.toLowerCase(), clean);
+  }
+  return Array.from(seen.values());
+}
 
 interface NotificationOptions {
   notifyUser?: boolean;
@@ -15,6 +49,21 @@ interface StatusReportNotificationOptions {
   notifyPhasePoc?: boolean;   // For phase reports
   notifyPhasePocs?: boolean;  // For plan reports (all phase PoCs)
   message?: string;
+  /**
+   * ENG-2840: the most distinct people one call may email. When the chosen options resolve to more, NOTHING is sent and the result says so
+   * (`overCap`). Set by the MCP tool for outside agents (10); the portal and Emma set none.
+   */
+  maxRecipients?: number;
+}
+
+/** A cap that is not a finite, non-negative number is no cap. */
+function capIsSet(cap: unknown): cap is number {
+  return typeof cap === 'number' && Number.isFinite(cap) && cap >= 0;
+}
+
+/** True when a report to `count` people exceeds the caller's cap. */
+function exceedsRecipientCap(count: number, cap: unknown): cap is number {
+  return capIsSet(cap) && count > cap;
 }
 
 interface GTMPlan {
@@ -113,7 +162,7 @@ export async function sendGTMPlanUpdateNotifications(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
     if (uniqueRecipients.length === 0) {
       return;
@@ -161,28 +210,28 @@ export async function sendGTMPlanUpdateNotifications(
     // Get customer portal URL
     const gtmPlanUrl = `${customerFrontendUrl}/gtm-plan`;
 
-    const subject = `GTM Plan Update: ${plan.title}`;
+    const subject = `GTM Plan Update: ${oneLine(plan.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #333;">GTM Plan Update Notification</h2>
         <p>Hello,</p>
-        <p>This is to notify you that a work item in the GTM Plan "<strong>${plan.title}</strong>" has been updated.</p>
+        <p>This is to notify you that a work item in the GTM Plan "<strong>${esc(plan.title)}</strong>" has been updated.</p>
         <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-          <p style="margin: 0;"><strong>Plan:</strong> ${plan.title}</p>
-          ${phase ? `<p style="margin: 5px 0;"><strong>Phase:</strong> ${phase.title}</p>` : ''}
-          ${workItem ? `<p style="margin: 5px 0;"><strong>Work Item:</strong> ${workItem.title}</p>` : ''}
-          <p style="margin: 5px 0;"><strong>Change:</strong> ${changeText}</p>
+          <p style="margin: 0;"><strong>Plan:</strong> ${esc(plan.title)}</p>
+          ${phase ? `<p style="margin: 5px 0;"><strong>Phase:</strong> ${esc(phase.title)}</p>` : ''}
+          ${workItem ? `<p style="margin: 5px 0;"><strong>Work Item:</strong> ${esc(workItem.title)}</p>` : ''}
+          <p style="margin: 5px 0;"><strong>Change:</strong> ${esc(changeText)}</p>
         </div>
         ${updatedNotes ? `
         <div style="background-color: #fff9e6; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #f57c00;">Updated Notes:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${updatedNotes.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(updatedNotes).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
         ${customMessage ? `
         <div style="background-color: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #1976d2;">Additional Message:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${customMessage.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(customMessage).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
         <div style="text-align: center; margin: 30px 0;">
@@ -215,6 +264,8 @@ This is an automated notification from AgentWeb.
           subject,
           html,
           text,
+          // ENG-2840: automated mail can wait a few seconds, so it queues behind password resets and support replies, not the other way round
+          lane: 'bulk',
         });
       } catch (emailError: any) {
         console.error(`Failed to send notification to ${recipient}:`, emailError);
@@ -239,10 +290,12 @@ export async function sendPhaseStatusReport(
   phaseId: string,
   notifications: StatusReportNotificationOptions,
   customerFrontendUrl: string = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'
-): Promise<void> {
+): Promise<StatusReportResult> {
+  const result: StatusReportResult = { recipients: 0, sent: 0, failed: 0 };
+
   // Check if any notifications are requested
   if (!notifications || (!notifications.notifyUser && !notifications.notifyPlanPoc && !notifications.notifyPhasePoc)) {
-    return;
+    return result;
   }
 
   try {
@@ -250,7 +303,7 @@ export async function sendPhaseStatusReport(
 
     if (!phase) {
       console.error("Phase not found for status report");
-      return;
+      return result;
     }
 
     const recipients: string[] = [];
@@ -276,10 +329,25 @@ export async function sendPhaseStatusReport(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
+    result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
-      return;
+      return result;
+    }
+    // With a cap (the MCP tool sets one) every contact must be ONE address: a contact holding a list would be a single send to several people,
+    // past both the cap and the hourly budget, which counts sends. Refuse before sending anything, so a cap is a promise about the whole
+    // report and never a partial send.
+    if (capIsSet(notifications.maxRecipients)) {
+      const lists = uniqueRecipients.filter((entry) => addressesIn(entry) > 1).length;
+      if (lists > 0) {
+        result.multiAddressContacts = lists;
+        return result;
+      }
+      if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+        result.overCap = notifications.maxRecipients;
+        return result;
+      }
     }
 
     // Get optional message from notifications
@@ -316,21 +384,21 @@ export async function sendPhaseStatusReport(
 
       return `
         <tr>
-          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.title}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${item.description}</div>` : ''}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${esc(item.title)}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${esc(item.description)}</div>` : ''}</td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">
             <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
-              ${item.status}
+              ${esc(item.status)}
             </span>
             ${completedAtText ? `<div style="color: #666; font-size: 11px; margin-top: 4px;">${completedAtText}</div>` : ''}
           </td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
-          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
-          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${item.notes || '-'}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${esc(item.dri || '-')}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${esc(item.notes || '-')}</td>
         </tr>
       `;
     }).join('');
 
-    const subject = `GTM Plan Phase Status Report: ${phase.title}`;
+    const subject = `GTM Plan Phase Status Report: ${oneLine(phase.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
         <h2 style="color: #333;">Phase Status Report</h2>
@@ -338,15 +406,15 @@ export async function sendPhaseStatusReport(
         ${customMessage ? `
         <div style="background-color: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #1976d2;">Message:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${customMessage.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(customMessage).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
-        <p>This is a status report for the phase "<strong>${phase.title}</strong>" in the GTM Plan "<strong>${plan.title}</strong>".</p>
+        <p>This is a status report for the phase "<strong>${esc(phase.title)}</strong>" in the GTM Plan "<strong>${esc(plan.title)}</strong>".</p>
         <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-          <p style="margin: 0;"><strong>Plan:</strong> ${plan.title}</p>
-          <p style="margin: 5px 0;"><strong>Phase:</strong> ${phase.title}</p>
-          <p style="margin: 5px 0;"><strong>Phase Status:</strong> ${phase.status}</p>
-          ${phase.dri ? `<p style="margin: 5px 0;"><strong>Phase PoC:</strong> ${phase.dri}</p>` : ''}
+          <p style="margin: 0;"><strong>Plan:</strong> ${esc(plan.title)}</p>
+          <p style="margin: 5px 0;"><strong>Phase:</strong> ${esc(phase.title)}</p>
+          <p style="margin: 5px 0;"><strong>Phase Status:</strong> ${esc(phase.status)}</p>
+          ${phase.dri ? `<p style="margin: 5px 0;"><strong>Phase PoC:</strong> ${esc(phase.dri)}</p>` : ''}
           ${phase.dueDate ? `<p style="margin: 5px 0;"><strong>Phase Due Date:</strong> ${(() => {
             const [year, month, day] = phase.dueDate.split('-').map(Number);
             const dueDateObj = new Date(year, month - 1, day);
@@ -431,21 +499,29 @@ This is an automated status report from AgentWeb.
     // Send emails to all recipients using system email
     for (const recipient of uniqueRecipients) {
       try {
-        await resendService.sendSystemEmail({
+        const delivery = await resendService.sendSystemEmail({
           to: recipient,
           subject,
           html,
           text,
+          // ENG-2840: bulk lane, see the work item update above
+          lane: 'bulk',
         });
+        // outside production the email guard resolves a send it held back: that is not a delivery
+        if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;
+        else result.sent += 1;
       } catch (emailError: any) {
         console.error(`Failed to send phase status report to ${recipient}:`, emailError);
-        // Don't fail the entire request if email fails
+        // Don't fail the entire request if email fails: the caller reads `failed`
+        result.failed += 1;
       }
     }
   } catch (statusReportError: any) {
     console.error("Error sending phase status report:", statusReportError);
-    // Don't throw error, just log it
+    // Don't throw error, just log it: whatever was not sent is counted as failed
+    result.failed = result.recipients - result.sent - (result.suppressed ?? 0);
   }
+  return result;
 }
 
 /**
@@ -458,10 +534,12 @@ export async function sendPlanStatusReport(
   plan: GTMPlan,
   notifications: StatusReportNotificationOptions,
   customerFrontendUrl: string = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'
-): Promise<void> {
+): Promise<StatusReportResult> {
+  const result: StatusReportResult = { recipients: 0, sent: 0, failed: 0 };
+
   // Check if any notifications are requested
   if (!notifications || (!notifications.notifyUser && !notifications.notifyPlanPoc && !notifications.notifyPhasePocs)) {
-    return;
+    return result;
   }
 
   try {
@@ -492,10 +570,25 @@ export async function sendPlanStatusReport(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
+    result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
-      return;
+      return result;
+    }
+    // With a cap (the MCP tool sets one) every contact must be ONE address: a contact holding a list would be a single send to several people,
+    // past both the cap and the hourly budget, which counts sends. Refuse before sending anything, so a cap is a promise about the whole
+    // report and never a partial send.
+    if (capIsSet(notifications.maxRecipients)) {
+      const lists = uniqueRecipients.filter((entry) => addressesIn(entry) > 1).length;
+      if (lists > 0) {
+        result.multiAddressContacts = lists;
+        return result;
+      }
+      if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+        result.overCap = notifications.maxRecipients;
+        return result;
+      }
     }
 
     // Get optional message from notifications
@@ -536,16 +629,16 @@ export async function sendPlanStatusReport(
 
         return `
           <tr>
-            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; padding-left: 24px;">${item.title}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${item.description}</div>` : ''}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; padding-left: 24px;">${esc(item.title)}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${esc(item.description)}</div>` : ''}</td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">
               <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
-                ${item.status}
+                ${esc(item.status)}
               </span>
               ${completedAtText ? `<div style="color: #666; font-size: 11px; margin-top: 4px;">${completedAtText}</div>` : ''}
             </td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${item.notes || '-'}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${esc(item.dri || '-')}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${esc(item.notes || '-')}</td>
           </tr>
         `;
       }).join('');
@@ -566,14 +659,14 @@ export async function sendPlanStatusReport(
         <div style="margin-bottom: 30px;">
           <div style="background-color: #f5f5f5; padding: 12px; border-radius: 5px; margin-bottom: 10px;">
             <h4 style="margin: 0; color: #333;">
-              ${phase.title}
+              ${esc(phase.title)}
               <span style="background-color: ${phaseStatusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; margin-left: 10px;">
-                ${phase.status}
+                ${esc(phase.status)}
               </span>
             </h4>
             ${phase.dri || phase.dueDate ? `
             <p style="margin: 5px 0 0 0; font-size: 14px; color: #666;">
-              ${phase.dri ? `PoC: ${phase.dri}` : ''}
+              ${phase.dri ? `PoC: ${esc(phase.dri)}` : ''}
               ${phase.dri && phase.dueDate ? ' | ' : ''}
               ${phase.dueDate ? `Due Date: ${phaseDueDateText}` : ''}
             </p>
@@ -601,7 +694,7 @@ export async function sendPlanStatusReport(
       `;
     }).join('');
 
-    const subject = `GTM Plan Status Report: ${plan.title}`;
+    const subject = `GTM Plan Status Report: ${oneLine(plan.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
         <h2 style="color: #333;">GTM Plan Status Report</h2>
@@ -609,14 +702,14 @@ export async function sendPlanStatusReport(
         ${customMessage ? `
         <div style="background-color: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #1976d2;">Message:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${customMessage.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(customMessage).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
-        <p>This is a comprehensive status report for the GTM Plan "<strong>${plan.title}</strong>".</p>
+        <p>This is a comprehensive status report for the GTM Plan "<strong>${esc(plan.title)}</strong>".</p>
         <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-          <p style="margin: 0;"><strong>Plan:</strong> ${plan.title}</p>
-          <p style="margin: 5px 0;"><strong>Plan Status:</strong> ${plan.status}</p>
-          ${plan.dri ? `<p style="margin: 5px 0;"><strong>Plan PoC:</strong> ${plan.dri}</p>` : ''}
+          <p style="margin: 0;"><strong>Plan:</strong> ${esc(plan.title)}</p>
+          <p style="margin: 5px 0;"><strong>Plan Status:</strong> ${esc(plan.status)}</p>
+          ${plan.dri ? `<p style="margin: 5px 0;"><strong>Plan PoC:</strong> ${esc(plan.dri)}</p>` : ''}
           ${plan.dueDate ? `<p style="margin: 5px 0;"><strong>Plan Due Date:</strong> ${(() => {
             const [year, month, day] = plan.dueDate.split('-').map(Number);
             const dueDateObj = new Date(year, month - 1, day);
@@ -704,19 +797,27 @@ This is an automated status report from AgentWeb.
     // Send emails to all recipients using system email
     for (const recipient of uniqueRecipients) {
       try {
-        await resendService.sendSystemEmail({
+        const delivery = await resendService.sendSystemEmail({
           to: recipient,
           subject,
           html,
           text,
+          // ENG-2840: bulk lane, see the work item update above
+          lane: 'bulk',
         });
+        // outside production the email guard resolves a send it held back: that is not a delivery
+        if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;
+        else result.sent += 1;
       } catch (emailError: any) {
         console.error(`Failed to send plan status report to ${recipient}:`, emailError);
-        // Don't fail the entire request if email fails
+        // Don't fail the entire request if email fails: the caller reads `failed`
+        result.failed += 1;
       }
     }
   } catch (statusReportError: any) {
     console.error("Error sending plan status report:", statusReportError);
-    // Don't throw error, just log it
+    // Don't throw error, just log it: whatever was not sent is counted as failed
+    result.failed = result.recipients - result.sent - (result.suppressed ?? 0);
   }
+  return result;
 }

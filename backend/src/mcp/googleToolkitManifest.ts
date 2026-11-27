@@ -20,6 +20,7 @@
 import { googleAdsToolRegistry, GOOGLE_ADS_TOOL_NAMES } from '../emma/googleAdsTools';
 import type { McpToolRegistry } from './server/registry';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { withUseWhen } from './zomaUseWhen';
 
 export const GOOGLE_TOOLKIT_TOOL_NAMES = GOOGLE_ADS_TOOL_NAMES;
 export type GoogleToolkitToolName = (typeof GOOGLE_TOOLKIT_TOOL_NAMES)[number];
@@ -134,11 +135,11 @@ function narrowDefinition(definition: any): any {
 
 /** Google toolkit tool definitions. Fails loudly when a tool is missing from the registry. */
 export function getGoogleToolkitManifest(registry: McpToolRegistry = googleAdsToolRegistry) {
-  return GOOGLE_TOOLKIT_TOOL_NAMES.map((name) => {
+  return withUseWhen(GOOGLE_TOOLKIT_TOOL_NAMES.map((name) => {
     const tool = registry.getTool(name);
     if (!tool) throw new Error(`Google Ads toolkit manifest: tool ${name} is not registered`);
     return narrowDefinition(tool.definition);
-  });
+  }));
 }
 
 /** Throws MetaToolkitRefusal (the toolkit's tool-level refusal) when outside the surface. */

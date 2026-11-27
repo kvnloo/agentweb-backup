@@ -1491,7 +1491,8 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
+      // bid_strategy: under CBO the ad set inherits the campaign's (createMetaAdsAdSet).
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap', 'bid_strategy'];
       this.log(`Fetching campaign: ${campaignId}`);
       /*
        * `adAccountId` was accepted and never used: a node id is global, so this returned any
@@ -1599,7 +1600,6 @@ export class MetaService {
         objective: params.objective,
         status: params.status || 'PAUSED',
         special_ad_categories: specialCategories,
-        is_adset_budget_sharing_enabled: false, // Required by some accounts when CBO is off
       };
 
       // Agent calls supply normalized daily_budget. Direct SDK-wrapper callers may
@@ -1609,6 +1609,12 @@ export class MetaService {
       } else if ((params as any).advantage_campaign_budget && (params as any).budget_amount !== undefined) {
         const currency = await this.getAdAccountCurrency(adAccountId, accessToken);
         finalParams.daily_budget = normalizeMetaMoney((params as any).budget_amount, currency).minorUnits;
+      }
+
+      // Meta requires is_adset_budget_sharing_enabled (true/false) on a campaign WITHOUT a campaign
+      // budget; it describes ad-set budgets, so it is only sent when the campaign has none.
+      if (finalParams.daily_budget === undefined) {
+        finalParams.is_adset_budget_sharing_enabled = false;
       }
 
       // ENG-2364: under CBO the bid strategy lives on the campaign. Without one, Meta rejects

@@ -35,6 +35,8 @@ export interface TimeoutContinuationMessage {
     // ENG-2854: the turn stopped at the step limit; its report is terminal, so a
     // passive session read must never auto-resume a deferral it still lists.
     iterationLimitReached?: boolean;
+    // ENG-2812: stamped on the assistant message written when a run pauses at the session limit.
+    sessionLimitPaused?: unknown;
     // ENG-2816: stamped on a user message typed by a share-link visitor (see generateSessionResponse).
     ishareSender?: unknown;
   } | null;
@@ -257,6 +259,8 @@ export function hasUnresolvedMediaDeferral(
   const last = messages[messages.length - 1];
   if (!last) return false;
   if (last.metadata?.iterationLimitReached === true) return false;
+  // ENG-2812: a session-limit pause closes any earlier deferral; only a person's "continue" resumes it.
+  if (last.metadata?.sessionLimitPaused) return false;
   const isUnresolvedShape = last.role === 'user'
     ? last.metadata?.kind === 'auto-continuation'
     : last.role === 'tool'

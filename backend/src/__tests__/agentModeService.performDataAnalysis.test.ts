@@ -366,7 +366,7 @@ describe('AgentModeService.performDataAnalysis', () => {
     const instruction = `Read from ${s3Key} and compute total tokens per user.`;
     const result = await (service as any).performDataAnalysis([], instruction, 'user-1');
 
-    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith(s3Key);
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith(s3Key, undefined, { maxBytes: expect.any(Number) });
     expect(mockedAxiosPost).toHaveBeenCalledTimes(1);
     const postBody = mockedAxiosPost.mock.calls[0][1];
     const sentInstruction = postBody.contents[0].parts[postBody.contents[0].parts.length - 1].text as string;
@@ -417,7 +417,7 @@ describe('AgentModeService.performDataAnalysis', () => {
 
     const result = await (service as any).performDataAnalysis([s3Url], 'Summarize the data.', 'user-1');
 
-    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith('users/user-1/files/1234/abc/data.csv', 'agentweb-user-files');
+    expect(mockedGetS3ObjectAsString).toHaveBeenCalledWith('users/user-1/files/1234/abc/data.csv', 'agentweb-user-files', { maxBytes: 52428800 });
     expect(mockedAxiosGet).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
   });

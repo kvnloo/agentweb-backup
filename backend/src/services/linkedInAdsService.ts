@@ -18,6 +18,19 @@ export interface LinkedInAdsApiResult {
   fields?: string[];
 }
 
+/**
+ * ENG-2840 (W2-9): optional bounds for one read, passed by the outside-agent read routes (routes/emmaLinkedInAdsReadRoutes.ts). Absent
+ * (Emma's own calls pass none), every request is exactly what it was before: no timeout, and every page is fetched.
+ */
+export interface LinkedInRequestBounds {
+  /** Each HTTP request to LinkedIn gives up after this many milliseconds (axios `timeout`). */
+  timeoutMs?: number;
+  /** fetchAllPages reads at most this many pages; `data.truncated` is true when LinkedIn had more. */
+  maxPages?: number;
+  /** fetchAllPages keeps at most this many elements (and asks for pages no larger); `data.truncated` is true when more existed. */
+  maxElements?: number;
+}
+
 // ─── UTM tagging (ENG-239) ─────────────────────────────────────────────────────
 
 /**
@@ -88,7 +101,8 @@ async function makeRequest(
   path: string,
   accessToken: string,
   body?: any,
-  extraHeaders?: Record<string, string>
+  extraHeaders?: Record<string, string>,
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   const url = `${LI_API_BASE}${path}`;
   const config: any = {
@@ -102,6 +116,7 @@ async function makeRequest(
       ...extraHeaders,
     },
     data: body,
+    ...(bounds?.timeoutMs ? { timeout: bounds.timeoutMs } : {}),
   };
 
   try {
@@ -235,7 +250,8 @@ function expectedFromSet(setFields: Record<string, any>, skip: string[] = []): R
 export async function refreshAccessToken(
   refreshToken: string,
   clientId: string,
-  clientSecret: string
+  clientSecret: string,
+  bounds?: LinkedInRequestBounds
 ): Promise<{ access_token: string; refresh_token: string; expires_in: number }> {
   const response = await axios.post(
     INTEGRATION_CONFIG.linkedinAds.tokenUrl,
@@ -248,6 +264,7 @@ export async function refreshAccessToken(
         client_secret: clientSecret,
       },
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      ...(bounds?.timeoutMs ? { timeout: bounds.timeoutMs } : {}),
     }
   );
 
@@ -268,38 +285,56 @@ export async function refreshAccessToken(
  * @param accessToken - Bearer token
  * @param pageSize    - Items per page: 1000 for q=search, 100 for q=criteria
  * @param extraHeaders - Optional extra request headers (e.g. X-RestLi-Method)
+ * @param bounds      - Optional page and element caps and a per-request timeout (ENG-2840); absent, every page is read as before
  */
 async function fetchAllPages(
   baseUrl: string,
   accessToken: string,
   pageSize: number,
-  extraHeaders?: Record<string, string>
+  extraHeaders?: Record<string, string>,
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   const allElements: any[] = [];
   let pageToken: string | undefined;
+  const maxPages = bounds?.maxPages;
+  const maxElements = bounds?.maxElements;
+  const size = maxElements !== undefined ? Math.max(1, Math.min(pageSize, maxElements)) : pageSize;
+  let pages = 0;
+  let truncated = false;
 
   do {
     const sep = baseUrl.includes('?') ? '&' : '?';
     const tokenParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
-    const url = `${baseUrl}${sep}pageSize=${pageSize}${tokenParam}`;
+    const url = `${baseUrl}${sep}pageSize=${size}${tokenParam}`;
 
-    const result = await makeRequest('GET', url, accessToken, undefined, extraHeaders);
+    const result = await makeRequest('GET', url, accessToken, undefined, extraHeaders, bounds);
     if (!result.success) return result;
 
     allElements.push(...(result.data?.elements ?? []));
     pageToken = result.data?.metadata?.nextPageToken ?? undefined;
+    pages++;
+    if (pageToken && ((maxPages !== undefined && pages >= maxPages) || (maxElements !== undefined && allElements.length >= maxElements))) {
+      truncated = true;
+      break;
+    }
   } while (pageToken);
 
-  return { success: true, data: { elements: allElements } };
+  if (maxElements !== undefined && allElements.length > maxElements) {
+    allElements.length = maxElements;
+    truncated = true;
+  }
+  return { success: true, data: truncated ? { elements: allElements, truncated: true } : { elements: allElements } };
 }
 
 // ─── Ad Account ───────────────────────────────────────────────────────────────
 
-export async function listAdAccounts(accessToken: string): Promise<LinkedInAdsApiResult> {
+export async function listAdAccounts(accessToken: string, bounds?: LinkedInRequestBounds): Promise<LinkedInAdsApiResult> {
   return fetchAllPages(
     '/rest/adAccounts?q=search&search=(type:(values:List(BUSINESS,ENTERPRISE)))',
     accessToken,
-    1000
+    1000,
+    undefined,
+    bounds
   );
 }
 
@@ -308,7 +343,8 @@ export async function listAdAccounts(accessToken: string): Promise<LinkedInAdsAp
 export async function listCampaignGroups(
   accessToken: string,
   adAccountId: string,
-  params: Record<string, any> = {}
+  params: Record<string, any> = {},
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   const statusFilter = params.status
     ? `(status:(values:List(${params.status})))`
@@ -316,8 +352,22 @@ export async function listCampaignGroups(
   return fetchAllPages(
     `/rest/adAccounts/${adAccountId}/adCampaignGroups?q=search&search=${statusFilter}`,
     accessToken,
-    1000
+    1000,
+    undefined,
+    bounds
   );
+}
+
+/**
+ * One campaign group by id (the same single-group path updateCampaignGroup reads back). Read-only.
+ * Used by the Zoma toolkit to describe a group in a preview and to read a change back.
+ */
+export async function getCampaignGroup(
+  accessToken: string,
+  adAccountId: string,
+  campaignGroupId: string
+): Promise<LinkedInAdsApiResult> {
+  return makeRequest('GET', `/rest/adAccounts/${adAccountId}/adCampaignGroups/${campaignGroupId}`, accessToken);
 }
 
 export async function createCampaignGroup(
@@ -382,7 +432,8 @@ export async function updateCampaignGroup(
 export async function listCampaigns(
   accessToken: string,
   adAccountId: string,
-  params: Record<string, any> = {}
+  params: Record<string, any> = {},
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   // LinkedIn REST API does not support combining campaignGroup + status in a single search expression.
   // When filtering by campaign group, use it as the sole search filter.
@@ -396,7 +447,19 @@ export async function listCampaigns(
     const statuses = params.status || 'ACTIVE,PAUSED,DRAFT,ARCHIVED';
     path = `/rest/adAccounts/${adAccountId}/adCampaigns?q=search&search=(status:(values:List(${statuses})))`;
   }
-  return fetchAllPages(path, accessToken, 1000);
+  return fetchAllPages(path, accessToken, 1000, undefined, bounds);
+}
+
+/**
+ * One campaign by id (the same single-campaign path updateCampaign reads back). Read-only.
+ * Used by the Zoma toolkit to describe a campaign in a preview and to read a change back.
+ */
+export async function getCampaign(
+  accessToken: string,
+  adAccountId: string,
+  campaignId: string
+): Promise<LinkedInAdsApiResult> {
+  return makeRequest('GET', `/rest/adAccounts/${adAccountId}/adCampaigns/${campaignId}`, accessToken);
 }
 
 /**
@@ -766,7 +829,8 @@ function buildLeadGenCallToAction(
 export async function listCreatives(
   accessToken: string,
   adAccountId: string,
-  campaignId: string
+  campaignId: string,
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   const rawId = campaignId.startsWith('urn:li:sponsoredCampaign:') ? campaignId : `urn:li:sponsoredCampaign:${campaignId}`;
   const campaignUrn = encodeURIComponent(rawId);
@@ -775,8 +839,22 @@ export async function listCreatives(
     `/rest/adAccounts/${adAccountId}/creatives?q=criteria&campaigns=List(${campaignUrn})`,
     accessToken,
     100,
-    { 'X-RestLi-Method': 'FINDER' }
+    { 'X-RestLi-Method': 'FINDER' },
+    bounds
   );
+}
+
+/**
+ * One creative by id or URN (the same single-creative path updateCreativeStatus reads back). Read-only.
+ * Used by the Zoma toolkit to describe a creative in a preview and to read a change back.
+ */
+export async function getCreative(
+  accessToken: string,
+  adAccountId: string,
+  creativeId: string
+): Promise<LinkedInAdsApiResult> {
+  const creativeUrn = creativeId.startsWith('urn:') ? creativeId : `urn:li:sponsoredCreative:${creativeId}`;
+  return makeRequest('GET', `/rest/adAccounts/${adAccountId}/creatives/${encodeURIComponent(creativeUrn)}`, accessToken);
 }
 
 // ─── UTM audit (ENG-239 AC3, read side) ───────────────────────────────────────
@@ -1149,9 +1227,9 @@ export async function retagCreativeUtm(
  * action at all, so a referenced post's destination could never be inspected
  * directly (only inferred indirectly, e.g. via retag idempotency behavior).
  */
-export async function getPost(accessToken: string, postUrn: string): Promise<LinkedInAdsApiResult> {
+export async function getPost(accessToken: string, postUrn: string, bounds?: LinkedInRequestBounds): Promise<LinkedInAdsApiResult> {
   const encoded = encodeURIComponent(postUrn);
-  return makeRequest('GET', `/rest/posts/${encoded}`, accessToken);
+  return makeRequest('GET', `/rest/posts/${encoded}`, accessToken, undefined, undefined, bounds);
 }
 
 /**
@@ -1280,13 +1358,14 @@ export async function finalizeVideoUpload(
 
 // ─── Targeting ────────────────────────────────────────────────────────────────
 
-export async function listTargetingFacets(accessToken: string): Promise<LinkedInAdsApiResult> {
-  return makeRequest('GET', '/rest/adTargetingFacets', accessToken);
+export async function listTargetingFacets(accessToken: string, bounds?: LinkedInRequestBounds): Promise<LinkedInAdsApiResult> {
+  return makeRequest('GET', '/rest/adTargetingFacets', accessToken, undefined, undefined, bounds);
 }
 
 export async function searchTargetingEntities(
   accessToken: string,
-  params: Record<string, any>
+  params: Record<string, any>,
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   if (!params.facet_urn) {
     return { success: false, error: 'TARGETING SEARCH requires facet_urn' };
@@ -1322,12 +1401,13 @@ export async function searchTargetingEntities(
     path += `&locale=(language:${params.locale_language},country:${params.locale_country || 'US'})`;
   }
 
-  return makeRequest('GET', path, accessToken);
+  return makeRequest('GET', path, accessToken, undefined, undefined, bounds);
 }
 
 export async function getAudienceCount(
   accessToken: string,
-  targetingCriteria: Record<string, any>
+  targetingCriteria: Record<string, any>,
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   // The current REST audienceCounts endpoint uses the targetingCriteriaV2 finder: a single
   // RestLi-2.0-encoded `targetingCriteria` query param. The legacy dotted
@@ -1341,7 +1421,10 @@ export async function getAudienceCount(
   return makeRequest(
     'GET',
     `/rest/audienceCounts?q=targetingCriteriaV2&targetingCriteria=${encodedCriteria}`,
-    accessToken
+    accessToken,
+    undefined,
+    undefined,
+    bounds
   );
 }
 
@@ -1364,7 +1447,8 @@ export async function getAdAnalytics(
   timeGranularity: string,
   dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } },
   fields: string[],
-  filters: { campaign_group_ids?: string[]; campaign_ids?: string[]; creative_ids?: string[] } = {}
+  filters: { campaign_group_ids?: string[]; campaign_ids?: string[]; creative_ids?: string[] } = {},
+  bounds?: LinkedInRequestBounds
 ): Promise<LinkedInAdsApiResult> {
   // LinkedIn RestLI requires dateRange as an encoded object, not flat dot-notation keys.
   // fields must not be URL-encoded (commas must stay literal).
@@ -1402,7 +1486,43 @@ export async function getAdAnalytics(
     parts.push(`creatives=List(${encodeUrns('urn:li:sponsoredCreative', filters.creative_ids)})`);
   }
 
-  return makeRequest('GET', `/rest/adAnalytics?${parts.join('&')}`, accessToken);
+  return makeRequest('GET', `/rest/adAnalytics?${parts.join('&')}`, accessToken, undefined, undefined, bounds);
+}
+
+// ─── Bounded reads (ENG-2840 W2-9) ────────────────────────────────────────────
+
+/** The calls a LinkedIn Ads read can make, with the signatures above. */
+export interface LinkedInAdsReadCalls {
+  refreshAccessToken: typeof refreshAccessToken;
+  listAdAccounts: typeof listAdAccounts;
+  listCampaignGroups: typeof listCampaignGroups;
+  listCampaigns: typeof listCampaigns;
+  listCreatives: typeof listCreatives;
+  getPost: typeof getPost;
+  listTargetingFacets: typeof listTargetingFacets;
+  searchTargetingEntities: typeof searchTargetingEntities;
+  getAudienceCount: typeof getAudienceCount;
+  getAdAnalytics: typeof getAdAnalytics;
+}
+
+/**
+ * The same calls with `bounds` applied to every request they make. Emma's implementation (emma/impl/adsApis.ts) uses this module itself
+ * when it is given no bounds, so her own calls keep their exact arguments; the outside-agent read routes give bounds.
+ */
+export function boundedReadCalls(bounds: LinkedInRequestBounds): LinkedInAdsReadCalls {
+  return {
+    refreshAccessToken: (refreshToken, clientId, clientSecret) => refreshAccessToken(refreshToken, clientId, clientSecret, bounds),
+    listAdAccounts: (accessToken) => listAdAccounts(accessToken, bounds),
+    listCampaignGroups: (accessToken, adAccountId, params) => listCampaignGroups(accessToken, adAccountId, params, bounds),
+    listCampaigns: (accessToken, adAccountId, params) => listCampaigns(accessToken, adAccountId, params, bounds),
+    listCreatives: (accessToken, adAccountId, campaignId) => listCreatives(accessToken, adAccountId, campaignId, bounds),
+    getPost: (accessToken, postUrn) => getPost(accessToken, postUrn, bounds),
+    listTargetingFacets: (accessToken) => listTargetingFacets(accessToken, bounds),
+    searchTargetingEntities: (accessToken, params) => searchTargetingEntities(accessToken, params, bounds),
+    getAudienceCount: (accessToken, targetingCriteria) => getAudienceCount(accessToken, targetingCriteria, bounds),
+    getAdAnalytics: (accessToken, sponsorAccountId, pivot, timeGranularity, dateRange, fields, filters) =>
+      getAdAnalytics(accessToken, sponsorAccountId, pivot, timeGranularity, dateRange, fields, filters, bounds),
+  };
 }
 
 // ─── InMail (Message Ad) ──────────────────────────────────────────────────────

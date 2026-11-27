@@ -21,6 +21,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionWorkPlan: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
   },
 }));
@@ -111,7 +112,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat, runVerifiedChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -231,6 +232,215 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
           passed: false,
         })
       );
+    });
+
+    it.each([
+      ['all blocked', ['blocked', 'blocked', 'blocked']],
+      ['completed then blocked', ['completed', 'blocked']],
+      ['skipped then blocked', ['skipped', 'blocked']],
+    ])('stops a terminal %s plan without pressing unavailable prerequisites twenty times', async (_name, statuses) => {
+      // Sanitized ENG-2998 trace: no_key prevented guest extraction; downstream
+      // steps were blocked too. These are not valid zero-result completions.
+      const workPlan = {
+        autocomplete: true,
+        title: 'Guest extraction fixture',
+        steps: statuses.map((status, i) => ({
+          stepCount: i + 1, title: 'Repeated step', status,
+          notes: status === 'blocked' ? 'connected=false; nothing_pulled=true; reason=no_key' : '',
+        })),
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse, workPlan,
+        content: 'Guest extraction blocked: no_key. No outreach sent.',
+      } as any);
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
+      expect(JSON.stringify(result)).toContain('no_key');
+      const verified = await runVerifiedChat({
+        sessionId: mockSession.sessionId, userId: mockUserId, startingMessage: 'Extract guests',
+        keywords: [], requiredFunctions: [], isUnattendedRun: true,
+      });
+      statuses.forEach((status, i) => {
+        if (status === 'blocked') expect(verified.workPlanBlockReason).toContain(`${i + 1} Repeated step:`);
+      });
+    });
+
+    it.each([
+      ['reason: no_key'],
+      [['connected=false', 'nothing_pulled=true', 'reason=no_key']],
+      [['connected=false', null, 'reason: no_key']],
+    ])('stops missing-key prerequisites across observed note shapes: %j', async (notes) => {
+      const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes }] };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Guest extraction blocked.', workPlan } as any);
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
+    });
+
+    it.each(['reason=no_key', 'connected=false; reason=no_key', 'reason: no_key'])(
+      'stops from the real schema-valid status writer: %s', async (notes) => {
+        const { setWorkPlanStatus } = await import('../emma/impl/workPlans');
+        const session = {
+          ...mockSession,
+          workPlan: { steps: [{ stepCount: 1, title: 'Extract guests', status: 'pending' }] },
+        };
+        mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+        mockChatbotDb.updateSessionWorkPlan.mockImplementation(async (_id, plan) => {
+          session.workPlan = plan as any;
+          return undefined as any;
+        });
+
+        const written = await setWorkPlanStatus([
+          { stepCount: 1, status: 'pending', notes },
+        ], mockSession.sessionId);
+        expect(written.success).toBe(true);
+        // A repeated status-only update must not erase the prerequisite before
+        // the scheduler reads the real producer's persisted plan.
+        const retried = await setWorkPlanStatus([
+          { stepCount: 1, status: 'pending' },
+        ], mockSession.sessionId);
+        expect(retried.success).toBe(true);
+        expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+        expect(session.workPlan.steps[0]).toMatchObject({ status: 'pending', notes });
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+          ...mockResponse, content: 'Guest extraction unavailable.', workPlan: session.workPlan,
+        } as any);
+
+        const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+        expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+        const verified = await runVerifiedChat({
+          sessionId: mockSession.sessionId, userId: mockUserId, startingMessage: 'Extract guests',
+          keywords: [], requiredFunctions: [], isUnattendedRun: true,
+        });
+        expect(verified.workPlanBlockReason).toContain('1 Extract guests:');
+        expect(verified.workPlanBlockReason).toContain('no_key');
+      },
+    );
+
+    it.each(['reason=no_key; token=private-secret', ['reason=no_key', 'private-secret'], `reason=no_key ${'private-secret'.repeat(1000)}`])(
+      'does not forward raw prerequisite notes into failure diagnostics: %j', async notes => {
+        const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'pending', notes }] };
+        mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Unavailable.', workPlan } as any);
+        const verified = await runVerifiedChat({ sessionId: mockSession.sessionId, userId: mockUserId,
+          startingMessage: 'Extract guests', keywords: [], requiredFunctions: [], isUnattendedRun: true });
+        expect(verified.workPlanBlockReason).toBe('1 Extract guests: reason=no_key');
+        expect(verified.workPlanBlockReason).not.toContain('private-secret');
+      },
+    );
+
+    it('scores keyword evidence without crediting a terminal blocked plan as success', async () => {
+      const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes: 'reason=no_key' }] };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Guest REPORT blocked: reason=no_key.', workPlan } as any);
+      const result = await runScheduledChat({ ...baseSchedule, keywords: ['report', 'absent'], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1, keywordMatches: ['report'], keywordMisses: ['absent'] });
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['Tool returned 429 rate limited, retry', 'Temporary timeout; retry', 'Blocked; cause unknown'])('retries a blocked step without a proven terminal prerequisite: %s', async (notes) => {
+      const blockedPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes }] };
+      const completedPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'completed' }] };
+      let calls = 0;
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
+        ...mockSession, workPlan: calls >= 2 ? completedPlan : blockedPlan,
+      } as any));
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => {
+        calls++;
+        return { ...mockResponse, content: 'Guest extraction report.', workPlan: calls >= 2 ? completedPlan : blockedPlan } as any;
+      });
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(calls).toBe(2);
+      expect(result).toMatchObject({ status: 'success', passed: true, attempt: 2 });
+    });
+
+    it.each(['Blocked', ' BLOCKED ', 'pending', ' PENDING ', 'Pending'])('stops a terminal prerequisite with normalized status %s', async (status) => {
+      const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status, notes: 'reason=no_key' }] };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Guest extraction blocked: reason=no_key.', workPlan } as any);
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
+      expect(JSON.stringify(result)).toContain('no_key');
+    });
+
+    it.each(['completed', ' COMPLETED ', 'skipped', '\tSkipped\n'])(
+      'completes a terminal plan with normalized status %j without mutating it', async (status) => {
+        const step = Object.freeze({ stepCount: 1, title: 'Inspect guests', status });
+        const workPlan = Object.freeze({ steps: Object.freeze([step]) });
+        mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+          ...mockResponse, content: 'Guest report.', toolCalls: [], workPlan,
+        } as any);
+
+        const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+
+        expect(result).toMatchObject({ status: 'success', passed: true, attempt: 1 });
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+        expect(workPlan.steps[0].status).toBe(status);
+      },
+    );
+
+    it('does not waive required-function debt for normalized terminal statuses', async () => {
+      const workPlan = {
+        steps: [{ stepCount: 1, title: 'Inspect guests', status: ' COMPLETED ' },
+          { stepCount: 2, title: 'Optional work', status: ' SKIPPED ' }],
+        pendingRequiredFunctionCalls: ['list_html_templates'],
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan, calledFunctions: {} } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse, content: 'Guest report.', toolCalls: [], workPlan, calledFunctions: {},
+      } as any);
+
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 20 });
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+    });
+
+    it('fails when the completion-gate continuation discovers a blocked prerequisite', async () => {
+      const donePlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'completed' }] };
+      const blockedPlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'blocked', notes: 'reason=no_key' }] };
+      let calls = 0;
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
+        ...mockSession, workPlan: calls >= 2 ? blockedPlan : donePlan,
+      } as any));
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => {
+        calls++;
+        return {
+          ...mockResponse, toolCalls: [],
+          content: calls === 1 ? 'Event 1 done. I did not complete Step 3 for Events 2 and 3.' : 'Guest extraction blocked: no_key.',
+          workPlan: calls >= 2 ? blockedPlan : donePlan,
+        } as any;
+      });
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(calls).toBe(2);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 2 });
+      expect(JSON.stringify(result)).toContain('no_key');
+    });
+
+    it.each(['Tool returned 429 rate limited, retry', 'Temporary timeout; retry', 'Blocked; cause unknown'])('does not credit an incomplete completion-gate continuation: %s', async (notes) => {
+      const donePlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'completed' }] };
+      const blockedPlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'blocked', notes }] };
+      let calls = 0;
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
+        ...mockSession, workPlan: calls === 2 ? blockedPlan : donePlan,
+      } as any));
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => {
+        calls++;
+        return {
+          ...mockResponse, toolCalls: [],
+          content: calls === 1 ? 'Event 1 done. I did not complete Step 3 for Events 2 and 3.' : 'Guest extraction report.',
+          workPlan: calls === 2 ? blockedPlan : donePlan,
+        } as any;
+      });
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(calls).toBe(3);
+      expect(result).toMatchObject({ status: 'success', passed: true, attempt: 3 });
     });
 
     it('auto-converges an unattended run when a deferred (pending) step finishes on a later attempt', async () => {
