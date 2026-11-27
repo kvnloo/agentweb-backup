@@ -441,6 +441,26 @@ export class InMemoryDynamo {
         };
       }
 
+      /**
+       * BatchGetItem: every requested key that exists comes back under `Responses[table]`. Nothing is ever unprocessed: the real service may
+       * answer some keys in `UnprocessedKeys` under load, and callers retry those; this fake does not simulate that.
+       */
+      batchGet(params: any) {
+        return {
+          promise: async () => {
+            const Responses: Record<string, Record<string, any>[]> = {};
+            for (const [table, request] of Object.entries<any>(params.RequestItems || {})) {
+              const schema = self.schema(table);
+              const store = self.store(table);
+              Responses[table] = (request.Keys as Record<string, any>[])
+                .map((key) => store.get(keyOf(schema, key)))
+                .filter((item): item is Record<string, any> => item !== undefined);
+            }
+            return { Responses, UnprocessedKeys: {} };
+          },
+        };
+      }
+
       update(params: any) {
         return {
           promise: async () => {
@@ -547,8 +567,13 @@ export class InMemoryDynamo {
       delete(params: any) {
         return {
           promise: async () => {
-            self.store(params.TableName).delete(keyOf(self.schema(params.TableName), params.Key));
-            return {};
+            const store = self.store(params.TableName);
+            const key = keyOf(self.schema(params.TableName), params.Key);
+            const old = store.get(key);
+            store.delete(key);
+            // ReturnValues: 'ALL_OLD' answers with the item that was deleted, and with nothing when there was none: how a caller learns
+            // whether a delete found a row.
+            return params.ReturnValues === 'ALL_OLD' && old ? { Attributes: { ...old } } : {};
           },
         };
       }

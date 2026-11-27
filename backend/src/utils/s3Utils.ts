@@ -119,6 +119,25 @@ export function getS3ObjectStream(key: string, bucket: string = DEFAULT_BUCKET) 
 }
 
 /**
+ * ENG-2840 (W2-7): the same stream, whose destroy() also aborts the underlying S3 request. Destroying the plain stream leaves the download
+ * paused with its connection held (until the SDK's idle timeout); a reader that stops early on purpose (a size limit) must free it.
+ */
+export function getS3ObjectStreamAbortable(key: string, bucket: string = DEFAULT_BUCKET) {
+  const request = s3.getObject({ Bucket: bucket, Key: key });
+  const stream = request.createReadStream();
+  const destroy = stream.destroy.bind(stream);
+  (stream as any).destroy = (error?: Error) => {
+    try {
+      request.abort();
+    } catch {
+      // already finished
+    }
+    return destroy(error);
+  };
+  return stream;
+}
+
+/**
  * Get S3 object metadata (content type, size, etc.).
  */
 export async function getS3ObjectMetadata(key: string, bucket: string = DEFAULT_BUCKET) {
@@ -140,6 +159,8 @@ function isTransientS3Error(error: any): boolean {
     'AllAccessDisabled',
     'InvalidObjectState',
     'PermanentRedirect',
+    // Our own size refusal (getS3ObjectAsString maxBytes): the object will not shrink on a retry.
+    'S3ObjectTooLargeError',
   ]);
   if (terminalCodes.has(code)) return false;
   if (status === 404 || status === 403) return false;
@@ -175,10 +196,22 @@ function isTransientS3Error(error: any): boolean {
  * immediately so callers can surface a model-actionable "data no longer available"
  * message instead of pointlessly retrying. The success path is unchanged.
  */
+/** Thrown by getS3ObjectAsString when `maxBytes` is set and the object is larger: never retried. */
+export class S3ObjectTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`S3 object exceeds the ${maxBytes} byte limit`);
+    this.name = 'S3ObjectTooLargeError';
+  }
+}
+
+/**
+ * `maxBytes` (optional): read at most that many bytes (a ranged read of maxBytes + 1, so an object of exactly the limit passes) and throw
+ * S3ObjectTooLargeError for a larger object, so an unbounded object never sits in memory. Without it, the whole object is read, as before.
+ */
 export async function getS3ObjectAsString(
   key: string,
   bucket: string = DEFAULT_BUCKET,
-  options?: { maxRetries?: number; baseDelayMs?: number; sleep?: (ms: number) => Promise<void> },
+  options?: { maxRetries?: number; baseDelayMs?: number; sleep?: (ms: number) => Promise<void>; maxBytes?: number },
 ): Promise<string> {
   const maxRetries = options?.maxRetries ?? 3;
   const baseDelayMs = options?.baseDelayMs ?? 100;
@@ -187,9 +220,19 @@ export async function getS3ObjectAsString(
   let lastError: any;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const result = await s3.getObject({ Bucket: bucket, Key: key }).promise();
-      return result.Body?.toString('utf-8') || '';
+      const maxBytes = options?.maxBytes;
+      if (maxBytes === undefined) {
+        const result = await s3.getObject({ Bucket: bucket, Key: key }).promise();
+        return result.Body?.toString('utf-8') || '';
+      }
+      const result = await s3.getObject({ Bucket: bucket, Key: key, Range: `bytes=0-${Math.max(0, Math.floor(maxBytes))}` }).promise();
+      const body = result.Body;
+      const buffer = body === undefined || body === null ? Buffer.alloc(0) : Buffer.isBuffer(body) ? body : Buffer.from(body as any);
+      if (buffer.byteLength > maxBytes) throw new S3ObjectTooLargeError(maxBytes);
+      return buffer.toString('utf-8');
     } catch (error) {
+      // A ranged read of an empty object answers 416 InvalidRange: with a limit set, that object is simply empty (as a full read was).
+      if (options?.maxBytes !== undefined && ((error as any)?.code === 'InvalidRange' || (error as any)?.statusCode === 416)) return '';
       lastError = error;
       if (attempt >= maxRetries || !isTransientS3Error(error)) throw error;
       // Exponential backoff with light jitter: 100ms, 200ms, 400ms (+ up to 50ms).

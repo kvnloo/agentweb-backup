@@ -880,6 +880,31 @@ describe('HubSpotService — getDealContactAssociations', () => {
     expect(ids).toHaveLength(20); // 1 result per page × 20 pages
     warnSpy.mockRestore();
   });
+
+  // ENG-2840 (W2-9): the MCP read route's bound. Without stopAfter every page is read (the tests above).
+  it('stopAfter: stops paging once MORE than stopAfter ids are held, never reading the next page', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [{ id: 'c-1' }, { id: 'c-2' }, { id: 'c-3' }], paging: { next: { after: 'cursor-more' } } },
+    });
+    const ids = await svc.getDealContactAssociations('deal-99', { stopAfter: 2 });
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+    expect(ids).toEqual(['c-1', 'c-2', 'c-3']);
+  });
+
+  it('stopAfter: keeps paging while it holds stopAfter ids or fewer, and stops at the last page', async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { results: [{ id: 'c-1' }], paging: { next: { after: 'p2' } } } })
+      .mockResolvedValueOnce({ data: { results: [{ id: 'c-2' }], paging: { next: { after: 'p3' } } } })
+      .mockResolvedValueOnce({ data: { results: [{ id: 'c-3' }] } });
+    expect(await svc.getDealContactAssociations('deal-99', { stopAfter: 2 })).toEqual(['c-1', 'c-2', 'c-3']);
+    expect(mockAxiosGet).toHaveBeenCalledTimes(3);
+    mockAxiosGet.mockReset();
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { results: [{ id: 'c-1' }], paging: { next: { after: 'p2' } } } })
+      .mockResolvedValueOnce({ data: { results: [{ id: 'c-2' }] } });
+    expect(await svc.getDealContactAssociations('deal-99', { stopAfter: 5 })).toEqual(['c-1', 'c-2']);
+    expect(mockAxiosGet).toHaveBeenCalledTimes(2);
+  });
 });
 
 // ─── getDeal ──────────────────────────────────────────────────────────────────

@@ -69,7 +69,7 @@ export const META_EVENT_SOURCE_TOOL_DEFINITIONS = [
   },
   {
     name: 'meta_event_source_get_health',
-    description: 'Read-only. Health of one pixel of this ad account: whether it is available, when it last fired, and which business catalogs it is connected to.',
+    description: 'Read-only. Health of one pixel of this ad account: whether it is available, when it last fired, and which business catalogs it is connected to. If the business cannot be read, healthy and connected_catalogs are null and connected_catalogs_reason says why.',
     inputSchema: { type: 'object', properties: { ...ACCOUNT_PROP, ...PIXEL_PROP }, required: ['pixel_id'], additionalProperties: false },
   },
   {
@@ -89,7 +89,7 @@ export const META_EVENT_SOURCE_TOOL_DEFINITIONS = [
   },
 ];
 
-const READ_PATH_RE = /^(act_\d+(\/adspixels)?|\d+(\/(owned_product_catalogs|client_product_catalogs|external_event_sources|diagnostics))?)$/;
+const READ_PATH_RE = /^(act_\d+(\/adspixels)?|\d+(\/(owned_product_catalogs|client_product_catalogs|external_event_sources|diagnostics|stats))?)$/;
 const WRITE_PATH_RE = /^\d+\/external_event_sources$/;
 
 export interface MetaEventSourceDeps {
@@ -121,11 +121,35 @@ function assertOnlyKeys(args: any, allowed: string[]) {
   if (extra.length) throw new MetaToolkitRefusal(`Not allowed: ${extra.join(', ')}. Allowed: ${allowed.join(', ')}.`);
 }
 
-function firingState(pixel: any, now: number): 'UNAVAILABLE' | 'NEVER_FIRED' | 'NOT_FIRING' | 'ACTIVE' {
+type FiringState = 'UNAVAILABLE' | 'NEVER_FIRED' | 'NOT_FIRING' | 'ACTIVE';
+
+/** last_fired_time as epoch ms: Graph's ISO string, or unix seconds / ms if it arrives numeric. */
+function parseFiredTime(raw: unknown): number {
+  if (raw === undefined || raw === null || raw === '') return NaN;
+  if (typeof raw === 'number' || /^\d+$/.test(String(raw))) {
+    const n = Number(raw);
+    return n < 1e12 ? n * 1000 : n;
+  }
+  return Date.parse(String(raw));
+}
+
+function firingState(pixel: any, now: number): FiringState {
   if (pixel?.is_unavailable === true) return 'UNAVAILABLE';
-  const fired = pixel?.last_fired_time ? Date.parse(String(pixel.last_fired_time)) : NaN;
+  const fired = parseFiredTime(pixel?.last_fired_time);
   if (!Number.isFinite(fired)) return 'NEVER_FIRED';
   return now - fired > STALE_FIRE_MS ? 'NOT_FIRING' : 'ACTIVE';
+}
+
+/** Events Meta counted for the pixel over its `/stats` buckets (aggregation=event). */
+function countEvents(stats: any): number {
+  let total = 0;
+  for (const bucket of list(stats)) {
+    for (const row of Array.isArray(bucket?.data) ? bucket.data : []) {
+      const n = Number(row?.count);
+      if (Number.isFinite(n) && n > 0) total += n;
+    }
+  }
+  return total;
 }
 
 /** Run one ENG-2927 tool. `accountId` is the resolved, ownership-checked ad account. */
@@ -133,6 +157,10 @@ export async function runMetaEventSourceTool(
   name: MetaEventSourceToolName, userId: string, accountId: string, rawArgs: any, deps: MetaEventSourceDeps = defaultDeps,
 ) {
   const { confirm, preview_token: previewToken, ...args } = rawArgs ?? {};
+  const rawRead = async (path: string, params: Record<string, string>) => {
+    if (!READ_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported event source read.');
+    return deps.readGraph(userId, accountId, path, params);
+  };
   const read = async (path: string, params: Record<string, string>) => {
     if (!READ_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported event source read.');
     try {
@@ -143,8 +171,13 @@ export async function runMetaEventSourceTool(
   };
   const account = `act_${String(accountId).replace(/^act_/, '')}`;
 
-  const { businessId, catalogs } = await readBusinessCatalogs(read, accountId);
-  if (!businessId) throw new MetaToolkitRefusal('This ad account is not in a Meta Business portfolio, so it has no product catalogs.');
+  // get_health reads the business best-effort, after the pixel's firing state (which needs no business).
+  let catalogs = new Map<string, any>();
+  if (name !== 'meta_event_source_get_health') {
+    const business = await readBusinessCatalogs(read, accountId);
+    if (!business.businessId) throw new MetaToolkitRefusal('This ad account is not in a Meta Business portfolio, so it has no product catalogs.');
+    catalogs = business.catalogs;
+  }
 
   const ownedCatalog = (raw: unknown): string => {
     const id = String(raw ?? '');
@@ -165,6 +198,25 @@ export async function runMetaEventSourceTool(
     const pixel = (await accountPixels()).get(id);
     if (!pixel) throw new MetaToolkitRefusal(`Pixel ${id} is not a pixel of this ad account. Nothing was changed.`);
     return { id, pixel };
+  };
+  /*
+   * The pixel's own last_fired_time can lag far behind (a Zoma user saw "last fired Nov 24" next to
+   * 250+ PageViews today in event stats). A stale or missing last_fired_time is therefore only a
+   * verdict after the freshest signal — the pixel's event counts for the last 24 hours — also says
+   * nothing arrived. A failed stats read keeps the last_fired_time verdict; it never upgrades one.
+   */
+  const pixelState = async (pixel: any, now: number): Promise<{ state: FiringState; events_last_24h: number | null }> => {
+    const base = firingState(pixel, now);
+    if (base !== 'NOT_FIRING' && base !== 'NEVER_FIRED') return { state: base, events_last_24h: null };
+    let events: number | null = null;
+    try {
+      events = countEvents(await deps.readGraph(userId, accountId, `${String(pixel?.id)}/stats`, {
+        aggregation: 'event', start_time: String(Math.floor((now - STALE_FIRE_MS) / 1000)),
+      }));
+    } catch {
+      events = null;
+    }
+    return { state: events !== null && events > 0 ? 'ACTIVE' : base, events_last_24h: events };
   };
   const connected = async (catalogId: string) => list(await read(`${catalogId}/external_event_sources`, { fields: EVENT_SOURCE_FIELDS, limit: '100' }))
     .map((s: any) => ({ id: String(s?.id ?? ''), name: s?.name ?? null }));
@@ -192,12 +244,30 @@ export async function runMetaEventSourceTool(
     case 'meta_event_source_get_health': {
       assertOnlyKeys(args, ['account_id', 'pixel_id']);
       const { id, pixel } = await ownedPixel(args.pixel_id);
-      const state = firingState(pixel, deps.now());
-      const connectedCatalogs = await catalogsOf(id);
+      const { state, events_last_24h: eventsLast24h } = await pixelState(pixel, deps.now());
+      let catalogsUnavailable: string | null = null;
+      try {
+        // rawRead: the reason carries Meta's own message, not read()'s "Nothing was changed." refusal wrapper.
+        const business = await readBusinessCatalogs(rawRead, accountId);
+        if (business.businessId) catalogs = business.catalogs;
+        else catalogsUnavailable = 'not in a Meta Business portfolio';
+      } catch (error: any) {
+        const message = metaMessage(error);
+        catalogsUnavailable = /business_management/i.test(message)
+          ? 'missing business_management permission'
+          : `could not read the business or its catalogs (${message})`;
+      }
+      const connectedCatalogs = catalogsUnavailable ? null : await catalogsOf(id);
       return {
         account_id: accountId, pixel_id: id, name: pixel?.name ?? null, state,
-        last_fired_time: pixel?.last_fired_time ?? null, connected_catalogs: connectedCatalogs,
-        healthy: state === 'ACTIVE' && connectedCatalogs.length > 0,
+        last_fired_time: pixel?.last_fired_time ?? null,
+        ...(eventsLast24h !== null ? { events_last_24h: eventsLast24h } : {}),
+        ...(state === 'ACTIVE' && eventsLast24h !== null && eventsLast24h > 0 && firingState(pixel, deps.now()) !== 'ACTIVE'
+          ? { state_source: 'event_stats', note: `Meta's last_fired_time is stale, but its event stats show ${eventsLast24h} events in the last 24 hours, so the pixel is firing.` }
+          : {}),
+        connected_catalogs: connectedCatalogs,
+        ...(catalogsUnavailable ? { connected_catalogs_reason: catalogsUnavailable } : {}),
+        healthy: connectedCatalogs === null ? null : state === 'ACTIVE' && connectedCatalogs.length > 0,
       };
     }
 
@@ -211,7 +281,9 @@ export async function runMetaEventSourceTool(
       const now = deps.now();
       const recommendations: Array<{ type: string; severity: string; message: string; pixel_id?: string }> = [];
       if (sources.length === 0) {
-        const candidates = [...pixels.values()].filter((p) => firingState(p, now) === 'ACTIVE').map((p) => String(p.id));
+        // Bounded: one stats read per stale pixel, for at most 20 pixels.
+        const states = await Promise.all([...pixels.values()].slice(0, 20).map(async (p) => ({ p, s: (await pixelState(p, now)).state })));
+        const candidates = states.filter(({ s }) => s === 'ACTIVE').map(({ p }) => String(p.id));
         recommendations.push({
           type: 'NO_EVENT_SOURCE', severity: 'MUST_FIX',
           message: candidates.length
@@ -222,7 +294,7 @@ export async function runMetaEventSourceTool(
       for (const s of sources) {
         const own = pixels.get(s.id);
         if (!own) continue; // another account's pixel: not inspected
-        const state = firingState(own, now);
+        const { state } = await pixelState(own, now);
         if (state !== 'ACTIVE') recommendations.push({ type: `PIXEL_${state}`, severity: 'MUST_FIX', pixel_id: s.id, message: `Connected pixel ${s.id} is ${state.toLowerCase().replace(/_/g, ' ')}; catalog events cannot match products.` });
       }
       for (const d of list(diagnostics)) {

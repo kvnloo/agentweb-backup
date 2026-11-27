@@ -60,12 +60,16 @@ import {
   driveErrorCode,
   driveThrottleRefusal,
 } from './shared/googleDriveErrors';
+import { auditSharedGoogleRead } from '../../services/sharedGoogleAudit';
 
 export async function readGoogleFileById(fileId: string, userId: string): Promise<any> {
   // ENG-1277: lazy load — see getGoogleDriveClient() for why.
   const { google } = await import('googleapis');
   let drive: any;
   let usingOAuth = false;
+  // Log-only (sharedGoogleAudit.ts): a read through the platform's shared service account for a file id nothing proves this caller owns.
+  const auditSharedAccount = (reason: 'no_oauth' | 'oauth_denied', outcome: 'ok' | 'failed') =>
+    auditSharedGoogleRead({ kind: 'drive-file', userId, ids: [fileId], source: 'readGoogleFileById', reason, outcome });
   try {
     const oauthClient = await getGoogleDriveOAuthClient(userId);
     drive = google.drive({ version: 'v3', auth: oauthClient });
@@ -100,14 +104,20 @@ export async function readGoogleFileById(fileId: string, userId: string): Promis
   };
 
   try {
-    return await readWithDrive(drive);
+    const result = await readWithDrive(drive);
+    if (!usingOAuth) auditSharedAccount('no_oauth', 'ok');
+    return result;
   } catch (oauthErr: any) {
+    if (!usingOAuth) auditSharedAccount('no_oauth', 'failed');
     // OAuth drive.file scope can't access files it didn't create — retry with SA
     if (usingOAuth && (oauthErr?.code === 403 || oauthErr?.status === 403 || oauthErr?.code === 401 || oauthErr?.status === 401)) {
       try {
         const saDrive = await getGoogleDriveClient();
-        return await readWithDrive(saDrive);
+        const saResult = await readWithDrive(saDrive);
+        auditSharedAccount('oauth_denied', 'ok');
+        return saResult;
       } catch (saErr: any) {
+        auditSharedAccount('oauth_denied', 'failed');
         // ENG-1300: carry the real numeric HTTP status through so a clean
         // 401/403/404 classifies as auth/not_found instead of the generic
         // Error/bug fallback once toolResultError rebuilds an Error from the

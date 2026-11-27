@@ -69,6 +69,45 @@ describe('executePreparedTools for a share-link visitor (ENG-2816)', () => {
     expect(toolMessages(input).join('\n')).toContain(`Tool \\"save_memory\\" acts on the owner's organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.`);
   });
 
+  // ENG-3170: Full control = everything a customer can do. The early refusal asks the link (through an optional port); an admin tool is never lifted.
+  describe('a link whose owner turned on full control', () => {
+    it('does not turn away an owner-only tool or connect_account, and runs them', async () => {
+      const exec = jest.fn().mockResolvedValue({ ok: true });
+      const ports = { ...makePorts(exec), shareLinkFullControl: jest.fn().mockResolvedValue(true) };
+      const input = makeInput([call('c1', 'save_memory', { content: 'x' }), call('c2', 'connect_account')], ports);
+      await executePreparedTools(input);
+      expect(exec).toHaveBeenCalledTimes(2);
+      expect(ports.shareLinkFullControl).toHaveBeenCalledWith('session-share-1234567890');
+      expect(toolMessages(input).join('\n')).not.toContain('not available in shared sessions');
+    });
+
+    it('still refuses an ADMIN tool', async () => {
+      const exec = jest.fn();
+      const ports = { ...makePorts(exec), shareLinkFullControl: jest.fn().mockResolvedValue(true) };
+      const input = makeInput([call('c1', 'get_user_by_id')], ports);
+      await executePreparedTools(input);
+      expect(exec).not.toHaveBeenCalled();
+      expect(toolMessages(input).join('\n')).toContain('Tool \\"get_user_by_id\\" is not available in shared sessions.');
+    });
+
+    it.each([['says no', jest.fn().mockResolvedValue(false)], ['is not wired', undefined]])('keeps the refusal when the link %s', async (_label, port) => {
+      const exec = jest.fn();
+      const ports: ToolDispatchPorts = { ...makePorts(exec), ...(port ? { shareLinkFullControl: port as any } : {}) };
+      const input = makeInput([call('c1', 'save_memory', { content: 'x' })], ports);
+      await executePreparedTools(input);
+      expect(exec).not.toHaveBeenCalled();
+      expect(toolMessages(input).join('\n')).toContain('is not available in shared sessions');
+    });
+
+    it('asks nothing for an ordinary tool, and nothing outside a share session', async () => {
+      const exec = jest.fn().mockResolvedValue({ ok: true });
+      const ask = jest.fn().mockResolvedValue(true);
+      await executePreparedTools(makeInput([call('c1', 'read_brand_guidelines')], { ...makePorts(exec), shareLinkFullControl: ask }));
+      await executePreparedTools(makeInput([call('c2', 'save_memory', { content: 'x' })], { ...makePorts(exec), shareLinkFullControl: ask }, { isInteractiveShare: false }));
+      expect(ask).not.toHaveBeenCalled();
+    });
+  });
+
   it('refuses an admin tool and connect_account with the share wording', async () => {
     const exec = jest.fn();
     const input = makeInput([call('c1', 'get_user_by_id'), call('c2', 'connect_account')], makePorts(exec));

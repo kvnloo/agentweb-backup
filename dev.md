@@ -1,3 +1,1034 @@
+## ENG-3196: Pure campaign-change risk classifier for Emma action engine (2026-11-26)
+
+Adds `backend/src/services/campaignChangeRiskPolicy.ts`, a deterministic, fail-closed, tenant-scoped classifier (execute / stage_for_approval / reject). Shadow library only; not wired into any execution path. First slice of ENG-1970.
+
+## ENG-3195: zoma_status no longer claims a card is on file when none is required (2026-11-26)
+
+`ZOMA_REQUIRE_PAYMENT_METHOD` is unset in prod by design (ENG-3131 asks for the card at first publish), and while unset `hasPaymentMethod` returns true without looking for a card. `formatZomaStatus` therefore ticked "[x] Payment method on file" for brand-new accounts with no card (seen in the Nov 26 prod signup test, relayed by Claude as "Payment: on file"). The checklist now omits the line while no card is required, and readiness carries `payment.required: false`. Card-required mode and the write gate are unchanged. Note for test runs: jest path patterns match the absolute path, so a worktree named after the ticket matches every suite; anchor patterns on `__tests__/(...)`.
+
+## ENG-2840: Log-only audit of reads through the shared Google service account (2026-11-26)
+
+- Where a caller names a Google resource that nothing proves they own, and AgentWeb's OWN Google service account then reads it:
+  `readGoogleFileById` (a `gdoc:<id>` / `gsheet:<id>` knowledge-base identifier, the `read_knowledge_base_files` MCP tool, Emma's Google file
+  reader) falls back to the service account when the caller has no Google Drive login or their own login is refused (401/403), with no check
+  that the caller owns or registered the file; the analytics readers read the GA4 property ids and Search Console domains SAVED in a user's or
+  organization's analytics config, which `analyticsConfigValidator.ts` checks for format only (GA4 property ids are plain numbers); and
+  registered Google Drive folders (`POST /api/settings/google-drive/folders` checks only that the service account can see the folder) are read
+  with the service account by the knowledge-base search, listing, reading and materializing code and by the folder-files route.
+- This change is step 1 of a two-step fix and changes nothing a customer can do: it writes one structured `shared_google_read` line per
+  configured resource per call to the application log (`services/sharedGoogleAudit.ts`): `kind` (`drive-file`, `ga4`, `gsc`), `userId`, `idHash`
+  (12 hex characters of a SHA-256 of the id; a Search Console property is first lowercased and stripped of its scheme, trailing slash and
+  `sc-domain:` prefix, so the forms of one site share a hash; this also merges an http and an https URL-prefix property and a domain property
+  of the same site, which Google treats as separate, erring toward more matches), `source` (the function or route), then when known `orgId` (analytics lines only: the
+  Drive reader does not know the caller's organization), `configSource` (`self`: the caller's
+  own config; `org`: the organization's, shared with a member), `platform` (true when the id is one of the platform's own landing-page GA4
+  properties or Search Console domains from `getLandingPagesConfig`, which deploying a landing page adds to the deployer's config; the list is
+  loaded in the background at most every 10 minutes whether or not the load works; until a load works, lines carry no `platform`, never
+  `false`), for Drive `reason` (`no_oauth`,
+  `oauth_denied`) and `outcome` (`ok`, `failed`), and `ofIds` when one call read several. Hooked in `readGoogleFileById`, the three `seoService`
+  readers, the portal's `GET /api/seo/metrics` (including the platform landing-page property it adds for a host named in `?domain=`),
+  `GET /api/seo/product-metrics`, and the GA4 probe `POST /api/seo/config/ga/test` (any numeric property id the caller names; not hooked:
+  `GET /api/seo/debug`, which reads the first configured domain that `/metrics` already logs). It never throws and never changes what a read returns or asks Google.
+- Reading the numbers: CloudWatch Logs Insights on `/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log`. The lines carry
+  a syslog prefix, so fields are parsed from `@message` (a plain `filter audit = ...` matches nothing). Resources read by several accounts,
+  the platform's own ids left out:
+  `fields @message | filter @message like /"audit":"shared_google_read"/ and @message not like /"platform":true/ | parse @message /"kind":"(?<kind>[^"]+)","userId":"(?<userId>[^"]+)","idHash":"(?<idHash>[0-9a-f]+)"/ | stats count_distinct(userId) as users, count(*) as lines by kind, idHash | sort users desc`.
+  Lines written before the platform list loaded carry no mark, so take the platform hashes out by hash as well: list them with
+  `fields @message | filter @message like /"platform":true/ | parse @message /"idHash":"(?<idHash>[0-9a-f]+)"/ | stats count(*) by idHash`.
+  A hash with several users is legitimate when they are all members of one organization: list them with
+  `fields @message | filter @message like /"idHash":"<hash>"/ | parse @message /"userId":"(?<userId>[^"]+)"/ | parse @message /"orgId":"(?<orgId>[^"]+)"/ | stats count(*) by userId, orgId`.
+  Drive lines have no `orgId`; join their userIds to organizations offline. Drive fallback use:
+  `fields @message | filter @message like /"audit":"shared_google_read"/ and @message like /"kind":"drive-file"/ | parse @message /"userId":"(?<userId>[^"]+)"/ | parse @message /"reason":"(?<reason>[^"]+)","outcome":"(?<outcome>[^"]+)"/ | stats count(*) as reads, count_distinct(userId) as users by reason, outcome`.
+  Registered Drive folders are counted from the stored registrations (user and organization `googleDriveFolders`), not from this log.
+- Known limits: a line is written per CONFIGURED id per call, also when a filter narrows the read to one id, when the read then fails, and
+  for a portal request answered 400, so `users` counts are right and `lines` overstate reads; `no_oauth` also covers a failure to build the
+  caller's Drive client, and `oauth_denied`/`failed` also covers a failure to build the service-account client; the hash keeps raw Drive file
+  ids out of the log but is not secret for GA4 property ids and domains (raw domains are already logged by the Search Console reader); the
+  line records the id used, not who owns the resource. Step 2 (enforcement: only ids the caller registered or can open with their own Google
+  login; a property or domain saved only when the customer's own Google login can see it; folders likewise) waits for these numbers, and its
+  refusal text is customer-facing copy for Harsha to review.
+- Found while auditing, pre-existing and reported separately (not changed here): the platform landing-page GA4 property and Search Console
+  domain are read without a limit to the caller's own landing-page hosts (for a host named in `?domain=`, and for every user whose config
+  received them on deploy).
+
+## ENG-2840: Provider reads for outside agents over MCP: HubSpot, Fathom, Luma, LinkedIn Ads, link scan, email lookup (2026-11-26)
+
+- Nine of Emma's tools on the MCP server for outside agents on their own account, under Emma's names. Each is a read-only subset:
+  - `call_hubspot_api`: an explicit list of 30 (entity, action) read pairs (`utils/hubspotReadArgs.ts`, shared by the tool and its route).
+  - `fathom_get_meetings` and `fathom_get_transcript`: the caller's own Fathom only.
+  - `luma_list_events` and `luma_get_guests`.
+  - `call_linkedin_ads_insights_api`: the whole ad account, broken down by `pivot` (campaign group, campaign, ad, ...).
+  - `call_linkedin_marketing_api`: AD_ACCOUNT LIST, CAMPAIGN_GROUP LIST, CAMPAIGN LIST, CREATIVE LIST, and TARGETING LIST_FACETS / SEARCH / ESTIMATE_REACH.
+  - `scan_website_links`: in-process, Emma's crawler.
+  - `find_or_lookup_email`: one email to a profile only, through the portal's own `POST /api/crm/leads/lookup-by-email` and its 50-a-day quota.
+- Same pattern as the other wave-2 tools:
+  - Arguments are checked by name and by value. Ids go raw into provider URLs (HubSpot paths, LinkedIn query strings, the Fathom path), so every id, cursor, date and enum is checked strictly.
+  - Each tool calls a new metered `/api/emma/*` route as the key's own user: `/hubspot-read`, `/fathom-meetings`, `/fathom-transcript`, `/luma-events`, `/luma-guests`, `/linkedin-ads/insights`, `/linkedin-ads/read`.
+  - The route checks the arguments again and calls Emma's own code with `req.user.userId` only.
+  - A 4xx passes through; a 5xx or no answer gets a fixed text.
+  - Answers are fixed fields, cut to about 60 KB (`truncated`).
+  - Every tool has a per-caller `CallGuard`: one call at a time, a process cap and an hourly cap.
+- Annotations: every provider read is a `write`, because it can refresh and store the owner's OAuth token or write a reconnect flag; `find_or_lookup_email` records quota use. `scan_website_links` is a `read`. None runs the agent. These tools are not exempt from the outside-content sanitizer: HubSpot records, transcripts and guest answers are third-party content.
+- No new opt-in key scopes. A `tools:execute` key can already have Emma call every one of these tools, writes included, through `emma_send_message`, so direct reads add nothing that key could not reach.
+- Bounds Emma does not have:
+  - Over MCP, HubSpot deal contacts stop at 100 (paging stops there too, `contacts_cut`), and the route applies Emma's sandbox check.
+  - LinkedIn reads are limited to 30 s per request, 5 pages, 500 elements and 10 referenced posts expanded.
+  - AD_ACCOUNT LIST over MCP returns only ad accounts the caller has connected or shared. The token alone can see every account its owner manages, including an agency's clients. When the 500-element bound cut that list, the answer says `truncated`.
+  - Over MCP the insights tool takes no campaign, creative or campaign-group filter, and there is no POST GET. On an org-shared connection
+    the owner's token can read accounts and posts that were never shared, and LinkedIn does not document that such a filter is intersected
+    with the account, so a filter id from another account could have returned that account's numbers. Breakdowns come from `pivot`.
+  - The link scan is capped at 100 pages, 500 links and 60 s, 10 an hour per caller.
+  - `include_phone` is not an input of `luma_get_guests`.
+- Shared services take new optional arguments. The default keeps Emma exactly as before:
+  - `handleHubspotApi(userId, args, options?)`.
+  - `HubSpotService.ownerUserId`.
+  - `linkedInAdsService` reads take `bounds?` (timeout, page and element caps); `callLinkedInMarketingApi` / `callLinkedInAdsInsightsApi` take a last `bounds?`.
+- Changed for Emma too:
+  - Fathom requests and the Fathom token refresh time out after 30 s with no data (they had no timeout).
+  - The link crawler's requests end at their time limit even while data still trickles in (an abort signal). Before, a slow site kept the
+    socket, and up to 1 MB, open after the scan had given up on it.
+- Not exposed:
+  - `fathom_get_onboarding_context`: AgentWeb's internal sales notes about the customer.
+  - `fathom_route_action_items`.
+  - Every HubSpot and LinkedIn write.
+  - The `find_or_lookup_email` find path: it spends AgentWeb's provider credits outside the 50-a-day gate.
+  - `/api/crm/leads/find-email`: it pools other tenants' stored emails, by its locked design.
+- Known, not changed here (Emma, pre-existing):
+  - HubSpotService puts ids raw into URL paths on writes too. A crafted `../` id could reach another object in the same portal; this is not cross-tenant.
+  - Emma's LinkedIn reads have no timeout or page cap.
+  - Emma's `find_or_lookup_email` never applies the 50-a-day gate, and its `quotaHit` flag catches the wrong error class.
+  - Luma has a per-caller budget, not a per-calendar one.
+  - A self-call wait (2 to 4 minutes) can end before a slow provider read finishes. The route then keeps running; the hourly cap still bounds it.
+- Proof: these tests, plus the inventory, annotation, route-budget and plan-route limit gates:
+  - `hubspotReadTool.test.ts`, `meetingEventReadTools.test.ts`, `linkedInAdsReadTools.test.ts`, `siteScanAndLookupTools.test.ts`.
+  - `emmaHubspotReadRoutes.test.ts`, `emmaMeetingEventRoutes.test.ts`, `emmaLinkedInAdsReadRoutes.test.ts`.
+  - `linkedInAdsReadBounds.test.ts`: the route's bounds checked through Emma's real code down to the HTTP calls.
+
+## ENG-2840: Platform landing-page analytics are read only for the caller's own pages (2026-11-26)
+
+- The problem (pre-existing, found while auditing the shared Google service account): landing pages deploy onto platform domains, and
+  their traffic is tracked in the platform's OWN GA4 properties and Search Console domain properties (`getLandingPagesConfig`: the
+  `agentwebforms.com` mapping and `additionalDomains`). Two ways let a customer read other customers' landing-page traffic through the shared
+  service account: `GET /api/seo/metrics?domain=<any managed landing host>` added the platform property and filtered GA4 (and, through the
+  "parent domain" fallback, Search Console) to the host NAMED in the request, with no check that the host was the caller's; and deploying a
+  landing page adds the platform property and root domain to the deployer's analytics config (`v0Service.ts`, auto-configure), so the
+  deployer's unfiltered analytics (the portal's Analytics & SEO page, Emma's `get_website_analytics` / `get_seo_metrics`, the product and
+  funnel reports) included every customer's landing-page sessions, pages, sources and search queries, minus only their own `gaFilteredDomains`.
+- The fix (`services/landingAnalyticsScope.ts`): every read of the managed base's platform property or domain keeps only the caller's own
+  locations. Only the config mappings for the managed base (`agentwebforms.com`, customDomainService `SUBDOMAIN_BASE`, and its
+  subdomains) are scoped: the other entry (audit pages on `agentweb.pro`, AgentWeb's own domain, where customers cannot deploy) holds
+  AgentWeb's own pages, and scoping it would cut AgentWeb's own site analytics (the founders' SEO page, Emma for them, the admin business
+  funnel's `agentweb.pro` read). A customer who saves `agentweb.pro` or its property in their own config is the broader "any property the
+  service account can open" gap, handled by the shared-account audit and its enforcement step.
+  GA4: `scopeGaClient` wraps the Data API client at every place one is created for a customer read (`/metrics` and its funnel,
+  `/product-metrics`, `fetchGoogleAnalyticsMetrics`); a `runReport` on a platform property gets the own-locations dimension filter ANDed to
+  its own. Search Console: `gscScopeFilter` adds a `page` `includingRegex` filter for a platform domain property or any subdomain property of
+  it (`/metrics`, `/debug`, `fetchSearchConsoleMetrics`). `?domain=` adds the platform property only for a host where the caller has a page.
+  A caller with no own location gets an impossible filter (an empty answer of the usual shape), never the whole property. Customer-owned
+  properties and domains are untouched.
+- Own locations: the ACTIVE domains the caller and the members of the caller's organization own in AW-CustomDomains (managed subdomains
+  and verified custom domains: whole host; a pending custom-domain row can be written for any host nobody has attached yet, even one of
+  AgentWeb's own, so it is not ownership), plus each own non-archived landing page's URL: a project's own `*.vercel.app` host whole; on a platform
+  domain host not owned in AW-CustomDomains, only that host AND the page path (`/acme` and below, never `/acme-2`); the root of such a
+  host is never claimed. A read failure of these lists fails closed (no location) and is not cached. Cached 5 minutes per caller; at most
+  100 locations. GA4 ids are compared without `properties/`, padding or leading zeros (a padded id saved in a config is the same property).
+  Platform ids are cached 10 minutes; the managed base's Search Console domain is always recognised, but its GA4 property id comes only
+  from the config: if the config has never loaded, that property cannot be recognised (reads of it behave as before) and
+  `[landingAnalyticsScope] the platform landing-page GA4 property could not be loaded` is logged on every attempt (one a minute).
+- What a customer sees change: only their own landing pages' traffic on the platform property (before: every customer's). Their own
+  GA4 properties and Search Console domains are read exactly as before. GA4 key-event configuration of a platform property (event names,
+  no traffic) is not filtered. Not changed: the GA4 probe `POST /api/seo/config/ga/test` (it reports only whether the service account can
+  open a property).
+- Changed for AgentWeb's own accounts: `?domain=audit.agentweb.pro` (or another host of the unscoped `agentweb.pro` mapping) no longer adds
+  the audit property unless the account owns that host (a domain row or a page path there); the founders' normal reads of their own
+  config are unchanged.
+- Residual risks, known: a managed subdomain released by one customer and later taken by another gives the new owner the old owner's
+  history for that host (ownership has no start date); a page on a managed host with no domain row ("rowless" pages) gets no root-page
+  traffic, since the root of a host the caller does not own is never claimed; more than 100 own locations are cut (fewer of the caller's
+  own pages, never another's). A new GA4 or Search Console read of customer analytics must go through `scopeGaClient` / `gscScopeFilter`
+  (the client factory itself is not scoped; only `runReport` is wrapped).
+- Proof: `landingAnalyticsScope.test.ts` (filters, regex boundaries, own-location rules, org members, fail-closed, caching, the client
+  wrapper), `seoRoutes.landingScope.test.ts` (a deployer, `?domain=` another customer's host, the caller's own host, product metrics) and
+  `seoService.landingScope.test.ts` (Emma's readers). Removing the GA wrapper or the Search Console filter from `/metrics` fails the route
+  tests; removing the funnel wrapper or the `/debug` filter fails theirs.
+
+## ENG-2840: File read, lead event and status note for outside agents over MCP (2026-11-26)
+
+- `read_file_content` (`mcp/server/fileReadTool.ts`): the text of ONE file in the caller's own AgentWeb storage (chat attachments, files
+  saved with `save_file`, Emma's outputs), through `POST /api/emma/read-file`. Emma's reader also fetches any public web URL from AgentWeb's
+  servers with no size limit; over MCP that would be an open fetch proxy, so the tool always sends `own_storage_only: true` (any URL that
+  `extractS3KeyFromUrl` does not claim is refused before anything else is answered or fetched) and `max_bytes` 10 MB (`readFileContent`
+  refuses a larger stored file from its stored size before reading, and stops the stream past the limit, aborting the S3 request so its
+  connection is freed). Both are new optional route fields (`max_bytes` only together with `own_storage_only`: it limits stored files only);
+  without them the route and Emma's tool behave as before. "Own" is `readFileContent`'s rule: `users/<caller>/` or `sandbox/<caller>/`
+  of the bucket; task results and knowledge-base files are not readable here. One read per caller at a time, 4 per process. The answer is
+  built from fixed fields (content, truncated, file_type, file_size, content_length, content_hash; never the URL echo, the route message or a
+  raw error), so it is exempt from the public sanitizer like the memory tools (`OWN_CONTENT_TOOL_NAMES`): a JSON file comes back as stored.
+  Read-only (a `tools:read` key may call it; it is in the inventory gate's proven-read-only list, the name contains "file"). Emma's image and
+  video refusals name her own describe tools, which outside agents lack, and are reworded; Emma's truncation message (which offers a
+  byte range her tool does not take) is unchanged and not relayed: the tool writes its own note. Known limits, as in Emma: the 10 MB counts
+  stored (compressed) bytes, so a crafted Office file can unpack much larger in the parser; the 4-reads-per-process pool is shared by all
+  callers (one each).
+- `add_lead_engagement` (`mcp/server/leadEngagementTool.ts`): one event on a lead, through a new thin route `POST /api/emma/add-lead-engagement`
+  (metered) over Emma's own handler and list check (list owner, organization owner, listed CRM editors; not the CRM route, which alerts the
+  list owner by email/Slack/WhatsApp). Checked in the tool: `custom.` + 1 to 53 of [a-z0-9_.-]; `event_data` at most 20 keys of simple values
+  (text up to 500 characters, numbers, true/false, null), 2 KB, keys other code reads (`smartleadEventKey`, `from`, `to`, `subject`, `message`,
+  `content`, `platform`, `reason`, `source`, `linkedin`, `campaignId`, `accountId`, `invitationId`) and the server's own (`channel`,
+  `idempotencyKey`, `eventId`, `eventType`, `createdAt`) refused, as are the public-schema privacy names (transcripts, locations, IP); `event_date`
+  ISO with a zone, at most 5 minutes ahead and a year back; `idempotency_key` without the words clicked, replied or received (it is stored in
+  the event's data, which the engaged rule scans); 120 events an hour per caller (in-process). In Emma's handler, only for this route
+  (`AgentEngagementLimits`): the event is stamped `channel: 'mcp'` (a caller's own `channel`/`idempotencyKey` data is dropped), a lead takes at
+  most 50 such events and none when its stored record is 300 KB or more (`utils/agentEngagementLimits.ts`; the item limit is 400 KB and a full
+  lead breaks every other writer on it), an `idempotency_key` already on the lead records nothing (`recorded: false, duplicate: true`), and the
+  append is conditional on the lead's `updatedAt` (re-read and re-decided up to 3 times). A lead without `updatedAt` is appended without the
+  condition, so two simultaneous calls with the same key could both record there. A 5xx or no answer says the event may or may not have been
+  recorded and how to check. Events containing "clicked", "replied" or "received" mark the lead engaged (Emma's rule). No CRM sync, no alert,
+  no conversion relay; the portal's live CRM view is not refreshed.
+- `manage_leads update` takes `status_note` (with `updates.status` only, refused on every other action; 1 to 500 characters, checked
+  before trimming): sent as `statusNote` to
+  the lead update route, which takes it out of the body before anything else reads it, stores it as `notes` in the `status.changed` event only
+  when the status really changes, and answers `statusNoteRecorded` (absent when no note was sent). It never touches the lead's own `notes`.
+  Same shape as Emma's `update_lead_status` note. The route still writes that event before the lead update (unchanged), so a failed update can
+  leave the event and its note.
+- Not exposed, and why: see brain `eng-2840-w27-scope-and-findings-2026-11-25.md` (`search_user_assets`, `materialize_knowledge_base_asset`,
+  `attach_knowledge_base_files`, the follow-up and conversation-status reads, `update_email_draft_for_lead`, `ask_crm`, `analyze_crm_data`).
+- Proof: unit tests of both tools (`mcp/server/__tests__/fileReadTool.test.ts`, `leadEngagementTool.test.ts`), the reader's limits
+  (`readFileContent.ownStorageLimits.test.ts`), both routes (`emmaApi.readFileAndEngagement.test.ts`), the handler's limits
+  (`leads.addLeadEngagement.agentLimits.test.ts`), the status note on the route and in the MCP update (`crm.statusNote.test.ts`,
+  `mcp.manageLeads.statusNote.test.ts`), and two tenants end to end through the real MCP server, routes and handlers on the in-memory
+  database (`mcp.leadEngagement.twoTenant.test.ts`): another tenant's list is refused and its lead unchanged, the stamp, the duplicate key, the
+  per-lead cap, and the status note stored in the event and not on the lead.
+
+## ENG-2840: Three security fixes in Emma's tools: lead lookup ownership, LinkedIn upload downloads, HubSpot write labels (2026-11-26)
+
+- `find_or_lookup_email` (`emma/emailLookupTool.ts`): with `leadId` + `listId` it loaded the lead by key with no ownership check, so any
+  caller holding both ids (including through text an agent was fed) got another tenant's lead email, name, company and LinkedIn. The lead
+  is now read only from a list the caller may read (`canAccessCrmList`); otherwise it is treated like a missing lead.
+- `call_linkedin_marketing_api` MEDIA uploads (`emma/impl/adsApis.ts`): any key of our bucket was presigned for any caller, and any other
+  URL was downloaded with a plain GET (no SSRF guard, no size cap, no timeout). Now a file of our bucket is read only when the storage rule
+  lets this caller read that key (`checkOurBucketKeyRead`), through the SDK with a byte ceiling; any other URL goes through the
+  SSRF-guarded caller-URL fetch with a byte ceiling and a time limit (`LINKEDIN_UPLOAD_MAX_BYTES`: image 20 MB, document 100 MB, video
+  200 MB; 60 s, 120 s, 180 s).
+- The Meta seed-audience CSV fetch (`fetchAndParseCsvRows`, used when a targeted campaign is launched from a `csv_url`) had the SSRF guard
+  but no size cap and no timeout: an endless or very slow body was held in memory. It is now bounded at 50 MB and 60 s for the whole download (an abort signal, not only an idle timeout).
+- Emma's tool gateway (`services/agentToolGatewayService.ts`) labelled `call_hubspot_api` SUBMIT, ENABLE, UNPUBLISH, DISABLE, ADD_ASSET and
+  REMOVE_ASSET as reads (safe to repeat, no confirmation flag). They are now writes (ENABLE external_publish, SUBMIT external_send,
+  UNPUBLISH destructive, the others internal_write), only the known reads are reads, and an unknown action is a write.
+- Found in the W2-9 research (brain `eng-2840-w29-research-2026-11-26.md`). Not changed here: the portal's `/api/crm/leads/find-email`
+  pools other tenants' stored emails by its locked design; it is not exposed over MCP.
+- Proof: `emma.emailLookupTool.test.ts` (another tenant's list is never read), `linkedInAds.agentMode.test.ts` (guarded fetch with
+  ceilings, own-bucket rule, refusals), `agentToolGateway.hubspotEffects.test.ts`. Known unrelated failure on main:
+  `emmaToolArgContracts.test.ts` "leaves unknown endpoints..." fails on origin/main 345ef0983 without this change.
+
+## ENG-2840: Content tools for outside agents over MCP, and five security fixes (2026-11-26)
+
+- Six of Emma's content tools on the MCP server (`mcp/server/contentTools.ts`), chosen by 30-day Emma usage among tools with no MCP twin:
+  `list_html_templates` (read), `create_html_file`, `create_html_from_template`, `update_html_file`, `describe_image` (read),
+  `perform_data_analysis`. Same pattern as the other wave-2 tools (arguments by name and value, the portal's own `/api/emma/*` route as
+  the key's own user, refusals as errors with the route's short message only, fixed text for a 5xx or a timeout, answers built from fixed
+  fields). Bounds Emma does not have: one call at a time per caller, at most 8 callers at once per process (4 for analysis) and a number
+  an hour per caller for each tool (`GUARDS`); self-call waits of at most 9 minutes (`TIMEOUTS_MS`), because the outside request is cut at
+  600 s by the load balancer and nginx (a longer run answers "did not answer in time"; a file may still appear); the model is never the
+  caller's choice and no session is attached; `update_html_file`, `describe_image` and `perform_data_analysis` take only files of the
+  caller's own AgentWeb storage, because Emma's versions fetch any public URL (an open fetch proxy over MCP). The owner of the named file
+  is checked by Emma's code: `update_html_file` writes only for the owner, `describe_image` asks the storage rule (below), and analysis
+  files are sent as `s3://<bucket>/<key>` (the URL path decoded once), the path where the analysis asks the storage rule before reading.
+  Text: control characters are refused everywhere; zero-width and direction characters only in single-line fields (titles, ids, URLs),
+  since content legitimately holds them (joined emoji, Persian, Hebrew, Arabic). Not exposed: Slack reads (one AgentWeb bot token for every tenant, privacy question open), `convert_to_pdf` (renders any URL in a
+  browser), `create_html_template` (overwrites by name, fetches URLs; later). Known: files these tools create sit in the caller's folder of
+  a bucket that serves an object to anyone holding its URL (the descriptions say so); `update_html_file`'s `_v2` name is deterministic, so
+  editing the same original twice writes the same name (said in the description, unchanged in Emma).
+- Fix: custom domains. `addCustomDomain` refuses AgentWeb's own domains and their subdomains (`RESERVED_PLATFORM_DOMAINS`: agentweb.pro,
+  agentwebforms.com, hireemma.ai) before any Vercel call (400 from `POST /api/domains/custom`), and the reconcile cron skips them. Every
+  customer project is in AgentWeb's own Vercel team, so Vercel reported such a host verified with no proof from the customer, and the
+  API's CORS list trusts those domains. Managed subdomains (`addSubdomain`) and page subdomains are unaffected. Re-attaching one of these
+  domains is done by hand in Vercel. Production on 2026-11-26 holds one such custom row, `hireemma.ai` (active: AgentWeb's own site).
+  Not covered: a subdomain of another customer's custom domain held in the same Vercel team.
+- Fix: Slack. Emma's `slack_get_thread_replies` had no user check (any session could read any thread in any channel the bot is in); it is
+  now scoped like `slack_get_recent_messages`. A non-admin naming a channel that does not exist and one that is not theirs now gets the
+  same answer (the name lookup covers every bot channel: it was a list of which clients' channels exist). A Slack tool call with no user
+  attached now reads, lists and posts nothing (it used to act as an admin; every tool call passes a user today). `GET /api/slack/channels` gave a
+  user with no personal channel every bot channel (other clients' names); it now lists, for anyone but a real (non-delegated) admin, only
+  the channels `POST /send-approval` would accept for them (own, else the organization's, none on WhatsApp).
+- Fix: knowledge-base links. These MCP tools' answers no longer carry Google Cloud Storage signed links (minted to expire in 2500, stored in task
+  records, unrevocable): `withoutSignedStorageLinks` (`mcp/server/knowledgeBaseParams.ts`) removes them from `list_knowledge_bases`,
+  `emma_get_brand_profile`, `list_tasks` and `manage_task`. Files are read with `read_knowledge_base_files` (by id and name). Not
+  covered: such a link quoted in Emma's own chat text (`emma_send_message`, chat history).
+- Fix: `describe_image` read any object of our bucket with the server's credentials (presigned) for any caller. It now asks the storage
+  rule the other storage tools ask (`checkOurBucketKeyRead`; like them it never carries admin power, so an admin's own Emma session cannot
+  describe a client's private file, while a delegated session can) first, for every model and before any read (harmless today only
+  because the bucket still serves objects by URL). `POST /api/emma/describe-media` without a model now uses the vision model, as Emma
+  does (it defaulted to `gpt-4o`, not a registered model, which also skipped the image download).
+- Proof: `mcp/server/__tests__/contentTools.test.ts` (requests, refusals, answers, errors, guards), tests of the domain refusal and cron
+  skip, the Slack scoping and channel list, the signed-link stripping through the four tools, and the describe_image owner check; the
+  inventory, classification, route-budget and plan-route limit gates.
+
+## ENG-3187: stdio MCP children get an allowlisted env, not process.env (2026-11-25)
+
+`createStdioTransport` spread `process.env` into every stdio MCP child since 2026-01-22, so a customer-driven server (Playwright `browser_run_code`) could read JWT_SECRET, AWS keys, Stripe/Slack tokens. Children now get `buildStdioChildEnv` (`backend/src/mcp/client/stdioChildEnv.ts`): PATH/HOME/locale/temp/proxy/CA plus the server's own config `env`. If a stdio server needs a secret, declare it in that server's `env` (`${VAR}` placeholders resolve), never rely on inheritance. Note: this does not stop vm-escape code reading `/proc/<backend pid>/environ` as the same OS user; process isolation is a separate step.
+
+## ENG-3187: the browser server no longer inherits the backend's secrets or working folder, a browser call carries no `_meta`, and the navigate tool opens public pages only (2026-11-25)
+
+**The problem.** The agent's browser is a Playwright MCP server that runs as a child process of the backend. `McpClientService.createStdioTransport` started it with `env: { ...process.env, ...resolvedEnv }` (since 2026-01-22) and no working folder, so the child had the backend's whole environment (login-token signing secret, AWS keys, Stripe and Slack keys) and the backend's own folder as its file root. Its `browser_run_code` tool runs the caller's code in a Node `vm`, which is not a security boundary: `page.constructor.constructor('return process')()` returns the host `process`. Any signed-in customer can drive that tool from their own chat. Chrome also runs with `--no-sandbox` (2026-03-12) and with site isolation switched off (2026-04-26, anti-detection work).
+
+**What this change does (code only: `backend/src/mcp/client/playwrightContainment.ts`, `mcpClientService.ts`, `utils/toolFailureType.ts`).**
+- The browser server gets an allow-list environment (`PATH`, `HOME`, locale and temp variables, proxy and certificate variables, `PLAYWRIGHT_BROWSERS_PATH`, font settings, `LC_*`, `XDG_*`) plus whatever its own configuration sets. Nothing else. The Windows basics are allowed too, for local development. There is no switch back to the backend's whole environment.
+- Every browser server runs in a fresh folder of its own under `/tmp/playwright-mcp-work/<pid>-<pool>-<random>` (mode 0700, made with `mkdtemp`; the root must be a real folder owned by the process), also passed as `--output-dir`. Playwright confines the browser's file tools to its working folder. The folder is found again by its transport and removed exactly when that browser server ends: the client is closed (pool release, eviction, failed connect, a direct call finishing), the child process exits by itself (the transport's own close handlers remove the folder; the SDK client forgets its transport on that event, so the callers that close a client hand over the transport they hold, and pool release and eviction, which still read it from the client, rely on that handler having run), or the backend shuts down. A new pool of the same session is never touched. A startup sweep removes folders whose owning process is gone, and folders of an earlier run that reused this process id (a container restart); a live process's folders are never swept. The sweep assumes every process that shares `/tmp` also shares the process-id space (true on one host).
+- A browser tool call is sent without `_meta`. Playwright reads `arguments._meta.cwd` as the folder it resolves `browser_file_upload` paths against when it checks them, while `setFiles` resolves the same raw paths against its own working folder, so a model-supplied `_meta.cwd` made the check pass for a path that reads any file the backend's user can read (found by the blind review of this change; it worked before this change too).
+- `browser_navigate` is checked before the call, on every path a tool is called by: only `http:`/`https:`, `about:blank` and `data:` are opened; the host must pass `assertPublicHostname` (5 s limit, and at most 8 checks waiting at once; this bounds the queued work, it does not protect the process's few lookup threads, which a lookup holds until the resolver returns); IPv6 literals and names that are local by convention (`localhost`, `*.localhost`, `*.local`, `*.internal`, `*.localdomain`, `*.lan`, `*.home.arpa`) are refused; a name that cannot be resolved gets its own message. The check also runs before `callToolDirect` connects. The refusals are worded for the model, are not retried, are logged with user and session (never the address), and are classified `by_design`, not `bug`.
+- Every other stdio MCP server keeps the shared allow-list that #4251 (`stdioChildEnv.ts`, ENG-3187) put on main on 2026-11-26; this change does not touch it. The browser server keeps its own list, which allows every name the shared one does (a test fails if the two drift apart) plus `TERM` and the `ALL_PROXY` pair.
+- `--blocked-origins` was tried and dropped: it turns on request interception and disables the HTTP cache for every browser session of every user, and Playwright documents it as not a boundary.
+
+**What it does NOT do (tracked in ENG-3187).** `browser_run_code` hands the caller Playwright's raw `page`. Through it, without any escape from the `vm`, a caller can still `page.goto('file:///proc/<backend pid>/environ')` (the navigate check and `file:` block are only on `browser_navigate`), and `page.request` sends Node-side HTTP that nothing routes or checks, to loopback or to the cloud metadata address (an IMDSv2 token request with a header works, so "IMDSv2 required" is not a protection against this). Code that escapes the `vm` runs as the same OS user as the backend and can read `/proc/<backend pid>/environ` and the backend's files. The navigate check does not see redirects, links, `location=`, meta refresh or DNS rebinding (Chrome resolves the name again). `browser_run_code` is about 43% of browser-tool calls in the production log on 2026-11-25 and five internal tools depend on it (cookie persistence and tools, site sign-in, the reCAPTCHA solver, the X.com typing rule). The real fix is the browser server under its own OS user or container with the metadata address and loopback blocked for it, or `browser_run_code` withdrawn from model-driven callers.
+
+**Rollback.** Revert the PR. The browser server then gets #4251's shared allow-list again, never the backend's whole environment.
+
+## ENG-2964: permanent sent-message records, production shadow (2026-11-25)
+
+- Created production AW-SentMessages via standalone CloudFormation, us-west-2, PITR/SSE/Retain.
+- Success-only detached recording at sendAsSender and LinkedIn message/InMail; default shadow,
+  SENT_MESSAGE_LEDGER_MODE=off rolls recording back without deleting history. Never blocks sends.
+- Original conditional-claim enforcement service remains dark. Direct provider bypasses and
+  LinkedIn org attribution remain gaps before enforcement. Review readiness after ~3 clean days.
+- Scoped Jest 31/31 pass; docs/eng-2964-sent-message-ledger.md describes remaining work.
+
+## ENG-2840: Lead reads for outside agents over MCP (2026-11-25)
+
+- Three tools that Emma has now exist on the MCP server: `get_lead_details`, `get_lead_engagements`, `get_lead_list_statuses`
+  (`backend/src/mcp/server/leadReadTools.ts`). `get_lead_details` is a different projection from `manage_leads get`, not a superset: it returns
+  the profile, notes, custom fields, ICP match, attribution, opt-out state, a message draft and a 200-character preview of the email draft,
+  enrichment sources, the LinkedIn connection status (`isConnected: false` also means "could not check": errors are swallowed), the
+  engagement counts and the 10 most recent engagements. It does NOT return the lead's own pipeline status or deal value fields, nor website,
+  domain, role, lifecycle, priority, heat score, expected close date and similar stored fields (`manage_leads get` does); status changes and
+  deal values DO appear inside engagement events (`status.changed` events carry from, to, dealValue). The history is not only emails and
+  hand-recorded notes: `lead.engagements` also holds contact-status audit events (with `actorUserId`, and `delegatedByUserId` for staff
+  acting by delegation: both pass the public sanitiser, as they do on the portal's own route), LinkedIn invite events, hot-lead call events and
+  Smartlead events (replies, bounces and opt-outs only: no bodies, and never the emails Smartlead sent). LinkedIn messages are read from the
+  event table under `linkedin-<listId>`, for a lead with a LinkedIn URL; the email events come from the same table under the caller's domain. `get_lead_engagements` is the history of
+  one lead, newest first, `limit` 1 to 100 (default 20).
+- NO stale-list search over MCP (decision after review round 3). Emma's `get_lead_details` looks for a lead that is not in `list_id` in the
+  caller's other accessible lists (ENG-969): the caller's lists, then one query per organization member, then up to 8 batched reads per tier,
+  retried once after 300 ms on an error. `AW-LeadLists` is provisioned at 5 read units and its `userId-index` at 5 (read-only
+  `describe-table`, 2026-11-25; 412 items), so a key that can repeat that for any unknown lead id 60 times a minute (600 for a key created
+  with the maximum) could throttle the lead-list reads of every tenant. The tool sends `recover_stale_list: false` and an unknown lead id is
+  refused as "Lead not found" with no per-member list queries (the list read, the access check and one lead read). Emma, the portal and the readback verifier send nothing and keep the search. The
+  route takes `recover_stale_list` as a boolean (anything else is a 400); only `false` changes behaviour.
+  `get_lead_list_statuses` returns a list's pipeline stages, including the default a list that never stored its own uses (which
+  `create_lead_list get` does not show); it only reads, so it is `readOnly` and a `tools:read` key can call it.
+- Counts to read right: `engagementSummary.total` and `last7Days` count events whose type contains "sent" (sent messages, but also
+  `linkedin.invite_sent` and any type containing "consent"); `totalAllMessages` counts every event (LinkedIn events are de-duplicated first). A cut page says
+  so in `message` ("Showing the first N of M"). When counting fails the data layer returns zeros and the answer still says `success`: three
+  zero counts beside listed events mean the count failed (the `engagementCountUnavailable` flag the handler has for this can never fire,
+  because `getLeadEngagementCount` swallows its own errors; pre-existing).
+- Same pattern as the other wave-2 tools: the handler checks arguments by name (an unknown argument, including any identity such as
+  `user_id`, `client_id`, `orgId`, is refused; `userId`, `sessionId` and `llmModel` are stripped by the MCP server before the tool sees them),
+  then self-calls the `/api/emma` route as the key's own user. The list access check (`canOrgMemberAccessList`: the list owner, the
+  organization's owner and listed CRM editors, and any other member of the owner's organization while the organization shares its CRM) runs
+  in Emma's handler on the far side and is not replaced. It differs slightly from the CRM routes' guard (`canAccessCrmList`): with CRM sharing
+  off an organization admin who is neither owner nor listed editor passes the CRM routes and is refused here; with an organization row
+  missing, this guard allows and the CRM routes deny. Both pre-exist.
+- `/api/emma/*` answers a refusal as HTTP 200 `{ success: false, message }`. The tools turn that into an error carrying only the route's
+  short `message`; the route's `error` field (raw exception text on an internal failure) is dropped. A 5xx from the route (its catch-all
+  answers with the exception's message) and a failure to reach the route (the raw message names the internal route and port) are replaced by
+  a fixed text. A 4xx (a 429 for an account over its monthly quota, a 400) passes through with the route's own words. "Lead list not found"
+  and "Access denied" are different answers, as they are for Emma and `manage_leads get`, so a caller can tell a real list id of another
+  account from an unknown one; list ids look like `list_<time>_<random>` and are not guessable, except the Calendly list, whose id contains
+  the owner's user id.
+- Two thin routes were added for the tools that had none: `POST /api/emma/lead-engagements` and `POST /api/emma/lead-list-statuses`, both
+  `metered` like `/leads` and `/lead-details`. `metered` means an account that is already over its monthly token quota is refused on them;
+  these reads spend no tokens, so the quota does NOT bound how often they run. The bounds are the key's rate limit (60 calls a minute by
+  default; a key can be created with 1 to 600; several keys of one account multiply it) and the fetch bound below.
+- Cost of a history read. `crmDb.getLeadEngagements` fetches the body of every received or delivered email event that has no stored body from
+  the mail provider (Resend, with the platform's key; two provider calls per received event, with retries) and stores it as a cache. Emma and
+  the portal do this for every such event at once, whatever `limit` is. A failed fetch is not stored and is tried again on the next read. The
+  provider fetch path is not paced like sending (sends go out at most 2 a second) for Emma and the portal. For the MCP tools the data layer takes an allowance
+  (`options.maxContentFetches`, sent by the tools as 10; the routes take `max_content_fetches`, a whole number 0 to 50, and answer 400 to
+  anything else, so a bad value is never a silent "no cap"): only the newest 10 such events without a stored body are fetched per call, through
+  ONE chain for the whole process (`runCappedFetch` in `services/db.ts`): one at a time, 500 ms apart (the gap the platform's own sends keep),
+  at most 20 in the chain (one running, 19 waiting) and at most 10 per account (so one account crawling its leads cannot fill it and starve the
+  others), each fetch given up on after 10 s (so a hanging provider holds one call for about 100 s at most, inside the 5-minute self-call timeout; the Resend reads set no timeout, so one request that never answered would otherwise block every
+  later read in the process; the abandoned request is not cancelled). A fetch that does not fit is skipped and its event comes back without a
+  body; fetches are handed to the chain newest first, so what a busy chain skips is the oldest of the allowed events. An uncapped read (Emma,
+  the portal) does not use the chain, is not paced and runs every fetch at once, as before. Resend's limit is shared with the platform's sends
+  and the chain paces only these fetches: it cannot guarantee that fetches plus sends stay under that limit, it stops a key's reads from adding
+  a burst. The other events come back without a body. A body already stored never uses the
+  allowance, and a body that cannot be fetched is not remembered: it uses the allowance again on every call, so a lead whose 10 newest bodies
+  fail never reaches older ones. Emma and the portal send nothing and are unchanged. `limit` does not bound reading: the email events of the
+  lead's address are read in full (twice, count and list) before the page is cut. `get_lead_details` can also check a connected LinkedIn
+  account (Unipile), one probe per connected account when the list names none and the user has more than one; the connection lookup is by the
+  list's LinkedIn account when the list names one, else by the CALLER's account.
+- Known limit, inherited from `crmDb.getLeadEngagements` / `getLeadEngagementCount` and unchanged here: email events are looked up through the
+  CALLING account's single legacy `emailDomain` setting, not the list owner's (an organization member reading a shared list sees only emails
+  under their own domain). An account whose sending domains are stored only in the multi-domain setting (`emailDomains[]`), or that sends from
+  a connected mailbox, gets none of its own emails from these tools (what lives on the lead is included: Smartlead replies, bounces and
+  opt-outs, which have no bodies and are not the emails Smartlead sent, LinkedIn invites, hand-recorded events; LinkedIn messages come from the
+  event table, for a lead with a LinkedIn URL), so an empty history is not proof that a lead was never emailed. The lookup is keyed by that domain string, not by account;
+  a new-style domain is claimed by one account only, the legacy field is set by an admin without a uniqueness check. Another pre-existing
+  flaw seen on the way: the LinkedIn connection lookup applies `Limit: 5` before filtering by account, so a profile that is a connection of
+  more than five accounts can read as not connected. The Resend content fetch sets no timeout.
+- Not `readOnly` (the two lead tools): a read can write the content cache. A `tools:read` key cannot call them (same as `manage_leads` and
+  `search_leads`). Nothing in the lead or list changes. They are found with `emma_search_tools`, not in the default tool list.
+- Not exposed here, and why: `get_hot_leads`, `get_leads_needing_followup`, `get_lead_conversation_statuses` (each reloads the whole email
+  history of the account's domain on every call), `analyze_crm_data` and `ask_crm` (spend the platform's model key), `log_contact_event`
+  (writes to a global table keyed by an email taken from the argument, with no ownership check).
+- Still true: external answers pass through the public response sanitiser (drops any key named `ipAddress`, `userAgent`, `debug`, `telemetry`,
+  `sessionId` and similar at any depth, including inside a lead's custom fields or event data, and returns `null` past 10,000 nodes), as for
+  `manage_leads`; the descriptions say so. Email text and notes are third-party content: the descriptions tell agents to treat them as data.
+- Proof: unit tests of the request builders, refusals, error texts and descriptions (`mcp/server/__tests__/leadReadTools.test.ts`), the two
+  routes against Emma's real handlers and the allowance's path to the data layer (`emmaApi.leadReadback.test.ts`), the allowance itself
+  (`crm.db.test.ts`, `getLeadEngagements`: also the chain across concurrent reads, its pacing and its backlog limit), and two tenants through the real MCP server, tool, route, handler and in-memory database
+  (`mcp.leadReads.twoTenant.test.ts`): foreign lists and lead ids, identity arguments, organization members with sharing on and off, the
+  organization owner and a listed editor with sharing off, what a page holds, and that no other list is ever looked in for a lead asked for
+  through the wrong list (the lists asked for are read off the database). The in-memory database now serves BatchGetItem
+  (`inMemoryDynamo.batchGet.test.ts`): without it any such search's failure was swallowed as "not found" and a test could pass without the
+  search running or not running. Not covered there: the email-event half of an engagement
+  read (AW-EmailEvents is not in the fake), Limit / ExclusiveStartKey, BatchGetItem's 100-key cap and unprocessed keys.
+
+## ENG-2840: Emailing a GTM status report over MCP, behind an opt-in `gtm:email` key scope (2026-11-25)
+
+Emma has always been able to email a phase or plan status report (`send_gtm_status_report`). Over MCP it was held back: the report templates put caller text into HTML unescaped (fixed in W2-4), one call mails every distinct phase contact, and all platform email shares one queue (the GTM emails have their own bounded lane since PR #4236). With those closed, outside agents (Yugo, Hue, Remy) get the capability, behind a scope the account owner grants and with limits.
+
+**What changed**
+- New tool **`send_gtm_status_report`** on the MCP server, registered with `requiredScope: 'gtm:email'` and `apiKeyOnly`, the same gate as the org memory writes. Only an `aw_` key that holds the scope can call it: a default key, a legacy key, a read-only key, an OAuth client and a delegated session are refused (HTTP layer, `mcpServer.ts`, per request; the registry refuses a non-key caller underneath). `tools:execute` does not imply it.
+- The scope is on the grantable list for key creation, is refused from a delegated (admin-as-customer) session, is not a default scope, and `tools/list` offers the tool only to a key that holds it. The customer portal's key form does not offer opt-in scopes, so a customer cannot tick it there; Yugo's key broker has to ask for `gtm:email` for the agents that should email.
+- Inputs mirror Emma's: `plan_id`, `phase_id` (omit for a whole-plan report), `notify_user`, `notify_plan_poc`, `notify_phase_poc` (phase report), `notify_phase_pocs` (plan report), `message`. **Nobody is emailed by default**: at least one choice must be `true` (a choice written as text is refused, not guessed), an argument that is not an input is refused by name, the message is at most 2,000 characters.
+- Limits, `mcp/server/gtmEmailLimits.ts`: **at most 10 people per call** (each contact must be a single address: a contact written as "a@x.test, b@x.test" or as a list is refused, because a list is one send to several people; the report service refuses before sending anything when the report would reach more: a new `maxRecipients` option, 400 "it would go to N people and one call may email at most 10. Nothing was emailed."), **about 50 emails an hour per account, all of its keys together** (a call reserves the most it could send, settles to what it attempted, and gives everything back when the route refused before sending, so parallel calls cannot overshoot), and **the same report is not sent twice within 10 minutes** (same account, plan, phase, people chosen and message; the message is hashed, never stored).
+- One audit line per attempt, `mcp_gtm_email`: user, key, plan, phase, which people were chosen, the outcome and the counts. Never the message and never an address.
+- The tool calls the portal routes through `mcpFetch`, so the plan owner check, the delegation and restriction claims stay on the route: a key can email only the people on its own user's plans (proved with two tenants on the real routes). A POST self-call is never retried, so a network blip cannot send a report twice.
+- `manage_gtm_items` still refuses its email arguments (and `send_status_report`), and now says where emailing lives. Behaviour change: the refusal text. **Notifications on `update_work_item` are not offered**: update the item, then send a report.
+
+**What the scope means (a decision, written down).** `gtm:email` bounds the VOLUME an agent can email, not the AUDIENCE. The report goes to the addresses on the plan, and a key can write those itself: `manage_gtm_plan update dri` needs only `tools:execute`, so a key that holds `gtm:email` can put any address on a plan it owns and email it, with up to 2,000 characters of its own text (and more through work item notes, which the report includes), from AgentWeb's system sender. The portal already lets a signed-in user do the same with no limit; this is about a compromised or prompt-injected agent holding an owner's key. The account owner grants the scope knowing that, the caps and the audit line bound and show what happens, and the scope should go only to agents trusted with it. Restricting recipients to the owner's organization, or a per-address cap shared across accounts, would narrow it; neither is done here because contacts on a plan are often people outside the organization, and it would change what the portal does too.
+
+**Found by the second independent review and NOT changed here, with the reason**
+- **The audit line's `apiKeyId` is the key that opened the MCP session.** A second key of the same user that reuses that session id is checked on its own scopes (per request, so no scope is ever borrowed) but logged under the opener's id, as every MCP tool's audit line is. `userId` is always right. Binding sessions to keys is a change to the session layer (including the cross-instance rehydration path) for every tool, so it is not made inside an email-scope PR.
+- **No process-wide hourly ceiling across accounts, and no per-address cap across accounts.** N accounts can each send 50 an hour, and any signed-in user can mint a `gtm:email` key. The portal route (`POST /api/gtm-plan/:planId/send-status-report`) already lets any signed-in user email any contact with no limit at all, so a ceiling on the MCP tool alone would bound the new automation and not the real exposure; the right place is the route, which is a separate decision about portal behaviour.
+- **No "sent by an agent on behalf of <owner>" line in reports sent over MCP.** It would change the email copy that customers' contacts receive, and the repo rule is that customer-facing copy Harsha has not reviewed does not merge. Today those reports say only "automated status report from AgentWeb", so a recipient cannot tell who caused one; the audit line is how an owner sees it.
+- **Recipient domains in the audit line:** the route answers counts, not addresses.
+
+**What this does and does not bound**
+- The 10-people cap, the hourly budget and the cooldown are enforced per process, in memory. Production runs one backend instance (Elastic Beanstalk MinSize=MaxSize=1, checked 2026-11-24), so they are exact there; if the backend scales out, each instance counts separately (the audit line shows it). A restart empties the counters.
+- A call can send up to 10 emails, so the hour is "about 50": the reservation makes it at most 50 attempted emails per ACCOUNT per hour, including parallel calls and every key of that account (minting more keys buys no more email).
+- A 5xx or a timeout from the route keeps the reservation and the cooldown (the mail service may have taken some); a 4xx gives them back.
+- The scope controls this TOOL, not every route to a GTM email: a key that may start an Emma run (`emma_send_message` and the others in `AGENT_EXECUTION_TOOLS`) reaches Emma's own `send_gtm_status_report` inside that run with no scope and no cap, as for `memory:org`. Keeping those tools out of an outside agent's allowlist is the control for that.
+- Report subjects now collapse line breaks, control characters and runs of spaces in a plan or phase title to a single space, and a mailbox written in different cases (or with stray spaces) is one person, for the portal and Emma as well (both were reachable before; an agent that can write titles and contacts makes them matter). With a cap set (only this tool sets one), a contact that holds more than one address (ASCII or fullwidth commas, semicolons, spaces, line breaks or invisible separators) is refused before anything is sent: how Resend treats a comma-joined `to` is unverified, and the hourly budget counts sends. Only an owner can write such a contact (the MCP tools accept one address per contact). Addresses of failed sends still appear in the existing error log lines.
+- The two reports use the same sender domain as all platform mail; separating bulk reputation is an infrastructure step (see PR #4236).
+
+**Tests:** limiter (fake clock), tool (request, refusals, send flow, audit), HTTP scope gate against the real registry, key creation and discovery, and the real routes with two tenants. The public tool inventory snapshot gains the new tool and the reworded `manage_gtm_items` description.
+
+## ENG-2840: Eight account reads for outside agents over MCP (2026-11-25)
+
+- Eight tools that Emma has now exist on the MCP server (`backend/src/mcp/server/accountReadTools.ts`): `list_connected_account_posts`,
+  `load_connected_account_metrics`, `get_post_analytics` (a connected LinkedIn or Instagram account), `search_user_guide` (the public docs),
+  `get_user_profile` (the key's own email, display name, company name, plan), `get_ads_thresholds` (the caller's own Meta ad account),
+  `get_hot_lead_call_settings` and `get_lead_notification_settings` (organization settings). Same pattern as the lead reads: arguments checked
+  by name and by value, then the portal's own route as the key's own user (`search_user_guide` and `get_user_profile` are in-process), a
+  refusal is an error carrying only a short text, a 5xx or an unreachable service is a fixed text, a 4xx passes through.
+- Social reads cost something the others do not. Each can go live to LinkedIn or Instagram with the ACCOUNT OWNER's OAuth token (a plain
+  organization member reading a teammate's shared page uses the teammate's token, as in the portal), may refresh and store that token, and may
+  cache posts. The LinkedIn app quota is shared by every tenant; the portal throttles the same call per account (`routes/socialPosts.ts`),
+  Emma's tool and the `/api/emma` routes do not. Through MCP a call goes through `socialReadGuard`: an answer is kept 60 s per (caller, tool,
+  arguments) (a refusal or failure is never kept; an `success: true` answer that is empty because the provider call failed IS kept for the 60 s;
+  two identical calls at the same moment both go upstream; the memory is per caller, so one tenant's answer never serves another), and each
+  caller has an allowance of 30 provider-call units a minute per account across the three tools, each call costing what it can cost the provider:
+  posts 1 (plus 5 per post with metrics: a personal LinkedIn post with metrics is up to five calls), account metrics 4 (a LinkedIn company page is four calls), post analytics 5 per post (a personal
+  LinkedIn post is five sequential calls; at most 5 posts per call). An answer from memory costs nothing; a call that does not fit is refused
+  with the seconds to wait. The budget is per caller, not per account: members of one organization reading the owner's shared page each have
+  their own; one user's several keys share one allowance and there is no cap across callers. Inputs are bounded in the handler: `limit` 1 to 50 (default 10; with `include_metrics` at most 5, because a personal LinkedIn post with metrics is up to five provider calls), `include_metrics` default false (Emma's own tool defaults to true although its schema says false), `force_reload` is not an
+  input, dates `YYYY-MM-DD`, real, both or neither, at most 366 days (the range ends at 00:00 UTC of `end_date`), `post_ids` 1 to 5 distinct ids of
+  the shapes the posts tool hands out (a LinkedIn urn, an Instagram media number, a YouTube video id: Instagram puts the id into a Graph path; an
+  invented single path word of 11 characters still matches the YouTube shape and reaches one Graph path segment, bounded by the units), and
+  account and post ids refuse zero-width and bidirectional embedding/override characters (not the isolates U+2066-2069 or tag characters: the
+  account id is only compared exactly and never echoed). A personal LinkedIn profile shows only the posts created through AgentWeb (plus a long
+  instruction-style message addressed to Emma); `get_post_analytics` omits LinkedIn company-page posts the provider does not return. They are not `readOnly`
+  (policy 'write', need `tools:execute`). The other five are read-only, so a `tools:read` key (and an OAuth client) can call them, including the
+  two settings reads (the owner/admin rule is enforced on the route, whatever the key's scope). The routes themselves are unchanged and keep their token-budget class (`exempt` for the two GET
+  routes, as before).
+- Org settings: `get_lead_notification_settings` has a new thin route, `GET /api/emma/lead-notification-settings` (class `exempt`: a
+  settings read), that requires `org:configure`. Emma's own read has no role check, so any member of an organization can read its Slack channel
+  id and mentioned Slack user ids; the MCP tool is stricter on purpose, like `get_hot_lead_call_settings` (owner/admin enforced in its service;
+  its revision hash is dropped). Emma's tool is unchanged (both now call the same `readLeadNotificationSettings`).
+- `get_ads_thresholds` self-calls `GET /api/ads-thresholds/meta/:accountId`, whose ownership check is the caller's OWN connected Meta ad
+  accounts (the store key is not user-scoped, so that check is the tenant fence). Accounts shared by a teammate are not found (as in the
+  portal). The account id must be the numeric id (`act_` allowed): names are not matched, unlike Emma's own tool.
+- `search_user_guide` has no tenant data; its query is limited to 500 characters in the handler (the schema limit is not enforced on the MCP
+  path), and a docs outage is a fixed text (no Notion fallback: its content is not known to be public). `get_user_profile` is largely covered by
+  `get_account_status`; the new fields are the display name and company name.
+- NOT exposed, and why: `get_website_analytics`, `get_ga4_key_events`, `get_seo_metrics`. The GA4 property id and the Search Console domain
+  are saved with a format check only (`routes/seo.ts`, `analyticsConfigValidator.ts`), with no proof that the customer owns them, and are read
+  through the platform's shared Google service account; a research read of the code also found that deploying a landing page to a managed
+  subdomain adds the platform's own shared property and domain to the user's config (`services/v0Service.ts`), and the readers filter by an
+  exclude list, so another tenant's pages and queries could come back (code path read, not production data). That is a portal and Emma issue
+  today, which exposing it over MCP would widen: it needs an ownership proof first. Also not exposed: `search_ads_knowledge_base` (discovery
+  spends platform Foreplay credits, 1 per ad, up to 20 per call, no budget, and the platform key is the silent fallback), `account_summary`
+  (full-account scans, up to 20 model calls and live social calls per request), `get_clarity_metrics` (configured ids and links only).
+- Proof: unit tests of every request builder, refusal, error text and the guard (`mcp/server/__tests__/accountReadTools.test.ts`), and two
+  tenants through the real MCP server, tool, route and handler with the provider-facing posts service as the only double
+  (`mcp.accountReads.twoTenant.test.ts`): a foreign account id is refused by the real resolver before any provider call, a shared teammate
+  account is reachable only once shared and with the owner's token, the memory is per caller, a plain member is refused both settings reads,
+  and another tenant's ad account id is a 403. Not covered: the provider calls themselves, and an owner's own settings where the fake database
+  holds no plan or billing data.
+
+## ENG-2812: a share-link visitor cannot reopen the owner's session limit; pause wording without numbers (2026-11-25)
+
+Follow-up to the per-session turn/spend limit (PR #4242).
+
+**Found live on the test instance.** A share-link visitor who typed "continue" on a paused session reopened the owner's window and got an answer. `startSessionLimit` read the raw typed text and did not ask who typed it (the same class as ENG-3164).
+
+**What changed**
+- A visitor's turn never opens a new window, whatever the word ("continue", "yes", "keep going"...). The owner on the same session still can, also from their own share link.
+- A visitor on a paused session gets: "This shared chat has reached its limit. The person who shared it can reply "continue" to keep going."
+- A visitor's own turns never show the 75% / 90% notices (their advice, "start a new session", means nothing to them), and those turns do not claim a notice, so the owner's next turn still gets it. A visitor can still read a notice or pause text the OWNER's turn stored earlier in the shared transcript. The cost: an owner who is away gets no warning before the window fills (the pause text is the warning).
+- Owner decision (2026-11-25): the pause text carries no numbers (no step count, no dollar figure): "This session has reached its limit. Reply "continue" to keep going in this session, or start a new session." The exact usage is still logged (`session_limit_paused`) and stored on the message (`sessionLimitPaused`).
+
+**Which signal.** `isInteractiveShare`, the flag the share route already passes (`!viewerIsOwner`, so false for the owner on their own link). It crosses the worker boundary (controller payload, worker entry, then positional argument 9 of `generateMarketingResponse`, which is the function that runs in the worker). The in-process `isShareVisitorTurn` marker was NOT used on purpose: replies are generated in a forked worker, where that set is empty.
+
+**Limits (not changed here)**
+- Slack sessions and MCP agents: a "continue" typed there is judged by its text only (as before).
+- A visitor on a paused session sees the pause text and cannot reopen; only the owner can.
+- The kill switch `SESSION_LIMIT_ENFORCE=false` still disables the whole limit.
+
+**Tests.** `sessionLimit.test.ts`: visitor cannot confirm (several words, the owner still can), visitor wording, visitor notices neither shown nor claimed, new wording exact, and the wiring (the call site passes `isShareVisitor`, the flag crosses the worker boundary, the share route sends `!viewerIsOwner`).
+
+## ENG-2840: Two lanes in the shared email queue (2026-11-24)
+
+All platform email (about 30 call sites in 12 source files: support, webhooks, admin, intake, roadmap, hot-lead notices, send-as-sender, Emma, ...) funnels through ONE in-memory queue in `services/resendService.ts`, paced at 500 ms a send. It had no priority and no bound, and a Resend retry sleeps inside the worker. Production runs one backend instance (EB `Agentweb-backend-env-prod-3`, MinSize=MaxSize=1), so when several senders overlapped (several GTM reports at once, or later several outside agents over MCP, each emailing many contacts) a password reset or a support reply could wait behind all of their mail, and an unbounded queue is also unbounded memory. One report sends one email at a time, so a single report holds one slot only: the lanes matter when senders overlap, and they cap how much automated mail can wait at once.
+
+**What changed**
+- `EmailLane = 'transactional' | 'bulk'` and an optional `lane` on `sendEmail` / `sendSystemEmail`. **An email that names no lane is transactional, exactly as before**, so none of the existing callers change.
+- Two queues. The transactional one is the old one (unbounded, as before). The bulk one is bounded: at most 100 bulk emails waiting. The count is bulk mail only, so a backlog of transactional mail never makes bulk mail fail.
+- The worker serves transactional mail first. While bulk mail waits, every eleventh send is a bulk one, so bulk mail is never starved by a steady stream of transactional mail. The worker now chooses the next email AFTER the 500 ms pacing gap (it used to choose before it), so mail that arrives during the gap is considered.
+- A full bulk lane refuses at once with `EmailQueueFullError` (`code: 'EMAIL_QUEUE_FULL'`, "Nothing was sent. Try again in a minute."). Nothing is queued, so nothing waits and memory stays bounded. The GTM report code already counts a refused send as a failed recipient, so a report says so honestly instead of throwing.
+- The three GTM emails (work item update notification, phase status report, plan status report) now use the bulk lane. Nothing else changed lane.
+- The non-production email guard keeps the lane when it drops some recipients and queues the rest. `lane` never reaches Resend.
+- Queue log lines now carry `lane=` and the depth of both lanes.
+
+**What this does and does not guarantee**
+- A transactional email waits behind at most the one send already in flight and the 500 ms pacing gap that follows it, plus one bulk slot per eleven transactional sends while bulk mail waits. "In flight" includes that send's retries: the retry sleeps are 1 s then 2 s, plus up to three Resend calls, and a Resend call has no timeout, so a hung call holds the worker for as long as the network allows (as it did before this change).
+- The cost for bulk mail: once a bulk email is first in its lane it waits for at most ten more transactional sends (about 5 seconds under a sustained transactional stream). The GTM report routes hold the HTTP request open while their emails send, so a report can take that much longer in that case; a single report to N recipients still takes about N x 0.5 s, as before.
+- The ~30 existing callers all stay in the transactional lane, so they still share a lane with each other. Moving a heavy existing sender (a drip or sequence send) to the bulk lane is a one-word change per call site; it is not done here because it changes when those emails go out.
+- Sender reputation is not separated by this change: both lanes send from the same Resend domain. A separate sending domain for bulk mail is an infrastructure step; code for it cannot be proven live without it, so it is not added.
+- Per-process: the bound and the counters live in memory. Exact on today's single instance; revisit if the backend ever scales out.
+
+**Next, in their own PRs:** an opt-in `gtm:email` key scope that lets MCP agents send these emails, with a recipient cap per call, an hourly budget per key and an audit line.
+
+Tests: `src/__tests__/resendService.lanes.test.ts` (21), additions in `gtmPlanNotificationService.test.ts`; the existing queue, retry, error and guard tests pass unchanged.
+
+## ENG-2840: Admin GTM status report routes answer for what the report did (2026-11-24)
+
+The two admin routes `POST /api/admin/gtm-plans/:planId/send-status-report` and `.../phases/:phaseId/send-status-report` called the report functions and ignored what they returned, then answered `200 "... sent successfully"` whatever happened. The report functions have returned counts (`recipients`, `sent`, `failed`, `suppressed`) since ENG-2840 W2-4, and the customer routes (`routes/gtmPlan.ts`) and Emma's tool already answer with them through `describeStatusReport` (the MCP tool does not email at all); the admin routes were the one place left that still said "sent" for a report that went to nobody or was refused by the mail service.
+
+**What changed**
+- Both admin routes now answer through `describeStatusReport`, exactly as the customer routes do: `400` when nobody was chosen or the chosen contacts have no address, `502` when the mail service refused every email, `200` with exact counts otherwise (`sent`, `failed`, `suppressed`; a partial send says "sent to 2 of 3 recipients; 1 could not be sent"), and an email the non-production guard held back is not called sent.
+- Failure answers are `{ success: false, error: <message> }`, the same shape the customer routes use.
+
+**Behaviour change to know:** a request that chooses no recipient used to get `200 "Plan status report sent successfully"` and now gets `400`. The admin screen (`partner-portal/src/pages/GTMPlans.tsx`) closes its dialog only when `success` is true and logs any error to the console, so on a failed report the dialog now stays open instead of closing as if the report went out. It does not show the message; showing it is a front-end change that is not part of this fix.
+
+**Tests:** the status report tests in `admin.gtmPlans.test.ts` now run the real report code and the real route against a mail service double that says what it did (sent, nobody chosen, every email refused, a partial send, a guard-suppressed send). The old tests passed because the mail mock had no `sendSystemEmail`, so every send threw and was swallowed while the route still said "sent successfully", and they stubbed the notification service with `jest.doMock` after the route was imported, which replaced nothing. The old "missing notification options" test asserted the bug (`200` for a report to nobody) and is replaced by the `400` case.
+
+## ENG-2812: Per-session turn/spend limit enforced (2026-11-24)
+
+- `backend/src/services/sessionLimit.ts` counts every agent-loop model call on the session item
+  (`sessionLimitTurns`, `sessionLimitSpendMicroUsd`, atomic ADD) and pauses the loop before its next
+  call once the window is used up. Window caps: 150 turns / $20 at the $80 Starter allowance, scaled by
+  the tier's live `llmUsagePolicy.hardCostThresholdMicroUsd` (Pro/Super Premium 375 / $50, Max 1688 / $225,
+  Sandbox 938 / $125; Free and unlimited tiers 150 / $20). No config row is written.
+- A person replies "continue" (or keep going / yes / proceed ...) to open a fresh window; unattended
+  scheduled runs cannot confirm and stop with `terminationReason: 'session_limit'`. The controller's
+  media / work-plan auto-continuations and the verified-chat retry loop all stop on `pausedBySessionLimit`.
+- 75% / 90% notices are appended once per window to the in-app reply (never on unattended or Slack runs),
+  each claimed with a conditional write.
+- Not covered: the owner's own Claude plan route (AgentWeb does not pay for those turns), Live Voice.
+- Kill switch: `SESSION_LIMIT_ENFORCE=false`. Every DynamoDB error fails open.
+
+## ENG-3176: linkedin_manage_post normalizes post_urn before socialActions calls (2026-11-23)
+
+list_comments/comment/react/repost now accept a post URL or URL-encoded URN and reduce it to `urn:li:(share|ugcPost|activity):<id>`. A bare number or unrecognised value returns a model-facing validation message instead of LinkedIn's "Syntax exception in path variables". delete_post and get_analytics are unchanged. Code: `backend/src/emma/impl/linkedinPostUrn.ts`.
+
+## ENG-3165: Caller-URL SSRF refusal counted as by_design, not a create_html_template bug (2026-11-21)
+
+The failure classifier now reads the caller-URL guard refusal ("That URL cannot be fetched. Use a public https link.") as `by_design`, so the agent-mode failure-cluster loop stops filing the guard working correctly (e.g. a loopback probe) as a tool bug. The guard is unchanged.
+
+## ENG-2998: Stop unattended retries when every remaining plan step is blocked (2026-11-14)
+
+The reported Luma run exhausted 20 attempts despite all three work-plan steps being blocked by an unavailable prerequisite (`no_key`). Scheduled verification now stops with failure when a plan contains blocked steps and no pending/in-progress step remains. The failure alert retains blocked step titles and notes. Completed/skipped plans and pending/deferred retries keep their existing paths. The completion-gate continuation uses the same check.
+
+No customer credentials, schedules, persistence models, or outbound actions were changed. Offline regression evidence: three fixtures fail at 20 worker calls on the old code and stop at one call on the fix. Scheduler/automatic-continuation/failure-reason suites pass; typecheck passes. Deployment and live-model parity remain unverified.
+
+## ENG-2984: keep draft-send lease tokens out of lead responses (2026-11-14)
+
+- The existing shared CRM response sanitizer now removes `emailDraftSendClaimedAt` for single-lead, list, search and update responses without mutating the stored lead or draft.
+- Opslane's internal-marker exposure reproduced as three failing sanitizer regressions (unscoped, allowlisted and ordinary viewers), then passed. Existing concurrency tests remain green.
+- No persistence write, lease duration, send eligibility or customer-facing wording changes in this slice. The parent PR remains data-plane approval held; the separate abandoned-claim refusal finding is not addressed here.
+
+## ENG-2984: Storage-free duplicate-send guards (2026-11-13)
+
+- `send_email_to_lead` claims the stored draft with a conditional DynamoDB update that sets the transient
+  `emailDraftSendClaimedAt` attribute on the `AW-Leads` item (`crmDb.claimLeadEmailDraft`, condition
+  `emailDraft = :expected` and no fresh claim). The claim value is an ownership token (ISO timestamp + UUID).
+  The draft stays stored during the send and is cleared only after success. Two concurrent invocations for one
+  lead send at most once; the loser returns "Email draft already sent or changed". A failed send releases the
+  claim (`releaseLeadEmailDraftClaim`, conditional on the caller's token, so an expired sender cannot drop a
+  replacement sender's claim). A crashed sender's claim expires after 5 minutes. New attribute only; no tables or indexes.
+- `resendService.sendEmail` computes one deterministic `Idempotency-Key`
+  (`buildResendIdempotencyKey`: tenant, sorted recipients, content hash, intent) per send and passes it
+  on every attempt, so a timed-out request that actually landed is replayed by Resend rather than delivered
+  twice. Callers can pass `tenantId` + `idempotencyIntent` for cross-call dedupe; without an intent a per-call
+  nonce is used, so separate identical sends are still not merged (unchanged behaviour). Resend keys expire after 24h.
+- LinkedIn `send-message` without `list_id`/`lead_id` runs a fire-and-forget SHADOW check after sending:
+  it reads the chat the send returned (`getOutboundMessagesInChat`, no profile lookup) and logs
+  `SHADOW would-block (ENG-2984)` if an identical outbound message was already there. It never blocks.
+  Grep that marker in prod logs to size the would-block rate before deciding on enforcement.
+- Review limitation: the five-minute draft lease is not a permanent sent-message ledger. A provider
+  acceptance followed by process loss, or a provider call outliving the lease, can still be replayed.
+  ENG-2964 owns durable sent/ambiguous outcomes; this slice only prevents overlapping ordinary calls
+  and retries within a single Resend invocation. Rollback is a code revert; existing lease attributes
+  become inert and require no destructive cleanup.
+
+## ENG-2840: the GTM plan tools on the MCP server now work; status reports say what was sent (2026-11-24)
+
+Wave 2, slice W2-4. `manage_gtm_plan` and `manage_gtm_items` (outside agents, over MCP) were mostly broken: most actions failed on every call, and the rest succeeded while dropping what the agent sent. No table, index, stored attribute or migration changes: a plan is still one row, and every write has the shape the customer portal already writes.
+
+### What was wrong (each read against the route it calls)
+
+- `add_phase` sent `name`; the route wants `title` and answered 400 every time.
+- `update_phase` called `PUT /api/gtm-plan/:planId/phases/:phaseId`, which the router did not have: 404.
+- `add_work_items` sent an array to a route that takes one item: 400.
+- `update_work_item` forwarded every argument as it came: `name` and `due_date` were ignored, and a call with nothing the route reads still answered success after changing only `updatedAt`.
+- `manage_gtm_plan` create and update declared `goals`, `target_audience`, `timeline`, `budget` and (update) `status`; none is read. A status-only update answered success.
+- `send_status_report` sent `include_summary` / `include_details`; the routes read `notifications` and `message`. With no recipient chosen the service returned without sending and the route still answered "sent successfully". The same false success happened when the chosen contact (plan or phase DRI) was not set, and when the mail service refused every email (the error was caught and logged). The portal's toast and Emma's `send_gtm_status_report` repeated it.
+- `update_work_item` also forwarded a guessed `notifications` object to the route, which emails the people it names. Undeclared, but it worked.
+
+### What changed
+
+- **Tools** moved to `mcp/server/gtmTools.ts` (the two registrations left `apiTools.ts`). Each action has an exact list of inputs; an argument that is not one of them is refused by name, with "Nothing was changed." They still call the routes the portal uses through `mcpFetch`, not Emma's in-process functions: the delegation and the share-link restriction claim are signed into the self-call token and only a route sees them.
+- **`title`** names a phase or a work item; `name` is still accepted as the old spelling (both given and different is refused). `due_date` is `YYYY-MM-DD` and a real day (the report emails split the date on "-"), or an empty string to clear. `dri` is an email address or an empty string. A work item `status` is one of `pending`, `in_progress`, `completed`, `skipped`. Title at most 300 characters, description and notes 5,000.
+- **`add_work_items`** takes 1 to 20 items, validated up front (one bad item refuses the whole call, nothing written), then sent one after the other through the single-item route. If one fails the answer names the items added before it; the ones after it are not tried; nothing is rolled back. The answer lists the new ids.
+- **A plan's and a phase's status** follow their work items (complete when everything under them is done or skipped), so `status` is refused on plans and phases with that reason. Goals, audience, timeline and budget are refused with "put them in the description".
+- **New route** `PUT /api/gtm-plan/:planId/phases/:phaseId` (title, description, dri, dueDate): same ownership checks and write shape as the other phase routes, an empty body is a 400.
+- **Status reports** (`sendPhaseStatusReport`, `sendPlanStatusReport`) now return `{ recipients, sent, failed }`. A pure function (`services/gtmStatusReportOutcome.ts`) turns it into the answer: 400 when nobody could be emailed, 502 when every email was refused, success with the counts otherwise (a partial send says how many failed). A send the non-production email guard resolved without delivering is counted as `suppressed`, not `sent` (the answer says "NOT delivered"). The plan and phase routes and Emma's `sendGTMStatusReport` use it. **Not changed:** the two admin status report routes (`routes/admin.ts`), a separate admin surface, which still answer "sent" regardless; and the work item update route, which still ignores a failed notification email on purpose ("don't fail the request if notifications fail").
+- **The three emails escape what a caller wrote.** Plan, phase and work item titles, descriptions, notes, contacts, statuses, the change text and the optional message were put into the email HTML as they were (29 lines, 32 values, in `gtmPlanNotificationService.ts`); they now go through the shared `escapeHtml` (`emma/impl/shared/htmlEscaping.ts`). The plain-text part and the subject are not HTML and are unchanged. Ordinary text looks the same; markup someone typed on purpose into a note or a message now shows as text.
+- **Neither GTM tool emails anyone.** `send_status_report` is not an action any more, and `update_work_item` takes no `notify_*` / `notification_message` (the guessed `notifications` object is refused too). Each is refused by name with the reason; see "Decision" below. This is about these two tools only: a key that may call `emma_send_message`, `emma_create_session` or `emma_run_marketing_task` starts an Emma session, and Emma has `send_gtm_status_report`. Whether such a session can call it depends on the account having the `gtm-plan` skill (the tool is registered in `emma/tools.ts`; this PR did not run a session to check). That route is as open as it was, and its emails are escaped now. The control over it is the same as for `memory:org`: the outside agent's allowlist.
+
+### Behaviour changes for clients that follow the old schema
+
+Calls that failed before and work now: `add_phase` (with `title`, or the old `name`), `update_phase`, `add_work_items`.
+
+Calls that worked, or appeared to, and are refused now (each with a message that says what to send instead):
+- `status` on a phase or a plan; `goals`, `target_audience`, `timeline`, `budget` on a plan (dropped or ignored before; a status-only plan update answered success).
+- `update_work_item` or plan `update` with nothing to change (answered success before).
+- camelCase `dueDate` on a plan update or `update_work_item` (the route read it, the old tool forwarded it): send `due_date`. A `phases` list on a plan update (a whole-plan rewrite, undeclared but working): not an input.
+- A free-form work item `status` (any text was stored before): one of `pending`, `in_progress`, `completed`, `skipped`. A `dri` that is not an email address (it is the address reports are mailed to).
+- Both `target_phase_id` and `new_phase_name` on `add_common_items` (the target won silently before): send exactly one. A `plan_id` on plan `create`.
+- `add_common_items` items: only `title` and `description` are added (anything else is refused by name; `id` and `sortOrder` from `get_common_items` are accepted and left out); at most 50 items. Before, extra keys were dropped without a word and a non-text description answered 500.
+- A title over 300 characters or text over 5,000 (descriptions, notes); a due date that is not a real `YYYY-MM-DD` day (any text was stored before).
+- Reworded answers: a sent status report now says "The plan status report was sent successfully to N recipients." (was "Plan status report sent successfully"), and the portal's own routes, the admin routes and Emma share the escaped email templates. `emma_create_gtm_plan` calls the same guarded routes; their response shapes are unchanged.
+- Not a refusal but a change in the routes: deleting a phase or a work item now sets the plan's `updatedAt` (it did not), and a write that keeps losing to others answers 409 instead of silently overwriting.
+- `send_status_report` and every notify argument, including a guessed `notifications` object (see the decision below). The old `send_status_report` never sent anything over MCP; the guessed `notifications` object on `update_work_item` did.
+- `get_common_items` no longer asks for a `plan_id` in its schema; one is still accepted and ignored. A title is stored trimmed.
+- `null` clears an optional text, date or contact, the same as an empty string (agents send it to clear a field and the old tool passed it through to the route). A required title still refuses it.
+
+### Decision (Manan): emailing from an outside agent's key is held back
+
+The status report and update emails put what the caller wrote into the HTML of an email from AgentWeb's system sender, to addresses stored on the plan (a DRI can be any address the caller sets). Before this change the text was not escaped (found while building this and confirmed by the independent review: all three templates, about 30 interpolations). An agent whose prompt was injected could therefore plant HTML (a link dressed as "reset your password") in a plan title or a phase contact, and anyone who then sent a report from the portal (it ticks the plan and phase contacts by default) or Emma would mail it from AgentWeb's domain.
+
+The old tools were not clean either: a plan update forwarded a whole `phases` list to the route and a work item update forwarded title, contact and notes, so an agent could already write most of that text. This change adds phase title, description and contact writes (`add_phase` and `update_phase` failed before) and removes the whole-`phases` rewrite, so it moves the exposure rather than creating it. The same PR escapes the templates (`escapeHtml`, with a test that puts a distinct marker in every field of all three emails) and keeps emailing off MCP: `send_status_report` is not an action and `update_work_item` takes no notify argument. Enabling emailing over MCP later is now a policy decision plus a recipient cap per report (a plan with many distinct phase contacts mails all of them in one call), not a security prerequisite. The previous behaviour for the portal and Emma is otherwise unchanged.
+
+### Limits (stated, not hidden)
+
+- Overlapping writes (Opslane P1 on the PR): every route that rewrites a plan read the whole plan, changed one phase or item and wrote the whole `phases` list back, so two writes that overlapped overwrote each other (an item reported as added was missing; a deleted phase came back with its items). With this change batches and concurrent agent sessions make that reachable, so the eight routes the tools call (`PUT /:planId`, the work item `PUT`, `POST /phases`, `PUT /phases/:phaseId`, `POST /work-items`, both `DELETE`s, `add-common-items`) now read the plan with a consistent read and write it conditionally: the plan must still exist and its `updatedAt` must be what the handler read. A handler whose write lost the race runs again from a fresh read, at most 8 attempts in all, then answers 409 ("Nothing was lost; please try again"). No stored attribute is added (`updatedAt` is on every plan; a plan without one is conditioned on its absence). The two `DELETE` routes did not set `updatedAt` at all, so no other writer could tell a delete had happened: they do now, and their answers carry it. The SDK resends a request whose answer it never received; if the first copy had been applied the resend fails its own condition, which is not a conflict, so a failed write whose stored plan holds exactly the `phases` and the `updatedAt` it meant to write (read consistently) is taken as our own and answered as a success (otherwise an add would be stored twice and a delete would answer 404). This covers a resend that finds the plan as our write left it: if another writer lands in the tens of milliseconds between our applied write and the resend, it is not recognised and an add can still be stored twice (a rarer case than before, not an impossible one). Not guarded (they write a plan without the check): the attachment and start-session routes, the agent-mode session hooks that mark a linked work item at the start and end of a turn (`agentModeController`), the Slack session writers (`gtmPlanService`), Emma's in-process plan functions (`emma/impl/gtmPlans.ts`) and the admin routes. `PUT /:planId` with a `phases` list in its body (the portal's whole-list rewrite) is guarded, but a retry replays the caller's own list, so it protects the scalar fields only; the tools never send `phases`. `updatedAt` has millisecond resolution and comes from each server's clock: a stale write goes undetected only if another writer's new stamp equals the stamp this writer read (a clock stepping back, or skewed between servers).
+- A duplicate can still happen in one narrow case: the SDK resends a request whose answer was lost, the first copy had been applied, and the confirming consistent read then fails too (throttled, timed out). The write is then treated as someone else's and the handler runs again, so an add is stored twice (the same outcome as before the check existed).
+- Two overlapping creates of the same item now store both: the lost-update fix means neither overwrites the other, where before one often vanished by accident. Inherent to the fix.
+- The customer portal's toast for a status report is a fixed "sent successfully" on any 2xx, so a partial send ("sent to 2 of 3") reads as full success there; a 400 or 502 shows the new message. That is in the customer-portal repo.
+- Marking a work item completed over MCP still adds a reaction to the item's Slack message when the item carries an agent session and the Slack token is set (`notifySlackWorkItemCompleted`, as from the portal): unchanged, not an email.
+
+### Proof
+
+`mcp.manageGtm.writes.test.ts` sends every action through the real path (MCP client, MCP server, tool, `mcpFetch`, the real Express app, the in-memory DynamoDB) and reads the stored plan back, with a second tenant that cannot read, change or delete the first tenant's plan, and the refusals for anything that would email. Run against the previous tool code the same file fails 19 of its 29 tests. `gtmTools.test.ts` pins the request each action builds, every refusal and the exact limits. `gtmPlan.statusReportAndPhase.test.ts` covers the report outcomes (portal route) and the new route. `gtmPlan.concurrentWrites.test.ts` makes two requests read the plan before either writes (a barrier on the in-memory database's reads) for every pair the tools can produce, in both orders (so each route loses a race at least once), and checks nothing is lost, a deleted phase stays deleted, the retry is bounded, a non-conflict error is not retried and a plan without `updatedAt` still works; 45 of its 46 tests fail on the previous routes (they also cover the recovery of a lost answer, the consistent reads and the plan deleted mid-write). The exact request shapes, with the final condition text, were also run against the real `Dev-AW-GTMPlan` table with throwaway rows (script in the brain: `evidence/scripts/w24_dynamo_semantics.cjs`): accepted, a stale write fails with `ConditionalCheckFailedException`, and a write to a plan that does not exist fails and creates no row. A DynamoDB emulator (dynalite) with the real aws-sdk and a proxy that drops the answer after the write commits was used by the reviewer for the lost-answer case.
+
+## ENG-2818: Zoma LinkedIn Ads toolkit lands dark behind ZOMA_LINKEDIN_ADS_ENABLED (2026-11-24)
+
+LinkedIn Ads is built as the fourth Zoma ad platform (Meta, Google and X exist), reads and guarded writes. It is **off in production**: nothing is listed, routed or offered until the flag is set. No table, index, key or migration changes: tokens go through the same `connectedAccountsDb` helpers (`createAccount`, `updateAccountTokens`) and the same `linkedin_ads` row Emma already writes.
+
+### The flag
+
+`ZOMA_LINKEDIN_ADS_ENABLED` is strict and case-sensitive.
+
+- unset or any other value: off. `zoma_status` has no `linkedin_ads` block, the tools are not listed, and the Zoma connect routes fall through. The served agent guide and the flag-off routes are byte-identical to main (tested).
+- `read`: `linkedin_ads_read`, the Zoma connect pages, the `zoma_status` block and reporting. `linkedin_ads_write` is not listed and is refused before the scope check and the paywall. Consent asks only for read scopes (plus scopes the user already granted, on a reconnect).
+- `true`: adds `linkedin_ads_write`.
+
+One variable on purpose: the production environment has about 18 characters of room left under the 4,096-character Elastic Beanstalk cap, and `read` needs about 31. Turning it on therefore needs the `.ebextensions/99-enigma-eng2070.config` cleanup first.
+
+### How writes are kept safe
+
+- Same guard as the other toolkits: a preview token (15 minutes, single use), then confirm, applied once, then an independent read-back reported as CONFIRMED, MISMATCH or UNCONFIRMED.
+- Every create is DRAFT with explicit values; a request carrying a `status` is refused. Zoma never relies on Emma's service defaults (ACTIVE groups and creatives, a 2.00 USD unit cost).
+- ACTIVATE is the publish write (`isZomaPublishWrite`, so the billing paywall applies), checked against the budget it unlocks, in the account's own currency.
+- Spend ceiling `LINKEDIN_ADS_TOOLKIT_SPEND_CEILING` (JSON by currency, micros). **Unset means a built-in default, unlike Google and X where unset means no limit:** USD only, 50.00 a day, 2x change ratio, total budget at most 30x the daily limit (1,500). Other currencies are refused. These numbers still need Harsha's confirmation.
+- Previews echo every value that will be sent; the whole creative content is bound into the preview token.
+
+### Connect flow
+
+Zoma pages with no new redirect URI. The portal callback forwards a signed state carrying a `zoma` claim; the Zoma routes verify signature and expiry again and bind the user. The page shows the full email of the Zoma account and an explicit Connect button. A reconnect never replaces a stored row with a narrower grant, unless the stored token is dead.
+
+### Changes to code Emma uses
+
+`routes/linkedInAdsAuth.ts` finalize and connect moved into `services/linkedInAdsOAuthFinalize.ts`. Same behaviour for the portal. Two intended differences: the error handlers log only a message (the raw AxiosError carried `client_secret` and `code`), and the cleanup timer is unref'd. Token refresh for Zoma calls is single-flight (`services/linkedInAdsCredentials.ts`).
+
+### What was not verified
+
+Everything is mocked. There is no LinkedIn test ad account, so nothing here has run against a real LinkedIn ad account: read-back shapes, DRAFT acceptance for groups and creatives, `x-restli-id` shapes, default analytics fields. LinkedIn read-back in Emma (ENG-3064) was merged on mocked evidence as well. Only adAnalytics reads are confirmed by LinkedIn to work for ad accounts not listed in the app (Development tier: 5 listed accounts; writes need Standard).
+
+Before the flag is set to `read` in production: file the Standard-tier case, update the Databricks marketplace docs (`linkedin_ads_read` joins the read-only view), then run a paused create, read-back and archive on a test ad account before `true`.
+
+### Rollback
+
+Unset the flag (an env change, no deploy of code needed to hide it), or revert the merge commit.
+
+## ENG-3170: a share-link visitor runs sensitive tools only on a link whose owner turned on Full control (2026-11-23)
+
+A share-link visitor runs under the owner's userId. A set of tools was guarded only by a sentence in the tool description or a `confirm`
+flag the model sets itself, so the visitor was the "user" who confirmed: delete leads / a lead list, send email or Slack, post to
+LinkedIn / X / Instagram / YouTube, publish a blog or landing page, change Google / LinkedIn / Meta-audience ad spend, disconnect LinkedIn.
+(`call_meta_marketing_api` writes are not in this set: they already halt into an approval deck; a visitor can answer it only on a link whose owner turned on Full control, the share route answers 403 otherwise.)
+
+**Full control (owner decision, 2026-11-23).** Customers see the switch as "Full control": "everything that the customer can do, like it used to be
+before any of our changes/restrictions". When ON for a link, a visitor on it also gets what ENG-2816 took away (owner settings, hot-lead calls,
+Smartlead, Luma, memory, `connect_account`) and the saved-login tools (`get_login_credentials`, `get_test_account`), on top of the sensitive set.
+ADMIN tools are never lifted (a link holder must not get staff powers). A visitor-made schedule keeps the whole block list (no link to ask).
+The visitor refusal for the ENG-2816 block list keeps its wording byte for byte (a share-session eval depends on it). The early, model-facing
+refusal in `toolDispatch` asks the link through the optional port `shareLinkFullControl`; `executeTool` decides again from a consistent read.
+Added with it, on the owner's yes: `enable_lead_list_public_access`, `set_landing_page_lead_list`, `deploy_landing_page`, `test_scheduled_chat`,
+and `set_lead_contact_status` (only `active`, which re-enables contact with a lead who opted out, is sensitive).
+
+**Also under Full control (owner, 2026-11-23: "the full capability of the end user themselves").** A link with it ON may answer an approval card that
+carries a write or a locked decision: the share route used to refuse those with 403 for every visitor (ENG-1635/1644) and still does unless a
+consistent read of the link says Full control is ON (unreadable, missing or off keeps the 403). Still different from the customer, on purpose or
+pending the owner's call: admin tools (never lifted), schedules a visitor creates (marked, wait for the owner to adopt them), schedule-template
+writes (refused for a visitor), and a visitor cannot stop the owner's running turn. The dialog shows the Off explanation only when the switch is off
+and the On text (every power listed) only when it is on.
+
+**Review round 2 (two independent reviews of the final code, 2026-11-23).** Fixed in this PR:
+- A link made before the setting existed keeps exactly what it had (the sensitive tools) and gains nothing that was refused to every visitor until now: the owner-only block list, `connect_account` and answering approval cards need an EXPLICIT stored `true` (`interactiveShareControl(...).full`). The dialog still shows such a link as ON; turning the switch off and on once makes it full control.
+- A link that is no longer live (stopped, expired) reads OFF for the rest of a turn already running. A stored choice that is not a boolean reads OFF (it no longer falls to the lifetime rule).
+- `stage_pending_decision` was first made sensitive for `audience` other than `team` (it emails the named address from AgentWeb with the caller's own text and link); the final review made it sensitive whatever the audience, see the last section.
+- The owner's saved browser sessions are saved logins: `load_/save_/clear_browser_cookies` and `mark_browser_session_failed` are sensitive tools, and a browser tool run for a visitor no longer loads the owner's cookies (or writes the visitor's back over them) unless the link allows the sensitive tools.
+- Third review round (two more independent reviews, of the fixes): both found that tools which drive the browser for the model (`open_site_signin`, `solve_captcha`, `coding_agent`) call `executeTool` WITHOUT the visitor claim, so the browser branch's "is this a visitor" test never saw one. A first fix asked the in-process visitor-turn marker (`isShareVisitorTurn`), but chat turns run in a FORKED WORKER, where that marker is never set (both reviewers of that fix found it; the unit tests could not, as they run in one process). The real fix is call-scoped: `executeTool` runs a call that carries a restriction inside a Node `AsyncLocalStorage` scope, and a nested call with no restriction of its own inherits it (so it also gets the block list and the sensitive rule, not only the cookie rule). It works in any process and for voice. The marker stays as a second signal in the main process. `read_verification_code` (a one-time login code or magic link read from the owner's mailbox: with a browser, a log-in as the owner) is a sensitive tool. A link whose owner turned on Full control keeps the expiry the owner chose when an alert or email reuses it (it used to be stripped, turning "full control for 7 days" into "for ever"); an old link and an OFF link are still made permanent by a mailed reuse. An empty `expiresAt` reads as "never expires" in the liveness check, as in the route. The stop (DELETE) route refuses a visitor claim like POST and PATCH. Portal: create and stop handlers are guarded against the owner switching chats mid-request.
+- The share route gives the same "a write failed: read the error, do not re-propose it" instruction the owner's route gives, from one shared helper.
+- The owner-only settings routes refuse a request carrying a visitor's restriction claim. The explicit choice is written to an existing link unconditionally (the copy it read may be stale). The guard test's name pattern now includes the neutral verbs (clear, load, save, update, configure, manage, mark, stage); every tool it caught is classified with a reason.
+A legacy link's schedule behaviour differs from main in one more place: a schedule a visitor creates on any link now loses the sensitive tools too (on main only the block list was refused until the owner adopts it).
+Known limits left on purpose (disclosed to the owner): the dialog shows a link made before the setting existed as ON although only the sensitive tools work on it (the block list, connect_account and approval cards need an explicit choice: turn the switch off and on once); the `email` actions get and search, and Slack and X message reads, still read the owner's mailbox and messages on an OFF link (raised separately); a browser the owner already used in the SAME chat keeps its logins; visitor-made schedules (marked) still run browser tools with the owner's cookies; per-user MCP tools register in the same registry and are not on the list; `set_lead_contact_status` to do-not-contact stays allowed on an OFF link (it only restricts outreach, the owner can undo it); `post_on_connected_account` is refused whole, so `save_as_draft` is refused on an OFF link; in-account overwrites (brand guidelines, market strategy, knowledge base, statuses, test accounts) are not refused (owner decision pending); a link has one token per session, so ON also covers anyone a system email or Slack message sends the same link to (such a send no longer strips the expiry of an explicit-ON link; an explicit-ON link past its expiry is replaced by a new OFF link the next time a system message needs a link, instead of the dead address being sent again; old and OFF links are still made permanent by such a send, the outage fix); an owner's own unattended run of a sensitive tool (now also `read_verification_code`, the login-recovery step of a scheduled report) is refused if the session or schedule reads fail twice; a visitor-written schedule (marked) still loads the owner's cookies for browser tools, because its browser calls carry no restriction and checking would cost a provenance read on every browser call; a browser the owner (or an earlier ON-link turn) already logged in keeps those logins for the rest of that chat's browser session.
+
+**A separate fix that rides in this PR, as its own commit (owner: "if it's a tiny fix, do it").** `set_lead_contact_status` used `crmDb.updateLead`,
+an upsert, so an id that was already deleted (or mistyped) came back as an empty stub lead. It now reads the lead first (consistent read) and reports a
+missing one as failed, writing nothing.
+
+**What changed.**
+- `interactiveShareMetadata.allowSensitiveActions` (the owner's per-link choice). `utils/interactiveShare.interactiveShareAllowsSensitiveActions`
+  reads it for the sensitive tools; `interactiveShareControl` returns both answers (`sensitive`, and `full` = an explicit stored `true`, on a live link) and is
+  what `executeTool`, the dispatcher and the share route use. An explicit boolean wins. A link made before the setting existed (no choice stored) reads as ON only
+  when its lifetime (`expiresAt` minus `sharedAt`, rounded to days) is one the share dialog offers (1, 3, 7, 14, 30, 90, 365): it was made on
+  purpose by the owner. Every other link reads OFF: no expiry (plan launches, emailed or Slack-posted links, very old links), the 45-day links
+  the admin Chat History tab mints on every conversation staff list (`routes/admin.ts` `ensureIshareLinkForReview`; 890 of the 921 live timed
+  links on 2026-11-23, only 31 were dialog-made), and any lifetime nobody can account for. Nothing readable reads as OFF.
+- `chatbotDb.createOrReuseInteractiveShare(sessionId, days, { allowSensitiveActions })` stores an explicit choice on every NEW link (off unless
+  the share dialog says on). An explicit choice is also applied to a link that already exists (one token per session); a caller with no
+  choice (email, Slack, alerts) never touches it. The work-plan launch path writes `allowSensitiveActions: false` itself.
+- `GET` / `PATCH /api/agent-mode/session/:sessionId/conversable-share` read and change it (owner only).
+- `services/toolRestrictionProfiles.ts`: `SHARE_VISITOR_SENSITIVE_TOOLS` (whole tools) and `SHARE_VISITOR_SENSITIVE_BY_ARGUMENT` (tools judged by one
+  argument; unknown or missing values are sensitive). `isSensitiveToolCall(tool, args)` is pure.
+- `agentModeService.executeTool` is the sink every path ends in (typed chat, voice, nested): a call under the `share_visitor` profile to a
+  sensitive tool reads the session (consistent read, one retry) and refuses unless the link allows it; unreadable or missing = refuse. The
+  check runs again on the arguments after repair. The owner is never affected.
+- A schedule a visitor set up (`share_visitor_schedule`) has no link to ask, so it is refused these until the owner adopts it. Its required
+  calls are dropped by tool NAME only (`restrictionRefusal(..., { nameOnly: true })`), so a Google Ads report schedule is still held to calling
+  `call_google_ads_api`.
+
+**Pinned.** `__tests__/shareVisitorSensitiveTools.test.ts` loads the real tool registry and fails when a name in the list no longer exists, when a
+rule's argument is not in the tool's schema, when a schema enum value is classified unexpectedly, and when a tool whose NAME looks outward
+facing (send, post, publish, delete, remove, launch, revoke, deploy, email, notify, share, ...) is neither sensitive nor written into its
+reviewed-not-sensitive list. A tool with a neutral name is not forced into review by this test, so classify a new write tool on purpose.
+
+**Writes to the link are attribute level.** `setInteractiveShareAllowSensitiveActions` and `removeInteractiveShareExpiry` update one attribute each.
+`updateSessionInteractiveShareMetadata` writes back a whole copy, so an email or alert that reuses a link (and strips its expiry) could otherwise
+write an older copy over the owner's change a moment after they made it.
+
+**Judged after repair.** A tool judged by an argument is judged on the arguments it will run with (`validateAndRepairToolArgs` turns a GET-shaped
+HubSpot call into LIST, an Attio FIND into SEARCH), so a read in a shape the model often uses is not refused for looking like a write. A tool that
+is sensitive whatever its arguments is settled before repair.
+
+**Known limits.** One token per session: turning the switch on also covers anyone who gets that link in a mailed or posted report (the dialog says
+"applies to everyone who has this link"). A link made in the share dialog before the setting existed reads ON until a mailed or posted reuse removes
+the expiry, then OFF. The admin review links (45 days) read OFF; new ones are minted with an explicit OFF. An owner's own unattended run of a
+sensitive tool now reads its session once (is it a visitor-made schedule?), and refuses when that read keeps failing, as ENG-2816 already does for
+the block-listed tools. `generateConversableResponse`, `scheduleAutoWorkPlanContinuation` and `approvalInboxExecution` start turns with no profile
+(not reachable by a visitor directly as far as read; not changed here). They are reachable INDIRECTLY through a decision a visitor stages: see "Final review" below, which closes that.
+
+**Not covered (listed in the test with the reason):** creating a new landing page (`generate_landing_page`, `duplicate_landing_page`);
+`coding_agent`; ClickUp / Notion task creation; lead field edits (`update_lead`, `update_lead_status`); reads of the owner's mailbox, Slack and X messages.
+(In-account overwrites of brand guidelines, market strategy, the knowledge base, status stages, list settings and a saved test login ARE covered since the
+final review below.)
+
+**Gotcha.** `executeTool`'s `validateAndRepairToolArgs` can hoist a nested wrapper or rename an alias, so a tool judged by an argument is judged on the
+PREPARED arguments (a tool judged by name is settled before repair; the ENG-803 publish-approval check reads prepared arguments for the same reason).
+
+## Final review (2026-11-24, on the rebased head; one full-context and one blind reviewer, read-only)
+Two reviewers found these; each was verified in the code by reading it, and all are fixed in this PR with tests:
+- **Resuming a schedule.** `manage_scheduled_chat` with action `toggle` was allowed on an OFF link, and the toggle route (`toggleScheduledChatStatus`) neither
+  checks nor writes a visitor mark, so a visitor could resume one of the owner's PAUSED schedules, which then ran, unrestricted, as the owner (it can email or
+  post). Now a toggle is allowed only with `status: 'paused'` (a new `alsoRequire` on the by-argument rule); resuming, an unknown, a missing or a non-text status
+  is sensitive. Judged after argument repair like the other rules.
+- **The old agent-engine task tools** (`create_task_from_prompt`, `create_task_from_template`, `create_revision`) create a task under the owner's account with
+  `useSharedBrowser: false`; the agent engine then fetches the owner's own saved logins and loads the owner's cookies. Their names carry no outward verb, so the
+  guard test never forced a decision. Now sensitive.
+- **`stage_pending_decision` is sensitive whatever the audience.** When a team approver settles a decision, `approvalInboxExecution.resumeOriginSession`
+  resumes the ORIGIN session as a full owner turn (no restriction), with the visitor's messages still in view. (The earlier note that this was "not reachable
+  by a visitor" was wrong.)
+- **The create-link reply tells the truth about the expiry.** `createConversableShare` answered with the REQUESTED expiry although `createOrReuseInteractiveShare`
+  reuses an existing live link. A link first made by an email or alert path never expires, so an owner who chose "7 days + Full control" from a dialog that had
+  not seen it was shown "Expires ..." on a permanent link that now had full control. The reply now carries the STORED `expiresAt`, and none when the link has none
+  (the dialog only shows an expiry when there is one). The PATCH route still turns the switch on for a link that never expires: the dialog then shows no expiry.
+- **What the approved wording promises.** The OFF text says Emma "won't ... change your settings or Emma's memory". Seven tools overwrite what the owner set up
+  inside the account and were left allowed "pending the owner's decision": `update_brand_guidelines`, `update_market_strategy`, `manage_market_strategy` (its
+  `update` action; `read` stays allowed), `update_knowledge_base_file`, `configure_lead_statuses`, `update_lead_list`, `save_test_account`. They are sensitive now,
+  so the wording is true for them (reads such as `read_market_strategy` and `read_brand_guidelines` are unchanged; lead field edits stay allowed). To allow them
+  again on OFF links, move those names back to the reviewed-not-sensitive list in `shareVisitorSensitiveTools.test.ts` and out of `SHARE_VISITOR_SENSITIVE_TOOLS`.
+
+Known limits added by this review (not fixed here, disclosed):
+- **A running turn is not tied to the link it started on.** `readShareLinkControl` and the approval-card gate read the session's CURRENT link. If the owner stops
+  link A and, while a visitor's turn on A is still running, creates link B with Full control, that turn's next tool call sees B's setting. Closing it means
+  carrying the admitted link's token in the tool context (through the forked chat worker and voice) and requiring a match; it needs an owner to stop one link and
+  start a Full-control one inside one turn.
+- A link made in the share dialog before the setting existed, whose expiry a later email or alert removed, now reads OFF (the release note says dialog links keep
+  working "as they did").
+- The system's own result emails of a schedule a visitor created go to the recipients on that schedule (reported by the blind reviewer, not verified here; the
+  schedule-recipient guard is ENG-1904's, not this change's).
+- The setting is written to the link that is current when the write happens (a background job minting a new link in between could be switched on); conditioning the
+  write on the token that was read would close it.
+
+## The exhaustive pass over every registered tool (2026-11-24), and the closed-world guard
+The final review found siblings of the same classes each round (a tool whose name carries no outward verb but which runs a task as the owner, publishes a page,
+re-times a schedule, replaces a Google doc...). So the whole registry (281 tools) was judged once, each by reading its implementation (two independent
+read-only reviewers, half each), against the approved OFF wording. Added to the sensitive list (whole tool): `create_image_task_from_prompt`, `generate_landing_page`
+(deploys a LIVE page, opens a lead list to public submissions, locks the site mode), `duplicate_landing_page`, `create_skill`, `save_work_plan`,
+`attach_knowledge_base_files`, `create_knowledge_base`, `create_html_template`, `create_book_outline`, `update_google_doc`, `update_google_sheet`,
+`report_product_issues` (a PUBLIC Featurebase post as the owner), `write_clickup_doc`, `create_clickup_task`, `coding_agent` (pushes to the owner's public preview, which the
+next publish ships), `list_test_accounts`, `open_site_signin`. Judged by argument: `dri` on the GTM plan, phase and work-item updates (every later report goes to that
+address), `email_notifications` on `create_schedule_from_template` and on `manage_scheduled_chat` create and update (provenance restricts the tools of a run,
+not who receives its emailed result), `autocomplete` on `create_work_plan` and `modify_work_plan`, `trigger_run` on `submit_scheduled_chat_variables` (runs the
+owner's schedule now, paused or not, with no mark), and for a schedule `update`, the timing and model fields (`schedule_frequency`, `frequency_interval_days`,
+`next_run_time`, `timezone`, `run_count`, `llm_model`, `backup_model`, `daily_digest`: timing is untracked by the provenance on purpose, so re-timing the owner's own
+schedule leaves no mark). A new `forbidWhenSet` on the by-argument rule expresses the last two.
+
+**The guard is closed-world now.** `shareVisitorSensitiveTools.test.ts` fails for ANY registered tool that is not: sensitive, sensitive by argument, blocked, admin,
+listed with a reason in `REVIEWED_NOT_SENSITIVE` (mutating, judged safe) or `REVIEWED_READ_ONLY` (named so that its read-ness is not obvious), or named like a read
+(`get_`, `list_`, `read_`, `search_`, ...). Before, only names containing an outward verb forced a decision, which is why each round found one more. What this still
+cannot catch: a new tool that is NAMED like a read but writes, and tools registered at runtime from the `mcp_servers` setting (the test runs without it).
+
+Judgement calls left allowed on an OFF link (each overwrites or adds data inside the account and none is a delete, a send or a publish; the owner's to decide):
+`update_lead`, `update_lead_status` and `update_email_draft_for_lead` (a lead's fields and draft, blanking included), `update_book_content`,
+`generate_book_content`, `update_landing_page_context`, `enrich_leads_execute` and `enrich_lead_custom` with `overwrite_policy: always_overwrite`, a `dri` set inside
+the items of `add_gtm_phase` / `add_gtm_work_items` / `add_gtm_common_items`, and lead lists that feed an automated outreach schedule (anything a visitor adds to
+such a list decides who the owner's outreach contacts later). `email` search and get (and Slack/X message reads) still read the owner's mailbox, so a login code or
+magic link is findable that way: the one remaining path to "use your saved logins", closing it removes reading the owner's inbox for a visitor on an OFF link.
+`send_for_review` stays (a result-link review flow: the recipient comes from the session's configuration, not from the visitor).
+
+## Third final-review round (2026-11-24, on 8f257cc48): what was closed, what stays
+Closed, each verified in the code:
+- **`email` is sensitive whatever its action.** `search`/`list`/`get` read full message bodies from the owner's mailbox, so a visitor's own (cookie-less) browser can
+  start a "send me a code" or "reset my password" flow on a site the owner has an account on and have Emma read the code or link back: that is
+  `read_verification_code` by another name. The owner can have it back for a visitor by turning Full control on. (This was listed as the owner's call; two blind
+  reviewers independently called it an account-takeover path, so it is closed and the revert is one line: remove `'email'` from `SHARE_VISITOR_SENSITIVE_TOOLS`.)
+  Slack and X message reads and `read_google_doc` stay (privacy of the owner's own messages, not a login).
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* **A session's browser is not shared between the owner and a visitor who may not use the owner's logins.** Browsers are pooled per (owner, chat session) for an hour,
+  and the visitor runs under the owner's id, so a visitor on an OFF link drove the browser the owner had logged in (or read its cookies with `browser_evaluate`).
+  `separateBrowserBetweenActors` releases the session's browser when the actor switches (owner to such a visitor, and back, when the owner's cookies load again).
+  A visitor on a link that allows the sensitive tools is the same actor as the owner.
+- **A schedule a visitor wrote no longer borrows the owner's saved logins.** The browser tools of an UNATTENDED run now ask the schedule's provenance (`scheduledRunRestriction`);
+  a marked schedule's browser steps run without the owner's cookies, and so do steps of a schedule that cannot be read (the browser step still runs; only the logins
+  are withheld). Owner-made schedules, and attended calls, are untouched.
+- **A schedule a visitor wrote may read the Meta ad account but never write to it** (`SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT`): in an unattended run a Meta write
+  is staged as an Approval Desk decision that AgentWeb's own approver can approve, and it is then sent with the owner's token. In a visitor's own chat a Meta write still
+  halts into a deck only the owner can answer, so that flow is unchanged.
+- **`dri` on `add_gtm_phase` and `create_gtm_plan`** (every later report of the plan goes to that address).
+- **The GitHub MCP tools of the owner's own token** (`create_issue`, `push_files`, `merge_pull_request`, ...) are sensitive by name (`SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS`); they exist only
+  at runtime, so the guard test pins their names and that none shadows a tool of ours. Servers an operator adds through the `mcp_servers` setting are NOT covered.
+
+Still allowed, on purpose (disclosed; the owner's to decide): `modify_work_plan` without `autocomplete` keeps an existing `autocomplete: true`, so a visitor who launches an
+autocomplete template and rewrites its steps leaves the owner's next turn to carry them out (this is the visitor-text-in-the-owner's-context class, which the anonymous-viewer
+label of ENG-2227 is for); `generate_image` and `enqueue_human_eval` queue an internal AgentWeb review whose staff reply can write the visitor's prompt into the owner's memory;
+`update_html_file` writes the next `_vN` of a file in a folder taken from the URL (a skipped version number can overwrite the owner's latest); `update_lead` pushes its edits to the
+owner's connected HubSpot or Attio when auto-sync is on; the import notifications of `add_leads_to_list` / `import_leads_from_search` when the owner turned them on;
+`send_for_review` (visitor HTML in the reviewer's email on a result link); `/ishare/:id/email-report` (a fixed AgentWeb report link to any address, rate limited, predates this change);
+Meta image and video uploads; turning Full control on also covers everyone who already holds the link (one token per session) and an `enqueue_human_eval` or `generate_image`
+call by a visitor makes an OFF link permanent (an email path does the same, by design); a running visitor turn is not tied to the link it started on.
+
+## Fourth final-review round (2026-11-24, on 70bee57cf): the hand-over is forced and verified, a schedule that emails others is not editable from an OFF link
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* **The browser hand-over could fail silently.** `releaseSessionClients` skips a pool with a call still running (`inFlight > 0`) and returned nothing, so
+  `separateBrowserBetweenActors` recorded the switch and went on to load the owner's cookies into a browser a visitor's still-running code controlled (a timed-out
+  request keeps running for up to an hour; a visitor can also end their own turn). Now the release is FORCED on a switch (`{ force: true }`, it returns
+  `{ released, skippedInFlight }`), and when it did not happen (a pool was skipped, or it threw) nothing is recorded and the browser step is not run: the caller answers with
+  an error and the next call tries again. Both directions.
+- **A visitor rewriting an existing schedule that emails OTHER people.** The visitor mark limits the tools a run may use, not who receives its emailed output, so a rewritten
+  prompt reached the owner's recipients (a phishing text from AgentWeb). On a link that may not run the sensitive tools, `manage_scheduled_chat` update and
+  `submit_scheduled_chat_variables` on a schedule that has recipients are refused (`scheduleContentEditTarget` names the schedule; a consistent read, one retry, an unreadable
+  schedule refuses). A schedule with no recipients but the owner's own results stays editable; ON and legacy links and the owner's own calls are untouched.
+- `google_calendar_update_event` with `attendees: []` (a key present with an empty list removes every attendee) is sensitive (`keyExists` on the by-argument rule).
+- The provenance answer for the browser steps of an unattended run is kept for a minute per session (a run makes many steps); an answer that could not be settled is not kept.
+Not changed: a nested `solve_captcha` inside a marked schedule is judged as the owner's (it only costs that tool its browser step; no leak found); the owner typing in a marked
+schedule's own session now has Meta writes refused until they adopt the schedule, like the other sensitive tools there.
+
+## Fifth final-review round (2026-11-24, on 0b464e28e)
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* **A forced release was undone by the browser tool's own retry.** A browser tool call retries (twice, after 2 s) on any error, and a call still running when the session's
+  browser is force-released fails with exactly such an error, so it reconnected to a NEW pool under the same key and ran the same code in the browser the next person had
+  just logged in (code that outlives the call, like a background cookie reader, then reads the owner's cookies). `McpClientService` now counts the forced releases of a
+  chat session (`sessionEpoch`); a call remembers the epoch it started in and does not retry into a later one (both retry loops), and answers that the browser was reset.
+- **`create_schedule_from_template` is sensitive in full.** The new schedule inherits the template's recipients when none are given, so a visitor could have AgentWeb mail
+  the owner's clients with text shaped by the visitor's variables.
+- **A run of a schedule a visitor wrote may not edit another schedule that emails other people** (it has no link that could allow it): the recipients check also applies under
+  the schedule profile.
+- The recipients check reads every stored format of the list (a list, a bare address, a JSON list in text: `normalizeEmailList`) and does not count the owner's own address
+  as "other people" (new schedules default to it, so before this an OFF-link visitor could edit almost no schedule, their own included); an unreadable owner address counts every
+  recipient as someone else.
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* The browser hand-over is serialized per session (a visitor's step cannot read the actor while the owner's switch is still releasing), and when the actor map is full an
+  OWNER entry is forgotten before a visitor's.
+Still allowed on purpose (disclosed): a `dri` nested inside the `phases` / `items` of `create_gtm_plan`, `add_gtm_phase` and `add_gtm_work_items` (the top-level `dri` is covered);
+voice does not check a link's expiry (`liveVoiceSocket.ts` checks `isActive` only; predates this change); the PATCH route turns Full control on for a link without showing its expiry.
+
+
+## The browser: a visitor who may not use the owner's logins has a browser of their own (sixth round; replaces the hand-over of rounds 3 to 5)
+Rounds 3 to 5 tried to share one pooled browser between the owner and a visitor and hand it over safely (release it when the actor changes, force the release, verify it,
+stop a force-closed call from retrying into the new browser, serialize the switch). Each fix left a window: the sixth round's full-context review reproduced a race
+(a visitor's call starting between the owner's switch and the owner's cookie load) in a simulation, and a call that is still running at the switch cannot be told from one that
+is about to start. The hand-over and everything it needed (the actor map, the lock, the forced release, the epoch) are REMOVED. Instead, a visitor who may not use the owner's
+logins (an OFF link, a link that cannot be read, or a run of a schedule a visitor wrote) gets a browser pool of their own: `executeTool` passes
+`ToolContext.browserPoolSessionId = <session>::visitor` for the browser call and `McpClientService` pools under it (both execute loops, the per-user discovery loop included),
+so there is nothing to hand over: the owner's cookies are never loaded into that browser, and the visitor's calls never touch the owner's. `releaseSessionClients` releases
+`<owner>::<session>::visitor` with the session. A visitor on a link that allows the sensitive tools (ON, or a legacy dialog link) is the same trust as the owner and keeps sharing the
+owner's browser. Left as a limit: a visitor call that started while the link was ON keeps running in the owner's browser if the owner turns the link OFF during that single call.
+
+## Seventh final-review round (2026-11-24, on 6335a379b): the tool that runs the caller's code on the server
+The Playwright tool `browser_run_code` (exposed as `playwright_browser_run_code`) runs a snippet in Node's `vm` on the SERVER, with the live Playwright `page` object passed in
+(`playwright-core/lib/tools/backend/runCode.js`). Node's documentation says `vm` is not a security boundary: code in it reaches the host `process` through the `page` object
+(checked locally: `page.constructor.constructor('return process')()` from inside the sandbox returns the real `process` and its environment), and `McpClientService` starts the
+browser server as a child process with `{ ...process.env }` (`mcpClientService.ts`, the stdio transport), so the backend's own environment, signing secrets included, is within reach.
+Whether production starts it that way is set in the `mcp_servers` setting and was NOT verified. This exists on main for every customer and has nothing to do with this change; it
+matters here because an OFF link allowed the tool, which made every sentence of the promise hollow for a visitor who writes code.
+Closed for visitors: a visitor who may not run the sensitive tools (OFF link, unreadable link, a run of a schedule a visitor wrote) may not call `*browser_run_code` THEMSELVES
+(`isServerSideBrowserCodeTool`). A call a tool makes itself with fixed code (`solve_captcha`) is not the visitor writing code and still runs: a call is "nested" when another
+restricted call is on the stack (`nestedInRestrictedCall`, set in `executeTool` from the call-scoped store, never taken from the caller's context). ON and legacy links keep it, as the
+owner has it. `browser_evaluate` runs inside the page and is not affected (the sandbox-account policy of ENG-1907 already denies the whole browser class, `browser_run_code` included).
+NOT fixed here, and not a ticket I opened: the tool is still callable by any signed-in customer in their own chat, and the browser process still inherits the backend's environment.
+That is a platform security issue for Harsha and Yugo (start the browser server with a scrubbed environment, isolate it, and treat the tool as running arbitrary code).
+
+## Eighth final-review round (2026-11-24, on 7ff64bd5f): browser calls that name a file on the server
+Both reviews gave NO BLOCKER on 7ff64bd5f. They agreed on one cheap, complete fix: the Playwright tools that take a `filename` (evaluate, snapshot, screenshot, console, network,
+pdf, video) write their result to that path, and `browser_file_upload` takes `paths` and sends those files to the page, while the browser server runs in the backend's own working
+directory (no `cwd` is set) and Playwright allows anything under it. A visitor who may not run the sensitive tools may no longer set either on a direct browser call
+(`browserCallTouchesServerFiles`; the same call without them, whose result comes back in the chat, is unaffected; nested calls, ON and legacy links and the owner are unaffected).
+Also: in a run of a schedule a visitor wrote the refusal says "adopt the schedule" (not the link settings), and `nestedInRestrictedCall` is dropped from a caller's context when
+there is no profile (it is only ever set from the call stack).
+Reported, NOT fixed here (platform items for Harsha and Yugo, equally reachable by any signed-in customer): the browser server process inherits the backend's environment and its working
+directory, so `browser_run_code` (now closed for visitors) and the file parameters are reachable by customers; the browser can navigate to the cloud metadata address (nothing
+blocks it, `ssrfGuard` is not applied to browser tools; whether it yields credentials depends on the instance's metadata settings, not verified); screenshots and downloads share one
+output folder. The fix is on the infrastructure side: start the browser server with a scrubbed environment, an empty working directory of its own per pool, and no route to the metadata address.
+
+## ENG-2840: memory tools on the MCP server (save, delete, list; org writes behind a new scope), plus a mint-time rate check and batch counting (2026-11-23)
+
+Wave 2, slice 2. Outside agents (the Hermes agents) can now keep Emma's memory over MCP. No table, index, stored attribute or migration changes.
+
+### What an agent gets
+
+- `save_memory`, `delete_memory`, `list_memories`: the user's own memory. Default scopes (`tools:execute` to write, `tools:read` to list); a signed-in OAuth client may use them too.
+- `save_org_memory`, `delete_org_memory`: the organization's memory, which goes into EVERY member's Emma prompt. They need the new opt-in scope `memory:org` and an `aw_` key (`apiKeyOnly`): an OAuth client is refused, and `tools:execute` does not imply the scope. A delegated (admin-as-customer) session cannot mint a key with it. Any org member's key may write; owners and admins (`org:configure`) may delete.
+- Reading org memory needs no opt-in scope: `list_memories` with `scope: "org"` shows a member what Emma already shows them. A key that holds `memory:org` is offered `list_memories` in `tools/list` only when it can also call it (`tools:read` or `tools:execute`).
+- The tools run in process on the shared module from W2-1, so the guards are Emma's: identity from the key (never an argument), memory switched off, no org, org memory off, the role check on delete, content over 2,000 characters split and over 8,000 refused, ads-learning rows never deleted or listed.
+
+### What the MCP path adds (Emma's own tools and the Settings routes are unchanged, except that Emma's save tools also get the cleanup of a failed split save, below)
+
+- The MCP path validates nothing against the input schema, so each handler checks its own arguments. An argument that is not an input of the tool is refused by name ("orgId is not an input of save_org_memory"), never ignored. (The server itself drops `userId`, `sessionId` and `llmModel` before any tool sees them, so those run as the caller.)
+- A cap of 200 stored memories per account and per org on saves made through MCP. A split save counts its rows. An account already above 200 (the largest on prod stores 277) keeps everything and is refused new saves until it deletes. The refusal says what the caller can do: a plain org member cannot delete org memory (`org:configure`), so they are told an owner or admin must make room, and an owner, an admin or a user with their own memory is told how to delete.
+- Each save runs under a lock for the account (the org when the caller has one), in order (approximately: the caller's record is read before the save is queued), so the check and the write cannot interleave with another save, **including the members of one JSON-RPC batch and a retry sent at the same moment**. The lock is per server process (the same limit as the lead and strategy tools): with several server instances, saves that reach different ones can each pass the check, so the cap is exact within an instance and approximate across them. The wait for an embedding while holding the lock is bounded to 15 seconds per embedding. The first time a wait times out, that part is saved without an embedding and the remaining parts of a long text are saved without asking for theirs (as when the embedding service fails; the prompt loader embeds a row that has none when it ranks an account's memories, and an account with 20 or fewer rows is injected whole, so nothing is lost). A hung embedding service therefore holds the lock for about 15 seconds plus the writes. It is not a budget for the whole save: a service that is slow but still answering, each part just inside 15 seconds, is not cut off and can hold the lock for up to about 15 seconds per part (a text of 8,000 characters is up to seven or eight parts).
+- An exact duplicate (same category, same text, ignoring surrounding whitespace; for a long text that is split, every part already stored) is not written again and costs no embedding; the answer says `saved: false, duplicate: true` and names the existing id(s).
+- `list_memories` (new): newest first, 20 a page (1 to 50), `nextCursor` back as `cursor`. The page is cut from the bounded newest-1,000 read the Settings screens make, by memory id, so a cursor can only ever select rows of the caller's own account or org. Never returns embeddings; says `truncated` when the newest-1,000 read was full (older rows exist). Both the list and the cap/duplicate check read the table strongly consistently (new `consistentRead` option on the two memory readers), so a list right after a save shows it and two identical saves in a row see each other; a category is filtered in code because an index cannot be read consistently.
+- The public-response sanitizer, which strips internal id fields from JSON-looking text in tool results for outside callers, does not touch these five tools: a memory is the caller's own text, and a memory that is a JSON object with an `apiKeyId` field must come back as saved.
+
+### Two small fixes that ride along
+
+- `POST /api/agent/api-keys` validated nothing about `rateLimitPerMin`, and the limiter trusts it: a key minted with a huge, negative or text rate had no effective limit (and `null` was stored, which blocked the key permanently). It must now be a whole number from 1 to 600 (missing or null means the default 60). Nothing existing changes: prod has 66 keys, 61 at 60 and 5 at 10. A broker that mints with a string, a fraction or a rate outside 1 to 600 now gets a 400.
+- The limiter counted HTTP requests, so a JSON-RPC batch of 100 calls cost one count. The other members are now charged, for aw_ keys and OAuth users alike, **when the batch is about to be served**: a batch that does not fit in what is left is refused whole (429) before any member runs, while a batch answered 404 (expired session), 403 or 503 costs only its own request, so a client that reconnects after a 404 is not refused. Clients that send batches larger than their allowance (more than 60 for an OAuth user, more than 10 for the five prod keys at 10 a minute) will now see a 429 where before they were not counted.
+- A split (long) save that fails part-way now removes the parts whose write was confirmed (best effort, logged by id if one cannot be removed, and finished before the error is passed on), so a retry does not write them a second time. A write that was applied but whose answer was lost is not known to us and can leave one orphan part. This is in the shared module, so Emma's own save tools get it too.
+- A JSON-RPC `method` that is not text made a debug log line throw inside the async handler and left the request hanging (any authenticated key could do it); it is guarded.
+- A tool name in a `tools/call` that is not text (an object with a hostile `toString`) made the scope check throw inside an async handler and left the request hanging; it is now an unknown tool (a write), as for any name no tool has.
+
+### What `memory:org` does and does not control
+
+It decides which KEYS may call `save_org_memory` and `delete_org_memory`. It is not a wall around org memory: a key that may call `emma_send_message`, `emma_run_marketing_task` or `emma_create_session` starts an Emma agent run, and that run has Emma's own `save_org_memory`, with no scope check and no cap (Emma's default foundation tools). That is how `email:read` and the Smartlead scopes already behave; keeping the agent-run tools (`AGENT_EXECUTION_TOOLS`) out of an outside agent's allowlist is the control, and it lives with whoever mints and brokers the key, not in this repo.
+
+### Limits, stated
+
+- Org memory is written into every member's prompt: a key holding `memory:org` can put text in front of every member's Emma. The scope is opt-in and key-only, and the cap of 200 bounds how much.
+- A signed-in OAuth client (including third-party marketplace apps) can write the user's own memory, which Emma reads into her prompt: that is the documented plan decision, and a persistent channel for text. Provenance on a row is only `sourceSessionId` (account) or `sourceUserId` (org).
+- Each save and each `list_memories` reads up to the newest 1,000 rows strongly consistently (about 17 KB each; on the largest prod account, 277 rows, about 4.7 MB). Both memory tables are pay-per-request, so that costs read units, not capacity.
+- Outside this repo: the key broker must request `memory:org` when it mints for an agent that writes org memory; the customer portal's key form cannot grant it today.
+- Memory is never deleted by age: TTL is off on both tables, and no source attribute is stored (no `source: 'mcp'` on rows; that would be a persisted-model change).
+- Rollback is a revert of the PR (code only).
+
+## ENG-2840: memory readers return every memory up to a bound instead of one page, and the memory tool bodies move to one shared module (2026-11-23)
+
+Wave 2, slice W2-1. No new tool and no new route; it repairs what Emma and the Settings memory screens read, and it moves the four memory tool bodies (`save_memory`, `delete_memory`, `save_org_memory`, `delete_org_memory`) into `backend/src/emma/impl/memory.ts` so the MCP memory tools of the next slice can share one set of guards.
+
+### The bug this fixes
+
+A memory row carries a 1,536-number embedding, about 17 KB, and one DynamoDB query page holds at most 1 MB, so one page is 56 to 60 rows. `accountMemoryDb.getUserMemories` returned after the first page that held any ordinary row, and `orgMemoryDb.getOrgMemories` was one unpaged query. Memory ids are ULIDs and the query reads oldest first, so an account with more memories than one page showed only its OLDEST 56 or so, to Emma's prompt and to the Settings memory screen alike. On 2026-11-23 that was 14 of the 52 accounts with memories (and one org); the largest account stores 277 and its page returned 56. Every memory saved after the first page was invisible.
+
+### What changed
+
+- `getUserMemories` and `getOrgMemories` take a fourth argument, `options: { maxRows?, newestFirst?, omitEmbeddings? }`. A call with a `limit` behaves exactly as before. A call without one follows the cursor until the rows run out or `maxRows` is reached.
+  - The prompt loader (`agentModeService`) is unchanged and gets the defaults: the **newest 200** rows (`MEMORY_READ_MAX_ROWS_PROMPT`), embeddings included because it ranks by them.
+  - `GET /api/memory` and `GET /api/org/:orgId/memory` read the **newest** rows up to **1,000** and return them **oldest first** as before (so the screen order does not change; if an account ever held more than 1,000, it is the oldest that are left out, never the newest). They do **not fetch the embedding vectors at all**: the read names every other attribute (a DynamoDB projection, checked against the real service on the account table and the category index of both tables). The portal never reads the vectors; they were about 40 of every 45 KB of a row on the wire. A category-filtered list is returned as read, because its index sorts by category, not by time.
+  - A read that stops at its bound logs a `[memory] ... stopped at its N-row bound (there may be more rows stored)` warning (DynamoDB returns a cursor whenever the limit was used up, even when nothing is left, so an account with exactly the bound's number of rows logs it too).
+  - `maxRows` and `newestFirst` are ignored when a `limit` is passed (that call keeps its old behaviour and order).
+- The account reader's page budget grows with the bound (ten pages for a `limit` call, as before). It still fails closed rather than return a partial answer. The org reader still does not validate rows (it never did; one odd row must not take the whole org list or every member's prompt down), and the account reader still fails closed on an item that is not a row at all (not an object, or no string id), on a page that is not a list, and on any row when the read has a `limit` (`getRecentMemories` and limited callers are exactly as before). The one change: the read without a `limit` (the prompt loader and the list screens) now reaches rows far past the first page, so a row that has an id but no text `content` (nothing to show or rank) is skipped and logged (`[memory] account memory read skipped N row(s) without text content, ids ...`) instead of failing the whole list and every prompt for that account. A bound that is not a number, zero or negative falls back to the default; a fraction rounds down, never below 1. (Checked on prod on 2026-11-23: no row in either memory table lacks a string `content` or `memoryId`.)
+- `setMemoryEmbedding` (both tables) is now conditional on the row existing and ignores a row deleted in the meantime. It was an unconditional upsert: a memory deleted while its embedding was being backfilled came back as a row with no content, which makes the account reader refuse the whole list.
+- `deleteMemory` (both tables) resolves `true` when a row was deleted and `false` when there was none. A delete of a missing id used to answer "deleted".
+- The memory category list moved to `utils/memoryCategories.ts`, one source for the database layer and the new module.
+
+### Tool defects fixed on the way (all in `emma/impl/memory.ts`)
+
+- An invalid category used to be embedded, and the embedding billed to the caller's cap, before the database layer refused it. The arguments are now checked first.
+- Whitespace-only content over 2,000 characters split into nothing and answered `success: true` with no row saved. It is now refused ("Content is required"). A call with no arguments object at all now answers `Invalid category: undefined` instead of a `TypeError`.
+- Content that was not text threw after the earlier rows were saved, so a retry saved them twice. It is now refused before anything is written.
+- The 8,000-character limit was enforced only by the agent-mode tool schema. It is enforced in the shared module too, so a caller that skips that schema cannot write a larger memory.
+- `delete_memory` / `delete_org_memory` of an id that does not exist now answer `success: false` ("not found; nothing was deleted").
+- The `delete_org_memory` description said only owners can delete; owners and admins can (`org:configure`). The description now says so.
+
+### Save routes and the embedding bill
+
+- `POST /api/memory` and `POST /api/org/:orgId/memory` embedded the text, billed to the caller's cap, before `addMemory` refused an invalid category, a blank content or a content over 2,000 characters. They now run the same checks, with the same messages and the same 400, before the embedding is requested (`utils/memorySaveGuard.ts`; a test pins that its messages equal `addMemory`'s). A valid save is unchanged.
+
+### What an end user sees
+
+- Emma: for an account past one page, her memory context now includes the newer memories as well (still the top 20 by relevance, as before). Nothing changes for an account with 56 or fewer memories.
+- Settings, memory and org memory tabs: an account past one page sees all its memories (up to 1,000) instead of the first ~56. The tabs have no pagination, so it is one longer list. The response is much smaller per row because the vectors are gone.
+- Emma's save and delete memory tools: the same answers, except the edge cases above, which are now errors or a "not found" instead of a false success.
+- No cap on how many memories an account may save is added here (the MCP write cap belongs to the next slice).
+- Unchanged on purpose: `DELETE /api/memory/:id` and `DELETE /api/org/:orgId/memory/:id` still answer success for an id that does not exist (the portal behaves as today); only the Emma tools say "not found".
+
+### Limits, stated
+
+- The prompt loader reads at most the newest 200 rows. An account above that keeps its memories, but Emma ranks among the newest 200 only: for the largest account today (277 rows) facts 1 to 77 stay out of her prompt, where before 221 of 277 did (the old reader returned one page of 56 rows, measured on prod). It costs about four sequential queries per agent turn for that account, against one before. The Settings list reads up to 1,000.
+- A 200-row read for the prompt is about 3.4 MB stored and about 9 MB of DynamoDB JSON on the wire for an account with an embedding on every row (about 45 KB of JSON per row; the largest account today is 277 rows). It was up to one page before. The parse and unmarshal (about 100 ms each at 200 rows, measured with the aws-sdk v2 converter on synthetic rows) run in the forked generation worker (the main generation path), not on the API event loop, and the loader reads once per turn. The Settings lists no longer fetch the vectors, so they stay small. Only 16 of 2,411 rows lacked an embedding on 2026-11-23, so the backfill the loader does for them stays negligible.
+- A read through an eventually consistent index can lag a save made a moment earlier; the tools answer with the saved ids.
+- Rollback is a revert of the PR (code only; no data, schema or index changed).
+
+## ENG-3102: merge-evidence.sh treats Opslane "didn't verify this commit" as an abstention (2026-11-16)
+
+- `.github/scripts/merge-evidence.sh` pass 4: the closed list of Opslane `neutral` abstention titles gains a fourth entry, "Opslane didn't verify this commit". Opslane posts it when it did not run on a head at all (a daily limit, the plan, or a setup change) and says the check does not block. Before, that title failed the gate, and the check-run cannot be re-requested, so only a new push could clear it (#4134).
+- The match is still app slug + check name + `neutral` + exact title. An Opslane `failure`, or a `neutral` with any other title, still blocks. A dropped run is not counted as evidence.
+- Consequence: a head can now pass the gate with no Opslane run on it. To undo, remove the title from `OPSLANE_NOOP_TITLES`.
+- Tests: four cases in `.github/scripts/merge-evidence.test.sh` built from the #4134 check-run.
+
 ## ENG-3148: Policy-blocked tool errors carry gate detail (2026-11-22)
 
 `toolResultError` now appends a blocked result's `formattedContent` (e.g. set_work_plan_status naming the missing calls per step) to the model-visible error. Prod session e68025bf burned 13/40 steps on blind set_work_plan_status retries and hit the iteration limit. iterationLimitStopResult semantics unchanged.

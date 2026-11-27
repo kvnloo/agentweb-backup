@@ -326,6 +326,91 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
     });
   });
 
+  describe('Zoma/Haven launch — AD_SET CREATE on a CBO campaign, and Meta\'s error detail', () => {
+    it('does not inject an ad-set bid_strategy under CBO (the ad set inherits the campaign\'s)', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({
+        id: 'camp_123', objective: 'OUTCOME_TRAFFIC', daily_budget: 5000, bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+      });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' });
+
+      const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams, daily_budget: undefined });
+
+      expect(result.success).toBe(true);
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith).not.toHaveProperty('bid_strategy');
+      expect(calledWith.daily_budget).toBeUndefined();
+      expect(result.appliedBidStrategy).toBe('LOWEST_COST_WITHOUT_CAP');
+      expect(result.readBackMismatch).toBeUndefined();
+    });
+
+    it('still sends a bid_strategy the caller explicitly chose under CBO', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC', daily_budget: 5000 });
+      await service.createMetaAdsAdSet('user123', { ...baseAdSetParams, daily_budget: undefined, bid_strategy: 'COST_CAP', bid_amount: 5 });
+      expect((metaService.createAdSet as jest.Mock).mock.calls[0][2].bid_strategy).toBe('COST_CAP');
+    });
+
+    it('does not require bid_amount when a COST_CAP strategy is inherited from the CBO campaign, and does not resend it', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC', daily_budget: 5000, bid_strategy: 'COST_CAP' });
+      const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams, daily_budget: undefined });
+      expect(result.success).toBe(true);
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith).not.toHaveProperty('bid_strategy');
+      expect(calledWith).not.toHaveProperty('bid_amount');
+    });
+
+    it('still requires bid_amount when the caller explicitly sets COST_CAP / BID_CAP on a CBO ad set', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC', daily_budget: 5000 });
+      for (const bid_strategy of ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP']) {
+        const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams, daily_budget: undefined, bid_strategy });
+        expect(result.success).toBe(false);
+        expect(JSON.stringify(result)).toContain(`bid_amount is required for ${bid_strategy}`);
+      }
+      expect(metaService.createAdSet).not.toHaveBeenCalled();
+    });
+
+    it('keeps the ad-set default bid_strategy when the campaign has no budget (ABO, unchanged)', async () => {
+      await service.createMetaAdsAdSet('user123', { ...baseAdSetParams });
+      expect((metaService.createAdSet as jest.Mock).mock.calls[0][2].bid_strategy).toBe('LOWEST_COST_WITHOUT_CAP');
+    });
+
+    it('returns Meta\'s full error (title, user message, code, subcode, fbtrace_id) in `error`, not a bare "Invalid parameter"', async () => {
+      const metaError: any = new Error('Invalid parameter');
+      metaError.structuredError = {
+        message: 'Invalid parameter', code: 100, error_subcode: 1885183,
+        error_user_title: 'Bid strategy conflict', error_user_msg: 'The ad set bid strategy must match the campaign.',
+        fbtrace_id: 'AbCdEf123',
+      };
+      (metaService.createAdSet as jest.Mock).mockRejectedValue(metaError);
+
+      const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams });
+
+      expect(result.success).toBe(false);
+      expect(result.error).not.toBe('Invalid parameter');
+      for (const part of ['Invalid parameter', 'Bid strategy conflict', 'must match the campaign', 'code 100', 'subcode 1885183', 'fbtrace_id AbCdEf123']) {
+        expect(result.error).toContain(part);
+      }
+    });
+  });
+
+  describe('Zoma/Haven launch — reading ONE campaign / ad set by id (GET)', () => {
+    it('CAMPAIGN GET is the id-scoped read, not "Invalid action: GET" (which surfaced as "Meta Toolkit call failed.")', async () => {
+      const list = jest.spyOn(service, 'listMetaAdsCampaignsNew').mockResolvedValue({ success: true, campaigns: [{ id: '120' }] } as any);
+      const result: any = await service.manageMetaAdsCampaigns('user123', 'GET', '123456789', '120', { fields: 'id,name' });
+      expect(result).toMatchObject({ success: true, campaigns: [{ id: '120' }] });
+      expect(list).toHaveBeenCalledWith('user123', '123456789', { campaignId: '120', fields: 'id,name' });
+    });
+
+    it('AD_SET GET is the id-scoped read', async () => {
+      const list = jest.spyOn(service, 'listMetaAdsAdSets').mockResolvedValue({ success: true, adSets: [] } as any);
+      await service.manageMetaAdsAdSets('user123', 'GET', '123456789', undefined, '777');
+      expect(list).toHaveBeenCalledWith('user123', undefined, '123456789', { adSetId: '777', fields: undefined });
+    });
+
+    it('GET without an id says which id is needed', async () => {
+      await expect(service.manageMetaAdsCampaigns('user123', 'GET', '123456789')).rejects.toThrow(/campaign_id is required for CAMPAIGN GET/);
+    });
+  });
+
   describe('A — the model-facing contract lists every field the handler accepts', () => {
     it('documents bid_strategy on AD_SET CREATE so the model knows it is writable', () => {
       const toolsSrc = fs.readFileSync(
