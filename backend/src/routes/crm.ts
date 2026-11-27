@@ -2846,6 +2846,9 @@ router.get('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
   }
 });
 
+/** Most lead ids one bulk contact-status request may name (ENG-2840; the portal sends at most one page of 200). */
+const BULK_CONTACT_STATUS_MAX_LEADS = 500;
+
 /**
  * @route PUT /api/crm/lists/:listId/leads/bulk-contact-status
  * @desc Bulk update contact status for multiple leads
@@ -2866,6 +2869,13 @@ router.put('/lists/:listId/leads/bulk-contact-status', async (req: Request, res:
 
     if (!Array.isArray(leadIds) || leadIds.length === 0) {
       return res.status(400).json({ message: 'leadIds array is required and must not be empty' });
+    }
+    // ENG-2840: bounded (the portal sends at most one page, 200 leads), and every id must be a plain string.
+    if (leadIds.length > BULK_CONTACT_STATUS_MAX_LEADS) {
+      return res.status(400).json({ message: `At most ${BULK_CONTACT_STATUS_MAX_LEADS} leads per request` });
+    }
+    if (!leadIds.every((id: unknown) => typeof id === 'string' && id.length > 0 && id.length <= 128)) {
+      return res.status(400).json({ message: 'leadIds must be lead ids' });
     }
 
     const validStatuses = ['active', 'do-not-contact', 'unsubscribed'];
@@ -2893,6 +2903,13 @@ router.put('/lists/:listId/leads/bulk-contact-status', async (req: Request, res:
 
     for (const leadId of leadIds) {
       try {
+        // ENG-2840: `updateLead` is an upsert, so an id that is not in this list would CREATE a stub lead holding only these fields. A
+        // missing lead is counted as failed, never created (Emma's own bulk status tool already does this).
+        const existing = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+        if (!existing) {
+          failed++;
+          continue;
+        }
         const updates: any = {
           contactStatus,
           contactStatusUpdatedAt: now,
