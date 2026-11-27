@@ -154,10 +154,11 @@ describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)',
   });
 
   it('preview → confirm: preview sends no mutate; confirm sends exactly one; replay sends none', async () => {
-    const args = { customer_id: CID, entity_type: 'BUDGET', action: 'UPDATE', budget_resource_name: BUDGET, amount: 50 };
+    // 2x: within the built-in default ceiling (ENG-3212: unset env = $500/day, ≤2x per change).
+    const args = { customer_id: CID, entity_type: 'BUDGET', action: 'UPDATE', budget_resource_name: BUDGET, amount: 40 };
     const preview = await call('call_google_ads_api', args);
     expect(preview.result.status).toBe('PREVIEW');
-    expect(preview.result.preview).toContain('20.00 USD/day (= 20000000 micros) → 50.00 USD/day (= 50000000 micros)');
+    expect(preview.result.preview).toContain('20.00 USD/day (= 20000000 micros) → 40.00 USD/day (= 40000000 micros)');
     expect(mutates()).toHaveLength(0);
     expect(mockRecordWrite).not.toHaveBeenCalled();
 
@@ -168,10 +169,10 @@ describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)',
     expect(mutates()).toHaveLength(0);
 
     const confirmed = await call('call_google_ads_api', { ...args, confirm: true, preview_token: preview.result.preview_token });
-    expect(confirmed.result).toMatchObject({ success: true, verification: 'CONFIRMED', id: BUDGET, amount_micros: 50_000_000 });
+    expect(confirmed.result).toMatchObject({ success: true, verification: 'CONFIRMED', id: BUDGET, amount_micros: 40_000_000 });
     expect(mutates()).toHaveLength(1);
     const [, body, cfg] = mutates()[0];
-    expect(body.operations).toEqual([{ update: { resourceName: BUDGET, amountMicros: '50000000' }, updateMask: 'amount_micros' }]);
+    expect(body.operations).toEqual([{ update: { resourceName: BUDGET, amountMicros: '40000000' }, updateMask: 'amount_micros' }]);
     expect(cfg.headers['login-customer-id']).toBe(MANAGER);
     expect(mockRecordWrite).toHaveBeenCalledTimes(1);
     expect(mockRecordWrite).toHaveBeenCalledWith(expect.objectContaining({ platform: 'google_ads', verification: 'CONFIRMED', entityType: 'BUDGET', action: 'UPDATE' }));
@@ -206,6 +207,14 @@ describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)',
     expect(confirmed.result).toMatchObject({ success: true, verification: 'CONFIRMED', biddable: false });
     expect(mutates()).toHaveLength(1);
     expect(mockPost.mock.calls.filter(([, body]) => body.query?.includes('campaign_conversion_goal.resource_name ='))).toHaveLength(4);
+  });
+
+  it('with GOOGLE_TOOLKIT_SPEND_CEILING unset, the built-in default refuses a >2x raise before any mutate (ENG-3212)', async () => {
+    delete process.env.GOOGLE_TOOLKIT_SPEND_CEILING;
+    const r = await call('call_google_ads_api', { customer_id: CID, entity_type: 'BUDGET', action: 'UPDATE', budget_resource_name: BUDGET, amount: 50 });
+    expect(r.isError).toBe(true);
+    expect(JSON.stringify(r)).toMatch(/ceiling/i);
+    expect(mutates()).toHaveLength(0);
   });
 
   it('a timeout on the confirmed mutate is UNCONFIRMED (metered as a write), not "did not apply"', async () => {
