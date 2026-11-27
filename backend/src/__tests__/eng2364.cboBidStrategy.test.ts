@@ -108,4 +108,16 @@ describe('MetaService.updateCampaign CBO bid strategy (ENG-2364)', () => {
     await service.updateCampaign('t', 'c1', { daily_budget: 5000 }, '123');
     expect(sent()).toEqual({ daily_budget: 5000 });
   });
+
+  it('keeps a COST_CAP campaign on COST_CAP on a budget-only update (sends no bid_strategy)', async () => {
+    mockCampaign({ bid_strategy: 'COST_CAP' });
+    await service.updateCampaign('t', 'c1', { daily_budget: 5000 }, '123');
+    expect(sent()).toEqual({ daily_budget: 5000 });
+  });
+
+  it('reads the current bid_strategy in the pre-write ownership read', async () => {
+    mockCampaign({});
+    await service.updateCampaign('t', 'c1', { daily_budget: 5000 }, '123');
+    expect(get.mock.calls[0][0]).toEqual(expect.arrayContaining(['daily_budget', 'lifetime_budget', 'bid_strategy']));
+  });
 });
