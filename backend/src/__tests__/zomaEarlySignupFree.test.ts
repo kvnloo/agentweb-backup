@@ -136,12 +136,35 @@ describe('early-signup free period', () => {
   it.each([
     ['offset-less date', { ZOMA_EARLY_SIGNUP_FROM: '2026-11-13T00:00:00' }],
     ['date only', { ZOMA_EARLY_SIGNUP_FREE_UNTIL: '2027-01-01' }],
-    ['missing value', { ZOMA_EARLY_SIGNUP_UNTIL: undefined }],
     ['inverted window', { ZOMA_EARLY_SIGNUP_FROM: '2026-12-05T00:00:00-08:00' }],
   ])('invalid config (%s) disables the skip', async (_l, over) => {
     setEarly(over as any);
     expect(getZomaEarlySignupConfig()).toBeUndefined();
     await expect(publish(deps(IN_WINDOW))).rejects.toBeInstanceOf(ZomaPaywallError);
+  });
+
+  it('flag alone uses the built-in window (no date env needed)', async () => {
+    setEarly({ ZOMA_EARLY_SIGNUP_FROM: undefined, ZOMA_EARLY_SIGNUP_UNTIL: undefined, ZOMA_EARLY_SIGNUP_FREE_UNTIL: undefined });
+    const cfg = getZomaEarlySignupConfig()!;
+    expect(cfg.from).toBe(Date.parse('2026-11-13T08:00:00Z'));
+    expect(cfg.until).toBe(Date.parse('2026-12-04T07:59:59Z'));
+    expect(cfg.freeUntil).toBe(FREE_END);
+    await expect(publish(deps(IN_WINDOW))).resolves.toBeUndefined();
+    await expect(publish(deps(BEFORE_WINDOW))).rejects.toBeInstanceOf(ZomaPaywallError);
+    expect((await getZomaPlanSummary('u1', deps(IN_WINDOW)))?.free_until).toBe('Jan 1, 2027');
+  });
+
+  it('blank date env falls back to the default; a set env value overrides it', () => {
+    setEarly({ ZOMA_EARLY_SIGNUP_UNTIL: '  ', ZOMA_EARLY_SIGNUP_FREE_UNTIL: '2027-02-01T00:00:00-08:00' });
+    const cfg = getZomaEarlySignupConfig()!;
+    expect(cfg.until).toBe(Date.parse('2026-12-04T07:59:59Z'));
+    expect(cfg.freeUntil).toBe(Date.parse('2027-02-01T08:00:00Z'));
+    expect(cfg.freeUntilRaw).toBe('2027-02-01T00:00:00-08:00');
+  });
+
+  it('defaults do nothing while the flag is off', () => {
+    setEarly({ ZOMA_EARLY_SIGNUP_FREE_ENABLED: undefined, ZOMA_EARLY_SIGNUP_FROM: undefined, ZOMA_EARLY_SIGNUP_UNTIL: undefined, ZOMA_EARLY_SIGNUP_FREE_UNTIL: undefined });
+    expect(getZomaEarlySignupConfig()).toBeUndefined();
   });
 
   it('zoma_status says free until Jan 1 and mints no checkout', async () => {

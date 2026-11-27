@@ -18,6 +18,15 @@ export interface ZomaEarlySignupConfig {
   freeUntilRaw: string;
 }
 
+/**
+ * Built-in window, so turning the feature on needs only the flag: prod-3's EB environment text is
+ * at its 4096-byte limit. An env value that is set (non-blank) wins; a set-but-invalid value still
+ * fails closed rather than falling back.
+ */
+export const DEFAULT_ZOMA_EARLY_SIGNUP_FROM = '2026-11-13T00:00:00-08:00';
+export const DEFAULT_ZOMA_EARLY_SIGNUP_UNTIL = '2026-12-03T23:59:59-08:00';
+export const DEFAULT_ZOMA_EARLY_SIGNUP_FREE_UNTIL = '2027-01-01T00:00:00-08:00';
+
 // An explicit offset is required: a date-only or offset-less value would shift the window by hours.
 const ISO_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 
@@ -36,14 +45,18 @@ function parseInstant(raw: string | undefined): number | undefined {
 
 export function getZomaEarlySignupConfig(env: NodeJS.ProcessEnv = process.env): ZomaEarlySignupConfig | undefined {
   if (env.ZOMA_EARLY_SIGNUP_FREE_ENABLED !== 'true') return undefined;
-  const from = parseInstant(env.ZOMA_EARLY_SIGNUP_FROM);
-  const until = parseInstant(env.ZOMA_EARLY_SIGNUP_UNTIL);
-  const freeUntil = parseInstant(env.ZOMA_EARLY_SIGNUP_FREE_UNTIL);
+  const raw = (v: string | undefined, fallback: string) => (v?.trim() ? v.trim() : fallback);
+  const fromRaw = raw(env.ZOMA_EARLY_SIGNUP_FROM, DEFAULT_ZOMA_EARLY_SIGNUP_FROM);
+  const untilRaw = raw(env.ZOMA_EARLY_SIGNUP_UNTIL, DEFAULT_ZOMA_EARLY_SIGNUP_UNTIL);
+  const freeUntilRaw = raw(env.ZOMA_EARLY_SIGNUP_FREE_UNTIL, DEFAULT_ZOMA_EARLY_SIGNUP_FREE_UNTIL);
+  const from = parseInstant(fromRaw);
+  const until = parseInstant(untilRaw);
+  const freeUntil = parseInstant(freeUntilRaw);
   if (from === undefined || until === undefined || freeUntil === undefined || from > until) {
     console.error('[zoma-billing] ZOMA_EARLY_SIGNUP_FREE_ENABLED is on but the window config is missing or invalid; no one skips the paywall.');
     return undefined;
   }
-  return { from, until, freeUntil, freeUntilRaw: env.ZOMA_EARLY_SIGNUP_FREE_UNTIL!.trim() };
+  return { from, until, freeUntil, freeUntilRaw };
 }
 
 /** True when this signup time is inside the window and the free period has not ended. */
