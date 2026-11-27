@@ -22,6 +22,7 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionLlmModel: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
     updateSessionApprovalDeck: jest.fn(),
+    getChatSessionRecord: jest.fn(),
   },
 }));
 
@@ -376,5 +377,111 @@ describe('generateSharedResponse — approval-deck cancel channel (ENG-1635/1644
 
     expect(res.status).toHaveBeenCalledWith(409);
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+  });
+
+  // ENG-3170: Full control is everything the customer can do, including approving a write or a locked decision.
+  describe('a link whose owner turned on FULL CONTROL', () => {
+    const link = (allowSensitiveActions: boolean | undefined) =>
+      ({ sessionId: SESSION_ID, interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-11-01T00:00:00.000Z', ...(allowSensitiveActions === undefined ? {} : { allowSensitiveActions }) } }) as any;
+
+    it.each([
+      ['a Meta write deck', () => writeDeck(), 'deck-write', [{ itemId: 'write-1', verdict: 'approve' }]],
+      ['an immutable item (the campaign objective)', () => immutableDeck(), 'deck-objective', [{ itemId: 'objective-1', verdict: 'leads' }]],
+    ])('lets the visitor answer %s, and reads the link with a consistent read', async (_label, deck, deckId, answers) => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(deck()) as any);
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(link(true));
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId, answers } }), res);
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      expect((mockChatbotDb as any).getChatSessionRecord).toHaveBeenCalledWith(SESSION_ID, true);
+      expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(SESSION_ID, deckId, answers, 'user');
+    });
+
+    it('lets the visitor answer a mixed deck too (the deck is still answered whole)', async () => {
+      const mixed = { ...questionDeck(), deckId: 'deck-mixed', items: [...questionDeck().items, ...writeDeck().items] };
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(mixed) as any);
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(link(true));
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId: 'deck-mixed', answers: [{ itemId: 'question-1', verdict: 'leads' }, { itemId: 'write-1', verdict: 'approve' }] } }), res);
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledTimes(1);
+    });
+
+    const linkWith = (extra: Record<string, unknown>) =>
+      ({ sessionId: SESSION_ID, interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: new Date(Date.now() - 86_400_000).toISOString(), ...extra } }) as any;
+
+    it.each([
+      ['a link made before the setting existed, with a share-dialog lifetime (it reads "sensitive tools allowed" but never FULL control: its visitors were refused this answer before)', () => linkWith({ expiresAt: new Date(Date.now() + 6 * 86_400_000).toISOString() })],
+      ['full control is on but the owner has stopped sharing (isActive false)', () => linkWith({ isActive: false, allowSensitiveActions: true })],
+      ['full control is on but the link has expired', () => linkWith({ expiresAt: new Date(Date.now() - 60_000).toISOString(), allowSensitiveActions: true })],
+      ['the stored choice is not a boolean', () => linkWith({ allowSensitiveActions: 'true' })],
+    ])('still refuses with 403 when %s', async (_label, record) => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(writeDeck()) as any);
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(record());
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId: 'deck-write', answers: [{ itemId: 'write-1', verdict: 'approve' }] } }), res);
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(mockAgentModeService.submitApprovalDeckAnswers).not.toHaveBeenCalled();
+    });
+
+    it('a write that FAILED gets the same instruction the owner\'s own route gives (read the error, do not re-propose the identical write)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(writeDeck()) as any);
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(link(true));
+      (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue({
+        outcome: 'submitted',
+        run: null,
+        summary: { status: 'unapplied', items: [{ itemId: 'write-1', status: 'failed', error: 'budget is below the account minimum' }] },
+        answeredDeck: { ...writeDeck(), status: 'answered', answers: [{ itemId: 'write-1', verdict: 'approve', answeredBy: 'user', at: '2026-09-20T00:00:02.000Z' }] },
+      });
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId: 'deck-write', answers: [{ itemId: 'write-1', verdict: 'approve' }] } }), res);
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      const workerArgs = (mockWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+      expect(workerArgs.messageContent).toContain('"status":"unapplied"');
+      expect(workerArgs.messageContent).toContain('budget is below the account minimum');
+      expect(workerArgs.messageContent).toContain('Do NOT silently re-propose an identical write that already failed.');
+    });
+
+    it('a question deck answer carries no failure instruction', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(questionDeck()) as any);
+      (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue({
+        outcome: 'submitted', run: null, summary: null,
+        answeredDeck: { ...questionDeck(), status: 'answered', answers: [{ itemId: 'question-1', verdict: 'leads', answeredBy: 'user', at: '2026-09-20T00:00:02.000Z' }] },
+      });
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId: 'deck-q1', answers: [{ itemId: 'question-1', verdict: 'leads' }] } }), res);
+      const workerArgs = (mockWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+      expect(workerArgs.messageContent).not.toContain('Do NOT silently re-propose');
+    });
+
+    it.each([
+      ['full control is off', () => link(false)],
+      ['a link made before the setting existed with no expiry (reads off)', () => link(undefined)],
+      ['no session record at all', () => null],
+    ])('still refuses with 403 when %s', async (_label, record) => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(writeDeck()) as any);
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(record());
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId: 'deck-write', answers: [{ itemId: 'write-1', verdict: 'approve' }] } }), res);
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect((res.json as jest.Mock).mock.calls[0][0].code).toBe('APPROVAL_DECK_FORBIDDEN');
+      expect(mockAgentModeService.submitApprovalDeckAnswers).not.toHaveBeenCalled();
+    });
+
+    it('still refuses when the link can not be read (fail closed)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(writeDeck()) as any);
+      (mockChatbotDb as any).getChatSessionRecord.mockRejectedValue(new Error('throttled'));
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId: 'deck-write', answers: [{ itemId: 'write-1', verdict: 'approve' }] } }), res);
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(mockAgentModeService.submitApprovalDeckAnswers).not.toHaveBeenCalled();
+    });
+
+    it('a plain question deck needs no read of the link at all', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(questionDeck()) as any);
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(makeReq({ deckAnswer: { deckId: 'deck-q1', answers: [{ itemId: 'question-1', verdict: 'leads' }] } }), res);
+      expect((mockChatbotDb as any).getChatSessionRecord).not.toHaveBeenCalled();
+    });
   });
 });

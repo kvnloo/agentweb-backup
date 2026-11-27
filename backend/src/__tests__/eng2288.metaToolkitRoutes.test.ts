@@ -74,7 +74,7 @@ describe('ENG-2288 Meta Toolkit HTTP routes', () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     mockHandle.mockRejectedValue(new Error('graph.facebook.com secret internals'));
     const res = await request(app).post('/api/meta-toolkit/tools/meta_get_insights/call').send({}).expect(500);
-    expect(res.body).toEqual({ error: 'Meta Toolkit call failed.' });
+    expect(res.body.error).toMatch(/^Meta Toolkit call failed: internal error \(Error\)/);
     expect(JSON.stringify(res.body)).not.toMatch(/secret|stack/);
   });
 

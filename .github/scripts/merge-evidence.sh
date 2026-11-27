@@ -573,7 +573,11 @@ fi
 # exact-title match is against a closed allowlist.
 # #3967 got "Opslane couldn't test this commit" ("No test finished, so this
 # check doesn't block.") — the same abstention, a third wording.
-OPSLANE_NOOP_TITLES='["Nothing Opslane can verify here","Nothing to verify in this PR","Opslane couldn'"'"'t test this commit"]'
+# #4134 got "Opslane didn't verify this commit" ("Opslane didn't run on this
+# commit (a daily limit, the plan, or a setup change). ... This check doesn't
+# block the merge.") — no run happened at all, a fourth wording (ENG-3102). The
+# rerequest endpoint 404s for it, so nothing but a push could clear it.
+OPSLANE_NOOP_TITLES='["Nothing Opslane can verify here","Nothing to verify in this PR","Opslane couldn'"'"'t test this commit","Opslane didn'"'"'t verify this commit"]'
 # shellcheck disable=SC2016 # $t is a jq variable, not a shell expansion
 opslane_filter='select((.app.slug // "") == "opslane" and .name == "Opslane"
   and .conclusion == "neutral" and ((.output.title // "") as $x | $t | index($x) != null))'

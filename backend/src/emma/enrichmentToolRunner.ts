@@ -89,10 +89,12 @@ export async function runEmmaEnrichment(
     throw new Error('Lead list not found');
   }
   const { canAccessCrmList, canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../services/crmAccessControl');
-  const hasAccess = params.mode === 'preview'
-    ? await canAccessCrmList(params.userId, accessList)
-    : await canDestructiveCrmList(params.userId, accessList);
-  if (!hasAccess) {
+  // ENG-2840: a list the caller cannot read at all answers exactly like a missing one, so the answer does not tell a caller whether another
+  // account's list exists. Only a member who may read the list but not edit it is told that editing needs an editor.
+  if (!(await canAccessCrmList(params.userId, accessList))) {
+    throw new Error('Lead list not found');
+  }
+  if (params.mode !== 'preview' && !(await canDestructiveCrmList(params.userId, accessList))) {
     throw new Error(CRM_EDITOR_REQUIRED_MESSAGE);
   }
 
@@ -206,8 +208,16 @@ export async function runEmmaEnrichment(
 export async function pickPreviewLeadIds(
   listId: string,
   explicitLeadIds: string[] | undefined,
+  userId: string,
 ): Promise<string[]> {
   const { crmDb } = await import('../services/db');
+  // ENG-2840: the access check comes before any lead is read. Before, the leads of any list id were loaded first, and "no leads to
+  // preview" versus the access refusal told a caller whether another account's list (or a lead id in it) existed.
+  const list = await crmDb.getLeadListById(listId).catch(() => null);
+  const { canAccessCrmList } = await import('../services/crmAccessControl');
+  if (!list || !(await canAccessCrmList(userId, list).catch(() => false))) {
+    throw new Error('Lead list not found');
+  }
   const result = await crmDb.getLeadsByListId(listId);
   const items: any[] = Array.isArray(result?.items) ? result.items : [];
   const pool = explicitLeadIds && explicitLeadIds.length > 0

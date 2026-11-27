@@ -261,7 +261,9 @@ describe('MCP tool annotation policy gate (ENG-2334)', () => {
     // schema has no send/reply fields, its action enum is search|list|get, and
     // the handler refuses anything else before any request
     // (mcp/server/__tests__/readEmailTool.test.ts).
-    const readOnlyByContract = new Set(['read_email']);
+    // read_file_content ("file" in the name) reads one file of the caller's own storage and writes nothing: the route is always called
+    // with own_storage_only and max_bytes (mcp/server/__tests__/fileReadTool.test.ts; readFileContent refuses any other URL before a fetch).
+    const readOnlyByContract = new Set(['read_email', 'read_file_content']);
     const bad = inventory.filter((e) => mutating.test(e.name) && !readOnlyByContract.has(e.name) && classifyMcpTool(e.name) === 'read');
     expect(bad.map((e) => e.name)).toEqual([]);
   });

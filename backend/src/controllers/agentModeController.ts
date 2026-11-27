@@ -47,7 +47,7 @@ import {
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
-import { getInteractiveShareExpiresAt } from '../utils/interactiveShare';
+import { getInteractiveShareExpiresAt, interactiveShareAllowsSensitiveActions, interactiveShareControl } from '../utils/interactiveShare';
 import { buildReportEmail, checkEmailReportAllowed, normalizeRecipient, resolveReportUrl } from '../utils/ishareEmailReport';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
@@ -2167,7 +2167,7 @@ async function scheduleAutoMediaContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillDeferred = !resolved?.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
+      stillDeferred = !resolved?.truncatedByStepBudget && !resolved?.pausedBySessionLimit && hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
       if (resolved?.content) {
         const { io } = await import('../server');
         // ENG-1495: resolved is this call's own generateSessionResponse result, so its
@@ -2900,7 +2900,7 @@ async function scheduleAutoWorkPlanContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillStalled = !resolved?.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
+      stillStalled = !resolved?.truncatedByStepBudget && !resolved?.pausedBySessionLimit && hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
       if (resolved?.workPlan?.autocomplete && hasNonRetryableWorkPlanStatusBlock(resolved?.toolCalls)) {
         await postWorkPlanNeedsYouMessage(sessionId, userId);
       }
@@ -4925,7 +4925,8 @@ type RunVerifiedChatResult = {
   attempts: number;
   workPlanCompleted: boolean;
   // ENG-2854: why a failed run stopped when it was not a requirements miss.
-  terminationReason?: 'iteration_limit';
+  terminationReason?: 'iteration_limit' | 'session_limit';
+  workPlanBlockReason?: string;
   // ENG-396: set when a headless turn left an unanswered blocking question. The
   // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
@@ -4973,6 +4974,11 @@ type RunVerifiedChatResult = {
   sendPressExhausted?: boolean;
 };
 
+// Read-only normalization shared by completion and blocked-plan retry decisions.
+function workPlanStepStatus(step: any): string {
+  return typeof step?.status === 'string' ? step.status.trim().toLowerCase() : '';
+}
+
 // ENG-1811: is this work plan ACTUALLY finished -- every step terminal AND no
 // outstanding debt from a removed step's required function call that never
 // genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against
@@ -4984,7 +4990,7 @@ type RunVerifiedChatResult = {
 // breaks any of them that happen to exercise this retry loop.
 function workPlanCompletedWithoutDebt(workPlan: any, calledFunctions?: Record<string, number>): boolean {
   if (!workPlan || !Array.isArray(workPlan.steps)) return true;
-  const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+  const allStepsTerminal = workPlan.steps.every((s: any) => ['completed', 'skipped'].includes(workPlanStepStatus(s)));
   if (!allStepsTerminal) return false;
   const called = calledFunctions || {};
   const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
@@ -5391,9 +5397,9 @@ async function runVerifiedChatInner(
   // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
   // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
   // or null when no question is awaiting.
-  const iterationLimitStopResult = (): RunVerifiedChatResult => ({
+  const iterationLimitStopResult = (terminationReason: 'iteration_limit' | 'session_limit' = 'iteration_limit'): RunVerifiedChatResult => ({
     success: false,
-    terminationReason: 'iteration_limit',
+    terminationReason,
     content: allContent,
     toolCalls: allToolCalls,
     // Score against the truncated turn's content: remainingKeywords is only pruned later.
@@ -5513,6 +5519,36 @@ async function runVerifiedChatInner(
     }
 
     return null;
+  };
+
+  // ENG-2998: no runnable steps remain. Stop unattended pressing without
+  // crediting blocked prerequisites as completion; pending/transient work retries.
+  const stopForBlockedPlan = (workPlan: any): RunVerifiedChatResult | null => {
+    const steps = Array.isArray(workPlan?.steps) ? workPlan.steps : [];
+    const notesOf = (step: any): string => typeof step?.notes === 'string' ? step.notes
+      : Array.isArray(step?.notes) ? step.notes.filter((note: unknown) => typeof note === 'string').join('; ') : '';
+    const blockedSteps = steps.filter((s: any) => ['blocked', 'pending'].includes(workPlanStepStatus(s)));
+    // The tool contract represents unfinished steps as pending; legacy callers
+    // also store blocked. Derive terminality from the existing prerequisite note
+    // for either representation, without changing the persisted status contract.
+    // Unknown/transient causes still use the bounded retry path.
+    if (!isUnattendedRun || blockedSteps.length === 0 ||
+        !steps.every((s: any) => ['blocked', 'pending', 'completed', 'skipped'].includes(workPlanStepStatus(s))) ||
+        !blockedSteps.every((s: any) => /\breason\s*[:=]\s*no_key\b/i.test(notesOf(s)))) return null;
+    const functionStatus = requiredFunctions.map(f => {
+      const actualCount = countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting);
+      return { functionName: f.functionName, requiredCount: f.minCount, actualCount, met: actualCount >= f.minCount };
+    });
+    return {
+      success: false, content: allContent, toolCalls: allToolCalls,
+      keywordMatches: keywords.filter(k => allContent.toLowerCase().includes(k.toLowerCase())),
+      keywordMisses: keywords.filter(k => !allContent.toLowerCase().includes(k.toLowerCase())),
+      functionCallMatches: functionStatus.filter(f => f.met).map(f => f.functionName),
+      functionCallMisses: functionStatus.filter(f => !f.met).map(f => f.functionName),
+      functionStatus, attempts: attempt, workPlanCompleted: false,
+      workPlanBlockReason: blockedSteps
+        .map((s: any) => `${s.stepCount}${s.title ? ` ${s.title}` : ''}: reason=no_key`).join('; '),
+    };
   };
 
   while (attempt < maxAttempts) {
@@ -5665,6 +5701,8 @@ async function runVerifiedChatInner(
           ...continuationToolCalls.filter((call: any) => call?.name)
         );
         if (continuationResponse.truncatedByStepBudget) return iterationLimitStopResult();
+        // ENG-2812: paused at the session limit — a person must confirm; never press again.
+        if (continuationResponse.pausedBySessionLimit) return iterationLimitStopResult('session_limit');
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
         // main turn instead of falling through and returning success on an
@@ -5677,6 +5715,8 @@ async function runVerifiedChatInner(
         if (continuationQuestion?.action === 'park') {
           return continuationQuestion.result;
         }
+        const blockedContinuation = stopForBlockedPlan(continuationResponse.workPlan);
+        if (blockedContinuation) return blockedContinuation;
         // Re-evaluate the gate against the continuation's own output. Pass the
         // whole run's accumulated tool-call objects (name + arguments + result) so a
         // still-uncommitted per-list preview→execute gap (ENG-518) keeps the gate
@@ -5712,6 +5752,14 @@ async function runVerifiedChatInner(
             `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
             `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
           );
+        }
+        // A transient/unknown blocked continuation is not completion. Re-enter
+        // the existing bounded work-plan retry path, never credit unfinished work.
+        if (continuationResponse.workPlan && !workPlanCompletedWithoutDebt(
+          continuationResponse.workPlan, continuationResponse.calledFunctions
+        )) {
+          await waitForVerifiedChatRetry(attempt);
+          continue;
         }
         // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
@@ -5817,6 +5865,8 @@ async function runVerifiedChatInner(
       allActualFunctionCallsForReporting.push(...toolCalls.filter((call: any) => call?.name));
       // Exhaustion requires explicit review/resume, never a requirements-driven retry.
       if (response.truncatedByStepBudget) return iterationLimitStopResult();
+      // ENG-2812: paused at the session limit — a person must confirm; never retry into the pause.
+      if (response.pausedBySessionLimit) return iterationLimitStopResult('session_limit');
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -5833,6 +5883,9 @@ async function runVerifiedChatInner(
       // Check work plan status
       const workPlan = response.workPlan;
       const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, response.calledFunctions);
+
+      const blockedPlanResult = stopForBlockedPlan(workPlan);
+      if (blockedPlanResult) return blockedPlanResult;
 
       // Only evaluate keywords and function calls if work plan is completed or doesn't exist
       let keywordMatches: string[] = [];
@@ -6778,6 +6831,20 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 const ENTITLEMENT_RETRY_DELAYS_MS = [1000, 2000];
 
 /**
+ * What Emma is told after an approval deck whose write failed (found live: a write that failed Meta-side validation was silently re-proposed
+ * identically three times, because the per-item `error` was in the outcome JSON but nothing said what to do with it). Used by BOTH the
+ * account owner's route and the share route, so a visitor on a Full-control link who approves a write gets the same behaviour.
+ */
+function deckFailureInstruction(deckOutcomeStatus: string): string {
+  return (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
+    ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
+      'actual failure to the user in plain language, and adjust the params yourself if the error ' +
+      'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
+      'the same write again. Do NOT silently re-propose an identical write that already failed.'
+    : '';
+}
+
+/**
  * ENG-2816 (step 3): is this schedule write a SHARE-LINK VISITOR's?
  *
  * A visitor acts under the owner's userId, so the request looks like the owner's own. Two independent signals say otherwise, and
@@ -6869,12 +6936,14 @@ function notifyOwnerOfFirstVisitorMark(req: Request, schedule: { scheduleId: str
  * owner pays for up to twenty refused attempts. So for a marked schedule the refused names are dropped from `requiredFunctionCalls`
  * and `functionCallMinCalls`; an unmarked schedule (every schedule that predates this) gets back exactly what it stores.
  */
-function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number>; skipped: string[] } {
+export function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number>; skipped: string[] } {
   const functionCalls: string[] = schedule?.requiredFunctionCalls || [];
   const minCalls: Record<string, number> = schedule?.functionCallMinCalls || {};
   if (!isScheduleMarked(schedule)) return { functionCalls, minCalls, skipped: [] };
   // ADMIN_SKILL_TOOL_NAMES can be absent where a test replaces the whole service module; production always has it.
-  const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? []) !== null;
+  // By NAME only (ENG-3170): a tool refused for some of its actions (a Google Ads report is allowed, a campaign change is not) is still
+  // one the run may be held to calling.
+  const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? [], undefined, { nameOnly: true }) !== null;
   const kept = withoutRefusedNames(functionCalls, isRefused);
   // `skipped` is what the run was NOT held to, in the schedule's own order, so a "passed" run can say what it skipped.
   return { functionCalls: kept, minCalls: minCallsWithoutRefused(minCalls, isRefused), skipped: functionCalls.filter((name) => !kept.includes(name)) };
@@ -8551,6 +8620,8 @@ export async function runScheduledChat(
       // was left unwritten — marked so the waived minimum is still observable in
       // runResults rather than looking like every requirement was met.
       ...(result.readOnlyRequirementWaived ? { readOnlyRequirementWaived: true } : {}),
+      // ENG-2812: keep why the run stopped (session_limit pause / iteration_limit) on the stored run record.
+      ...(result.terminationReason ? { terminationReason: result.terminationReason } : {}),
       // ENG-2816 (step 3): see skippedRequiredCalls on this function's return type.
       ...(runRequired.skipped.length > 0 ? { skippedRequiredCalls: runRequired.skipped } : {}),
       // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
@@ -8673,7 +8744,8 @@ export async function runScheduledChat(
     // rewrite the schedule's prompt so future runs do better. Runs on test runs too so
     // it's easy to try out. Best-effort — never fails the run.
     // ENG-2854: an iteration-limit report is the terminal turn; no further model turn.
-    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit') {
+    // ENG-2812: nor after a session-limit pause, which is waiting for a person.
+    if (schedule.selfImprove === true && result.terminationReason !== 'iteration_limit' && result.terminationReason !== 'session_limit') {
       try {
         await runScheduleSelfImprovement({
           schedule,
@@ -10060,6 +10132,8 @@ async function runSessionTurn(
   // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
   // partial answer from a forced synthesis turn instead of the full deliverable.
   truncatedByTimeBudget?: boolean;
+  // ENG-2812: the run stopped at the session's turn/spend limit; no automatic follow-up turn.
+  pausedBySessionLimit?: boolean;
   // ENG-1239: true when the run was cooperatively cancelled (e.g. preempted by a genuine
   // customer message) before it could compose a closing reply — content may be empty
   // even though toolCalls shows real work (an already-dispatched call can't be aborted).
@@ -11601,12 +11675,7 @@ export const agentModeController = {
         // told Emma what to DO with a failure, so she just retried instead of explaining it
         // to the user or adjusting the params herself. A bare JSON dump relies entirely on
         // the model inferring the right response; make it explicit instead.
-        const failureInstruction = (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
-          ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
-            'actual failure to the user in plain language, and adjust the params yourself if the error ' +
-            'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
-            'the same write again. Do NOT silently re-propose an identical write that already failed.'
-          : '';
+        const failureInstruction = deckFailureInstruction(deckOutcomeStatus);
         const deckOutcomeDirective = `[Approval deck outcome: ${JSON.stringify({
           status: deckOutcomeStatus,
           ...(isWriteDeck ? { items: result.summary?.items ?? [] } : {}),
@@ -12207,7 +12276,7 @@ export const agentModeController = {
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
       // ENG-2113: automatic follow-up turns would run on AgentWeb's models; on the plan route the user is asked to continue instead.
-      if (!planRoute && !response.truncatedByStepBudget && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+      if (!planRoute && !response.truncatedByStepBudget && !response.pausedBySessionLimit && hasDeferredMediaBudgetToolCall(response.toolCalls)) {
         setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
         ));
@@ -12219,7 +12288,7 @@ export const agentModeController = {
       // "retry" instead of just continuing per the plan's own "never wait on the user"
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
-      if (!planRoute && !response.truncatedByStepBudget && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
+      if (!planRoute && !response.truncatedByStepBudget && !response.pausedBySessionLimit && hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, selectedModel, 1, false).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
@@ -13026,7 +13095,13 @@ export const agentModeController = {
   async createConversableShare(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId, expirationDays: rawExpirationDays } = req.body;
+      const { sessionId, expirationDays: rawExpirationDays, allowSensitiveActions: rawAllowSensitiveActions } = req.body;
+
+      // ENG-3170: the owner's choice about a link is the owner's. A call made by a tool on a visitor's behalf carries a restriction claim and
+      // never reaches it (no tool does today; this keeps it that way).
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
 
       // ENG-1907: no transcript leaves a sandbox account.
       if (isEvaluationUser(user?.userId)) {
@@ -13039,6 +13114,10 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // ENG-3170: the owner's choice for this link (sensitive actions on or off). Only a real boolean counts; anything else is "no
+      // choice made": a new link is then off, and an existing link is left as it is.
+      const allowSensitiveActionsChoice = typeof rawAllowSensitiveActions === 'boolean' ? rawAllowSensitiveActions : undefined;
+
       // Validate expirationDays (default 7, max 365)
       const expirationDays = rawExpirationDays != null ? Number(rawExpirationDays) : 7;
       if (!Number.isFinite(expirationDays) || expirationDays < 1 || expirationDays > 365) {
@@ -13046,30 +13125,51 @@ export const agentModeController = {
       }
 
       // Use the common function to create or reuse interactive share
-      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays);
+      const conversableUrl = allowSensitiveActionsChoice === undefined
+        ? await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays)
+        : await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays, { allowSensitiveActions: allowSensitiveActionsChoice });
 
       // Extract the token from the URL for backward compatibility
       const urlParams = new URL(conversableUrl).searchParams;
       const conversableToken = urlParams.get('conversable') || '';
 
-      // KNOWN LIMITATION: this echoes the requested window, not the stored value.
-      // createOrReuseInteractiveShare REUSES an existing active share untouched,
-      // so when one already exists this expiresAt can differ from what's actually
-      // in the DB — most notably, re-sharing a session that already has a
-      // no-expiry token (e.g. one first minted by a machine/email path) shows an
-      // "Expires" date in the UI while the link is in fact permanent. This is a
-      // display mismatch only: it grants no extra access (the token was already
-      // live) and is reversible. Changing an active share's expiry requires
-      // revoke (stopConversableShare) + reshare. A true fix needs per-purpose
-      // tokens (see the on-demand-minting redesign) rather than one shared token
-      // per session, so it is intentionally out of scope here.
-      const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
+      // ENG-3170: answer with what is STORED, expiry included. createOrReuseInteractiveShare REUSES an existing live link, so the link that now
+      // exists may have a different expiry from the one asked for (most notably a link first made by an email or alert path, which never
+      // expires). That used to be a display mismatch that granted no extra access; with the Full control switch it would show "Expires
+      // tomorrow" on a permanent link that now has full control, so the dialog is told the truth (a link with no expiry has no `expiresAt`).
+      let storedExpiresAt: string | undefined;
+
+      // ENG-3170: answer with what is STORED, not with what was asked for. When the owner made an explicit choice, re-read it (a
+      // consistent read) and say so if it did not persist, instead of showing a switch that is not true. With no choice made, a new
+      // link is off and an existing link is what it already was.
+      let allowSensitiveActions: boolean;
+      if (allowSensitiveActionsChoice !== undefined) {
+        const storedShare = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+        allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedShare);
+        storedExpiresAt = typeof storedShare?.expiresAt === 'string' && storedShare.expiresAt ? storedShare.expiresAt : undefined;
+        if (allowSensitiveActions !== allowSensitiveActionsChoice) {
+          console.error(`AgentMode ENG-3170: the sensitive-actions choice for share ${sessionId} did not persist (asked ${allowSensitiveActionsChoice}).`);
+          return res.status(500).json({ error: 'Failed to save the sensitive-actions setting for this link' });
+        }
+      } else {
+        // An old client that sends no choice: say what the link that is now stored means. It is read back, because the link may have just been
+        // replaced (an expired full-control link is replaced by an off one), so the copy read before the call may no longer be the link.
+        try {
+          const storedNow = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+          allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedNow);
+          storedExpiresAt = typeof storedNow?.expiresAt === 'string' && storedNow.expiresAt ? storedNow.expiresAt : undefined;
+        } catch (readError) {
+          console.error(`AgentMode ENG-3170: could not read back the share link ${sessionId} to say what it allows:`, readError);
+          allowSensitiveActions = false;
+        }
+      }
 
       res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
         conversableUrl: conversableUrl,
-        expiresAt: expiresAt
+        ...(storedExpiresAt ? { expiresAt: storedExpiresAt } : {}),
+        allowSensitiveActions
       });
     } catch (error) {
       console.error('AgentMode: Create conversable share error:', error);
@@ -13082,6 +13182,11 @@ export const agentModeController = {
     try {
       const user = req.user as User;
       const { sessionId } = req.params;
+
+      // ENG-3170: see createConversableShare: whether a link exists is the owner's call; a visitor's claim never reaches it.
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
 
       // Verify the session belongs to the user
       const session = await chatbotDb.getChatSession(sessionId);
@@ -13102,6 +13207,75 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Stop conversable share error:', error);
       res.status(500).json({ error: 'Failed to stop conversable sharing' });
+    }
+  },
+
+  // ENG-3170: read the owner's sensitive-actions setting for this session's interactive link. The EFFECTIVE value (a link made before
+  // the setting existed has no stored choice; utils/interactiveShare says how it reads), so the share dialog never has to know the rule.
+  async getConversableShareSettings(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      const share = session.interactiveShareMetadata;
+      if (!share?.isActive) {
+        return res.status(404).json({ error: 'No interactive share link for this session' });
+      }
+      res.status(200).json({
+        allowSensitiveActions: interactiveShareAllowsSensitiveActions(share),
+        // Tells the dialog whether the value was chosen by the owner or is a link made before the setting existed.
+        explicit: typeof share.allowSensitiveActions === 'boolean',
+      });
+    } catch (error) {
+      console.error('AgentMode: Get conversable share settings error:', error);
+      res.status(500).json({ error: 'Failed to read the share link settings' });
+    }
+  },
+
+  // ENG-3170: the owner changes the sensitive-actions setting on the link that already exists. Owner only (the session must be theirs;
+  // a visitor's token never reaches this route, it needs the owner's login), a real boolean only, and nothing else on the link changes.
+  async updateConversableShareSettings(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const { allowSensitiveActions } = req.body || {};
+
+      // ENG-3170: see createConversableShare: a call carrying a visitor's restriction claim never changes the owner's setting.
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
+
+      if (isEvaluationUser(user?.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
+      if (typeof allowSensitiveActions !== 'boolean') {
+        return res.status(400).json({ error: 'allowSensitiveActions must be true or false' });
+      }
+
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      const share = session.interactiveShareMetadata;
+      if (!share?.isActive) {
+        return res.status(404).json({ error: 'No interactive share link for this session' });
+      }
+
+      // Attribute level: only the choice is written, never a copy of the rest of the link read a moment ago.
+      await chatbotDb.setInteractiveShareAllowSensitiveActions(sessionId, allowSensitiveActions);
+      console.log(`AgentMode ENG-3170: the owner set sensitive actions ${allowSensitiveActions ? 'ON' : 'OFF'} for share link ${sessionId}`);
+
+      const stored = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+      if (typeof stored?.allowSensitiveActions !== 'boolean' || stored.allowSensitiveActions !== allowSensitiveActions) {
+        return res.status(500).json({ error: 'Failed to save the setting for this link' });
+      }
+      res.status(200).json({ allowSensitiveActions: stored.allowSensitiveActions, explicit: true });
+    } catch (error) {
+      console.error('AgentMode: Update conversable share settings error:', error);
+      res.status(500).json({ error: 'Failed to update the share link settings' });
     }
   },
 
@@ -13407,7 +13581,21 @@ export const agentModeController = {
           (item) => Boolean(item.metaWriteManifestDigest) || item.immutable === true,
         );
         if (hasBlockedItem) {
-          return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+          // ENG-3170: FULL CONTROL is everything the customer can do, and the customer can approve a write or a locked decision. So on a
+          // link whose owner turned it on, the visitor may too. Decided from a CONSISTENT read of the link made now (an owner who has just
+          // switched it off is honoured on the next call); anything unreadable, missing or off keeps the refusal.
+          let linkHasFullControl = false;
+          try {
+            const fresh = await chatbotDb.getChatSessionRecord(session.sessionId, true);
+            // FULL CONTROL proper: an explicit choice on a link that is still live. A link made before the setting existed (read as "may
+            // run the sensitive tools" by its lifetime) never gets this: its visitors were refused this answer before and still are.
+            linkHasFullControl = interactiveShareControl(fresh?.interactiveShareMetadata).full;
+          } catch {
+            linkHasFullControl = false;
+          }
+          if (!linkHasFullControl) {
+            return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+          }
         }
         const result = await agentModeService.submitApprovalDeckAnswers(session.sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
         if (result.outcome === 'needs_person') {
@@ -13430,11 +13618,10 @@ export const agentModeController = {
         const commented = (deckAnswer.answers || [])
           .filter((a: any) => a?.verdict === 'comment' && typeof a?.freeText === 'string' && a.freeText.trim())
           .map((a: any) => ({ itemId: a.itemId, comment: a.freeText.trim() }));
-        // Non-write deck (the only kind reachable here — the block above refuses
-        // any write item) — see generateResponse's identical comment for why
-        // 'nothing_approved' is wrong for a pure question deck: submitApprovalDeckAnswers
-        // only ever describes WRITE execution outcomes in `summary`, so a question deck
-        // resolves every non-comment item's actual selection into `selections` instead.
+        // Either kind of deck can reach here: a question deck, or (ENG-3170) a write or locked-decision deck on a link whose owner turned on
+        // Full control. See generateResponse's identical comment for why 'nothing_approved' is wrong for a pure question deck:
+        // submitApprovalDeckAnswers only ever describes WRITE execution outcomes in `summary`, so a question deck resolves every
+        // non-comment item's actual selection into `selections` instead.
         const deckItems = answeredApprovalDeck?.items ?? [];
         const isWriteDeck = deckItems.some((item) => Boolean(item.metaWriteManifestDigest));
         const selections = deckItems
@@ -13453,7 +13640,7 @@ export const agentModeController = {
           ...(selections.length > 0 ? { selections } : {}),
           ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
           ...(commented.length > 0 ? { commented } : {}),
-        })}]`;
+        })}]${deckFailureInstruction(deckOutcomeStatus)}`;
         answerAck = answerAck ? `${answerAck}\n\n${deckOutcomeDirective}` : deckOutcomeDirective;
       }
 
@@ -18034,7 +18221,9 @@ export const agentModeController = {
         const interactiveShareMetadata = {
           isActive: true,
           token: conversableToken,
-          sharedAt: new Date().toISOString()
+          sharedAt: new Date().toISOString(),
+          // ENG-3170: an explicit "off". This link opens the plan page; the owner turns sensitive actions on from the share dialog.
+          allowSensitiveActions: false,
         };
         await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
         // ENG-2773: stamp the winner only once the session is fully built, so a duplicate never
@@ -18550,6 +18739,8 @@ export const agentModeController = {
         success: result.success,
         message: result.success
           ? `All required functions were called successfully.`
+          : result.terminationReason === 'session_limit'
+          ? 'Paused at the session turn/spend limit; reply "continue" in the session to keep going.'
           : result.terminationReason === 'iteration_limit'
           ? `Stopped at the iteration limit after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}; see the resumable report in content.`
           : `Some required functions were not called enough times after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}.`,

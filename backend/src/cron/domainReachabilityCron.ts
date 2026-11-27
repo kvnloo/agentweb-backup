@@ -16,7 +16,7 @@
  */
 import AWS from "aws-sdk";
 import { probeDomain, decideFromVerdict } from "../services/domainReachabilityService";
-import { addCustomDomain, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { addCustomDomain, isReservedPlatformDomain, SUBDOMAIN_BASE } from "../services/customDomainService";
 import { isEvaluationUser } from "../services/evaluationPolicy";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
@@ -225,6 +225,8 @@ export async function reconcileUnregisteredDomains(
 
     if (registeredHosts.has(host)) continue;
     if (host === SUBDOMAIN_BASE || host.endsWith(managedSuffix)) continue;
+    // AgentWeb's own domains are refused by addCustomDomain: skip before the claim row, or a refused host leaves a phantom pending record.
+    if (isReservedPlatformDomain(host)) continue;
 
     // Claim first, atomically, before any Vercel call — see the doc comment above. The claim
     // id is deterministic (not uuidv4()) specifically so two racing instances compute the SAME
@@ -298,13 +300,22 @@ export interface RowlessManagedHostResult extends RowlessManagedHost {
  */
 export function selectRowlessManagedHosts(
   domains: Array<{ domain?: string }>,
-  pages: Array<{ id?: unknown; status?: string; userId?: string; customDomainUrl?: string }>
+  pages: Array<{
+    id?: unknown;
+    status?: string;
+    userId?: string;
+    customDomainUrl?: string;
+    archived?: boolean;
+  }>
 ): RowlessManagedHost[] {
   const registeredHosts = new Set(domains.map((d) => d.domain).filter(Boolean));
   const managedSuffix = `.${SUBDOMAIN_BASE}`;
   const out: RowlessManagedHost[] = [];
   for (const p of pages) {
     if (p.status !== "deployed" || !p.customDomainUrl) continue;
+    // ENG-3144: archiving leaves status at "deployed"; an archived page is not live, so its
+    // stored host is not a monitoring target (it alerted daily as an expired certificate).
+    if (p.archived === true) continue;
     // ENG-1907: a sandbox principal's pages never bring a host into monitoring scope.
     if (isEvaluationUser(p.userId)) continue;
     let host: string;

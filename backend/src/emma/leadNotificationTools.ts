@@ -33,12 +33,20 @@ emmaToolRegistry.register({
   },
   execute: async (args: unknown, context?: any) => {
     validateArgs(args, []);
-    const org = await callerOrg(context, 'lead notification settings');
-    const config = configOf(org.leadNotifications);
-    if (org.leadNotifications !== undefined && !config) throw new Error('Stored lead notification settings are invalid');
-    return { success: true, ...settings(config) };
+    return readLeadNotificationSettings(context);
   },
 });
+
+/**
+ * The settings view. `requireConfigure` (set by the MCP route, ENG-2840 W2-6a) additionally requires org:configure, as the hot-lead call
+ * settings read does: the view holds Slack channel and user ids. Emma's own tool does not set it and behaves as before.
+ */
+export async function readLeadNotificationSettings(context: any, options: { requireConfigure?: boolean } = {}) {
+  const org = await callerOrg(context, 'lead notification settings', options.requireConfigure === true);
+  const config = configOf(org.leadNotifications);
+  if (org.leadNotifications !== undefined && !config) throw new Error('Stored lead notification settings are invalid');
+  return { success: true, ...settings(config) };
+}
 
 emmaToolRegistry.register({
   name: 'update_lead_notification_settings',

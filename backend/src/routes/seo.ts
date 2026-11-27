@@ -13,6 +13,8 @@ import {
   testGaProperty,
 } from "../services/seoService";
 import { resolveAnalyticsConfig, resolveConfigTarget } from "../services/analyticsConfigResolver";
+import { auditSharedGoogleRead } from "../services/sharedGoogleAudit";
+import { createLandingAnalyticsScope, gscScopeFilter, scopeGaClient } from "../services/landingAnalyticsScope";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 
@@ -130,6 +132,8 @@ router.post("/config/ga/test", async (req, res) => {
       return res.status(429).json({ ok: false, reason: "rate_limited", message: "Please wait before testing again" });
     }
     gaTestCooldown.set(uid, now);
+    // Log-only (sharedGoogleAudit.ts): a probe of any property id the caller names, through the shared service account.
+    auditSharedGoogleRead({ kind: 'ga4', userId: uid, ids: [propertyId], source: 'POST /api/seo/config/ga/test' });
     res.json(await testGaProperty(propertyId));
   } catch (error: any) {
     console.error("Error testing GA property:", error.message);
@@ -150,6 +154,11 @@ router.get("/metrics", async (req, res) => {
 
     // Resolve the effective analytics config (org owner's when org sharing is on).
     const resolved = await resolveAnalyticsConfig(user);
+    // Log-only (sharedGoogleAudit.ts): these ids were saved with a format check only and are read through the shared service account.
+    auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user.orgId, configSource: resolved?.source, ids: (resolved?.properties ?? []).map((p: any) => p?.propertyId), source: 'GET /api/seo/metrics' });
+    auditSharedGoogleRead({ kind: 'gsc', userId, orgId: user.orgId, configSource: resolved?.source, ids: resolved?.seoDomains ?? [], source: 'GET /api/seo/metrics' });
+    // The platform's own landing-page property and domain hold every customer's landing pages: reads of them keep only the caller's own.
+    const landingScope = createLandingAnalyticsScope(user);
 
     // Check if effective config has SEO domains or a GA property configured.
     // When ?domain= is passed (e.g. from a landing page link) we still proceed so the
@@ -246,9 +255,12 @@ router.get("/metrics", async (req, res) => {
         // When viewing a specific subdomain that lives under a managed root property (e.g.,
         // foo.agentwebforms.com under sc-domain:agentwebforms.com), scope all GSC requests
         // to pages whose URL contains that subdomain hostname.
-        const gscDimFilterGroups = gscPageFilter
-          ? [{ filters: [{ dimension: "page", operator: "contains", expression: gscPageFilter }] }]
-          : undefined;
+        const scopeFilter = await gscScopeFilter(landingScope, siteUrl);
+        const gscFilters: any[] = [
+          ...(gscPageFilter ? [{ dimension: "page", operator: "contains", expression: gscPageFilter }] : []),
+          ...(scopeFilter ? [scopeFilter] : []),
+        ];
+        const gscDimFilterGroups = gscFilters.length > 0 ? [{ filters: gscFilters }] : undefined;
 
         // Fetch daily data for timeline chart
         const dailyDataResponse = await fetch(searchAnalyticsUrl, {
@@ -468,16 +480,19 @@ router.get("/metrics", async (req, res) => {
     if (domainFilter) {
       const lpConfig = await getLandingPagesConfig();
       const mapping = resolveLandingPageGa4(lpConfig, bareHost(domainFilter));
-      if (mapping) {
+      // Only for a host where the caller has a landing page (the reads below are limited to the caller's own pages either way).
+      if (mapping && (await landingScope.hasLocationOn(bareHost(domainFilter)))) {
         const alreadyHas = gaProperties.some((p: any) => p.propertyId === mapping.ga4PropertyId);
         if (!alreadyHas) {
           gaProperties = [...gaProperties, { propertyId: mapping.ga4PropertyId, label: mapping.gscDomain }];
+          // Log-only (sharedGoogleAudit.ts): the platform's own landing-page property, read for the host named in ?domain=.
+          auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user.orgId, ids: [mapping.ga4PropertyId], source: 'GET /api/seo/metrics ?domain (landing page property)' });
         }
       }
     }
 
     if (gaProperties.length > 0) {
-      const gaClient = await getGoogleAnalyticsDataClient();
+      const gaClient = scopeGaClient(await getGoogleAnalyticsDataClient(), landingScope);
 
       if (gaClient) {
         // Fetch metrics for each property in parallel
@@ -875,7 +890,7 @@ router.get("/metrics", async (req, res) => {
         const funnel = funnelResult.Item?.funnels?.[funnelId];
 
         if (funnel && funnel.stages) {
-          const gaClient = await getGoogleAnalyticsDataClient();
+          const gaClient = scopeGaClient(await getGoogleAnalyticsDataClient(), landingScope);
           if (gaClient) {
             // Use same date range as GA metrics
             const now = new Date();
@@ -1071,7 +1086,8 @@ router.get("/debug", async (req, res) => {
     const endDateStr = "2024-11-20";
     
     const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
-    
+    const debugScopeFilter = await gscScopeFilter(createLandingAnalyticsScope(user), siteUrl);
+
     const response = await fetch(searchAnalyticsUrl, {
       method: "POST",
       headers: {
@@ -1083,6 +1099,7 @@ router.get("/debug", async (req, res) => {
         endDate: endDateStr,
         dimensions: ["date"],
         rowLimit: 1000,
+        ...(debugScopeFilter && { dimensionFilterGroups: [{ filters: [debugScopeFilter] }] }),
       }),
     });
 
@@ -1123,6 +1140,7 @@ router.get("/product-metrics", async (req, res) => {
 
     // Resolve the effective analytics config (org owner's when org sharing is on).
     const resolved = await resolveAnalyticsConfig(user);
+    if (resolved.primaryPropertyId) auditSharedGoogleRead({ kind: 'ga4', userId, orgId: user?.orgId, configSource: resolved.source, ids: [resolved.primaryPropertyId], source: 'GET /api/seo/product-metrics' });
 
     // Check if effective config has a product domain and GA property configured
     if (!resolved.productDomain || !resolved.primaryPropertyId) {
@@ -1131,8 +1149,8 @@ router.get("/product-metrics", async (req, res) => {
       });
     }
 
-    // Get Google Analytics Data API client
-    const gaClient = await getGoogleAnalyticsDataClient();
+    // Get Google Analytics Data API client (reads of the platform's landing-page property keep only the caller's own pages)
+    const gaClient = scopeGaClient(await getGoogleAnalyticsDataClient(), createLandingAnalyticsScope(user));
     if (!gaClient) {
       return res.status(500).json({
         message: "Google Analytics API not configured. Please contact support."

@@ -47,6 +47,8 @@ const mockGetProfile = jest.fn();
 const mockListReceivedInvitations = jest.fn().mockResolvedValue({ items: [], cursor: null });
 const mockIsUnderInvitationCooldown = jest.fn((..._args: any[]) => false);
 const mockGetMessagesWithContact = jest.fn();
+// ENG-2984: shadow duplicate check reads the chat the send went to.
+const mockGetOutboundMessagesInChat = jest.fn().mockResolvedValue([]);
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
@@ -99,6 +101,7 @@ jest.mock('../services/linkedInOutreachService', () => {
     // ENG-126 breaker check — must be present or send-invite throws before pacing.
     isUnderInvitationCooldown: (...args: any[]) => mockIsUnderInvitationCooldown(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
+    getOutboundMessagesInChat: (...args: any[]) => mockGetOutboundMessagesInChat(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
@@ -305,6 +308,73 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
       expect(mockUpdateLeadLinkedInSyncAt).not.toHaveBeenCalled();
+    });
+
+    describe('ENG-2984 shadow duplicate check (no list_id/lead_id)', () => {
+      const unlinkedArgs = {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        provider_id: 'li-provider-123',
+        message: 'Hello!',
+      };
+      const flush = () => new Promise((r) => setImmediate(r));
+      let warnSpy: jest.SpyInstance;
+      beforeEach(() => { warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+      afterEach(() => warnSpy.mockRestore());
+      const wouldBlockLogged = () =>
+        warnSpy.mock.calls.some((c) => String(c[0]).includes('SHADOW would-block (ENG-2984)'));
+
+      it('logs a would-block warning but still sends when an identical message is already in the chat history', async () => {
+        mockSendMessage.mockResolvedValue({ object: 'ChatStarted', chat_id: 'chat-1', message_id: 'm-new' });
+        mockGetOutboundMessagesInChat.mockResolvedValueOnce([
+          { id: 'm-old', text: '  hello!  ', timestamp: '2026-11-10T10:00:00Z' },
+          { id: 'm-new', text: 'Hello!', timestamp: '2026-11-12T10:00:00Z' },
+        ]);
+
+        const result = await service.linkedinOutreach('user-1', unlinkedArgs);
+        await flush();
+
+        expect(result.success).toBe(true);
+        expect(mockSendMessage).toHaveBeenCalledTimes(1);
+        expect(mockGetOutboundMessagesInChat).toHaveBeenCalledWith('chat-1');
+        expect(wouldBlockLogged()).toBe(true);
+        // Shadow only: nothing persisted.
+        expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+      });
+
+      it('does not warn when the only identical message is the one just sent', async () => {
+        mockSendMessage.mockResolvedValue({ object: 'ChatStarted', chat_id: 'chat-1', message_id: 'm-new' });
+        mockGetOutboundMessagesInChat.mockResolvedValueOnce([
+          { id: 'm-old', text: 'Something else', timestamp: '2026-11-10T10:00:00Z' },
+          { id: 'm-new', text: 'Hello!', timestamp: '2026-11-12T10:00:00Z' },
+        ]);
+
+        const result = await service.linkedinOutreach('user-1', unlinkedArgs);
+        await flush();
+
+        expect(result.success).toBe(true);
+        expect(wouldBlockLogged()).toBe(false);
+      });
+
+      it('a history read failure never changes the send result', async () => {
+        mockSendMessage.mockResolvedValue({ object: 'ChatStarted', chat_id: 'chat-1', message_id: 'm-new' });
+        mockGetOutboundMessagesInChat.mockRejectedValueOnce(new Error('unipile down'));
+
+        const result = await service.linkedinOutreach('user-1', unlinkedArgs);
+        await flush();
+
+        expect(result.success).toBe(true);
+        expect(wouldBlockLogged()).toBe(false);
+      });
+
+      it('does not run for CRM-linked sends (they already block duplicates)', async () => {
+        mockSendMessage.mockResolvedValue({ object: 'ChatStarted', chat_id: 'chat-1', message_id: 'm-new' });
+
+        await service.linkedinOutreach('user-1', validArgs);
+        await flush();
+
+        expect(mockGetOutboundMessagesInChat).not.toHaveBeenCalled();
+      });
     });
 
     it('does NOT persist message when lead has no linkedin URL', async () => {
