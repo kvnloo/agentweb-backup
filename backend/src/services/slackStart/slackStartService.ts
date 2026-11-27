@@ -102,9 +102,9 @@ const NOT_FOUND: ServiceResult = { status: 404, body: { code: 'not_found' } };
 
 export interface SlackStartService {
   config(): ServiceResult;
-  start(input: { body: any; idempotencyKey: unknown; ip: string | undefined }): Promise<ServiceResult>;
+  start(input: { body: unknown; idempotencyKey: unknown; ip: string | undefined }): Promise<ServiceResult>;
   read(intakeId: string, bearer: string | undefined): Promise<ServiceResult>;
-  answer(intakeId: string, bearer: string | undefined, body: any): Promise<ServiceResult>;
+  answer(intakeId: string, bearer: string | undefined, body: unknown): Promise<ServiceResult>;
   complete(intakeId: string, bearer: string | undefined): Promise<ServiceResult>;
 }
 

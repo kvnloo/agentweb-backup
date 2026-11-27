@@ -53,8 +53,8 @@ export function buildProductionSlackStartDeps(env: Env = process.env): SlackStar
     async createUser({ userId, email }) {
       try {
         await userDb.createUser(email, userId, SLACK_START_DISABLED_PASSWORD, false, false, ['customer'], email.split('@')[0]);
-      } catch (err: any) {
-        if (err?.code !== 'ConditionalCheckFailedException') throw err;
+      } catch (err: unknown) {
+        if ((err as { code?: string } | null)?.code !== 'ConditionalCheckFailedException') throw err;
         const own = await userDb.getUserByIdConsistent(userId);
         if (!own || own.email !== email) return 'exists';
       }
@@ -64,11 +64,11 @@ export function buildProductionSlackStartDeps(env: Env = process.env): SlackStar
         subscriptionType: 'Free',
         allowedPages: free?.allowedPages ?? [...DEFAULT_PAGES],
         allowedSkills: free?.allowedSkills ?? [],
-      } as any);
+      } as Parameters<typeof userDb.updateUser>[1]);
       return 'created';
     },
     updateUser: async (userId, patch) => {
-      await userDb.updateUser(userId, patch as any);
+      await userDb.updateUser(userId, patch as Parameters<typeof userDb.updateUser>[1]);
     },
     async writeLead({ leadId, intakeId, email, website, domain, utm }) {
       const listId = requireListId();
@@ -76,7 +76,7 @@ export function buildProductionSlackStartDeps(env: Env = process.env): SlackStar
       if (!list) throw new Error(`slack-start lead list ${listId} not found`);
       const utmFields = Object.fromEntries(Object.entries(utm ?? {}).map(([k, v]) => [`utm_${k}`, v]));
       try {
-        const created: any = await crmDb.createLead(listId, {
+        const created = (await crmDb.createLead(listId, {
           leadId,
           failIfExists: true,
           email,
@@ -87,9 +87,10 @@ export function buildProductionSlackStartDeps(env: Env = process.env): SlackStar
           ...(utm?.source ? { utmSource: utm.source } : {}),
           ...(utm?.medium ? { utmMedium: utm.medium } : {}),
           customFields: { signupSource: 'slack_start', slackStartIntakeId: intakeId, ...utmFields },
-        });
+        })) as { leadId?: string } | undefined;
         return { leadId: created?.leadId ?? leadId };
-      } catch (err: any) {
+      } catch (caught: unknown) {
+        const err = caught as { leadAlreadyExists?: boolean; duplicateEmail?: boolean; existingLead?: { leadId?: string } } | null;
         if (err?.leadAlreadyExists) return { leadId };
         if (err?.duplicateEmail && err.existingLead?.leadId) return { leadId: err.existingLead.leadId };
         throw err;

@@ -96,13 +96,18 @@ export interface SlackStartStore {
 
 type DocClient = Pick<AWS.DynamoDB.DocumentClient, 'transactWrite' | 'get' | 'update'>;
 
-const isConditionalFailure = (err: any) => err?.code === 'ConditionalCheckFailedException';
-const isTransactionConditionFailure = (err: any) =>
-  err?.code === 'TransactionCanceledException' && /ConditionalCheckFailed/.test(String(err?.message ?? ''));
+type AwsErr = { code?: string; message?: string } | null | undefined;
+const isConditionalFailure = (err: unknown) => (err as AwsErr)?.code === 'ConditionalCheckFailedException';
+const isTransactionConditionFailure = (err: unknown) =>
+  (err as AwsErr)?.code === 'TransactionCanceledException' &&
+  /ConditionalCheckFailed/.test(String((err as AwsErr)?.message ?? ''));
 
 function stripKey<T>(item: Record<string, unknown> | undefined): T | null {
   if (!item) return null;
-  const { pk: _pk, kind: _kind, [SLACK_START_TTL_ATTRIBUTE]: _ttl, ...rest } = item;
+  const rest = { ...item };
+  delete rest.pk;
+  delete rest.kind;
+  delete rest[SLACK_START_TTL_ATTRIBUTE];
   return rest as T;
 }
 
