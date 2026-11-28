@@ -11,6 +11,7 @@ import { canEditItem } from '../services/orgShareService';
 import { getJwtSecret } from '../config/jwt';
 import { canInOrg } from '../services/orgAuthz';
 import { buildClickUpAccessInventory } from '../services/integrationAccessService';
+import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from '../services/oauthFlowSessions';
 
 const router = express.Router();
 
@@ -22,8 +23,6 @@ const CLICKUP_TEAM_URL = `${CLICKUP_API}/team`;
 // ============================================
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 
 interface StatePayload { userId: string; nonce: string; frontendUrl?: string; }
 
@@ -54,32 +53,7 @@ const decodeStateFrontendUrl = (state: string): string | null => {
   }
 };
 
-interface TokenSession { access_token: string; userId: string; expires: number; }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (userId: string, access_token: string): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { access_token, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): string | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId); // one-time use
-  return session.access_token;
-};
+interface TokenSession extends LocalOAuthFlowSession { tokens: { access_token: string } }
 
 // ============================================
 // Org sharing of a personal token (ENG-2935)
@@ -190,7 +164,11 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       return res.status(500).json({ error: 'No access token received from ClickUp' });
     }
 
-    const tokenSessionId = storeTokenSession(userId, access_token);
+    const tokenSessionId = await storeOAuthFlowSession<TokenSession>('clickup', {
+      userId,
+      tokens: { access_token },
+      expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS,
+    });
     res.json({ success: true, tokenSessionId });
   } catch (error: any) {
     console.error('[ClickUp OAuth /finalize]', error?.response?.data || error);
@@ -205,16 +183,16 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   const { tokenSessionId } = req.body;
   const userId = req.user.userId;
 
-  if (!tokenSessionId) {
+  if (typeof tokenSessionId !== 'string' || !tokenSessionId.trim()) {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const access_token = retrieveTokenSession(tokenSessionId, userId);
-  if (!access_token) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
   try {
+    const session = await consumeOAuthFlowSession<TokenSession>('clickup', tokenSessionId, userId);
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
+    const { access_token } = session.tokens;
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
 

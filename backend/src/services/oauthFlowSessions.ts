@@ -13,14 +13,20 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isStrings = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every(item => typeof item === 'string');
 
-// Validate both provider payloads at the shared persistence boundary before route use.
+// Validate each provider payload at the shared persistence boundary before route use.
 function isValidPayload(value: unknown, provider: PendingOAuthSession['provider'], userId: string): boolean {
   if (!isRecord(value) || value.userId !== userId ||
       typeof value.expires !== 'number' || !Number.isFinite(value.expires) || value.expires <= Date.now() ||
       !isRecord(value.tokens)) return false;
   const tokens = value.tokens;
-  if (typeof tokens.access_token !== 'string' || !tokens.access_token.trim() ||
-      typeof tokens.expires_in !== 'number' || !Number.isFinite(tokens.expires_in) ||
+  if (typeof tokens.access_token !== 'string' || !tokens.access_token.trim()) return false;
+  // Attio and ClickUp issue non-expiring access tokens with no refresh token.
+  if (provider === 'clickup') return true;
+  if (provider === 'attio') {
+    return isRecord(value.workspaceInfo) && typeof value.workspaceInfo.workspace_id === 'string' &&
+      typeof value.workspaceInfo.workspace_name === 'string';
+  }
+  if (typeof tokens.expires_in !== 'number' || !Number.isFinite(tokens.expires_in) ||
       (tokens.refresh_token !== undefined && typeof tokens.refresh_token !== 'string')) return false;
   if (provider === 'fathom') return true;
   return isRecord(value.hubInfo) && typeof value.hubInfo.hub_id === 'number' &&

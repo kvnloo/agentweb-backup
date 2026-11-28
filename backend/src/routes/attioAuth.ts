@@ -8,12 +8,11 @@ import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
+import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from '../services/oauthFlowSessions';
 
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 interface StatePayload {
@@ -36,7 +35,7 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   }
 };
 
-interface TokenSession {
+interface TokenSession extends LocalOAuthFlowSession {
   tokens: {
     access_token: string;
   };
@@ -44,38 +43,7 @@ interface TokenSession {
     workspace_id: string;
     workspace_name: string;
   };
-  userId: string;
-  expires: number;
 }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (
-  userId: string,
-  tokens: TokenSession['tokens'],
-  workspaceInfo: TokenSession['workspaceInfo']
-): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, workspaceInfo, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'workspaceInfo'> | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId);
-  return { tokens: session.tokens, workspaceInfo: session.workspaceInfo };
-};
 
 // GET /init
 router.get('/init', authenticateToken, async (req: any, res) => {
@@ -158,11 +126,12 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     const workspace_id: string = selfData.workspace_id ?? selfData.id?.workspace_id ?? `attio-${Date.now()}`;
     const workspace_name: string = selfData.workspace_name ?? selfData.name ?? 'Attio Workspace';
 
-    const tokenSessionId = storeTokenSession(
+    const tokenSessionId = await storeOAuthFlowSession<TokenSession>('attio', {
       userId,
-      { access_token },
-      { workspace_id, workspace_name }
-    );
+      tokens: { access_token },
+      workspaceInfo: { workspace_id, workspace_name },
+      expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS,
+    });
 
     res.json({ success: true, tokenSessionId });
   } catch (error: any) {
@@ -177,16 +146,15 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   const { tokenSessionId } = req.body;
   const userId = req.user.userId;
 
-  if (!tokenSessionId) {
+  if (typeof tokenSessionId !== 'string' || !tokenSessionId.trim()) {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
   try {
+    const session = await consumeOAuthFlowSession<TokenSession>('attio', tokenSessionId, userId);
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
     const { tokens, workspaceInfo } = session;
 
     const account = await createAccount(userId, 'attio', {

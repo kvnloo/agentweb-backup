@@ -13,6 +13,7 @@ process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
 const mockGetUserById = jest.fn();
 const mockUpdateUser = jest.fn();
 jest.mock('../services/db', () => ({
+  oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
   userDb: {
     getUserById: (...args: any[]) => mockGetUserById(...args),
     updateUser: (...args: any[]) => mockUpdateUser(...args),

@@ -3,7 +3,13 @@ import request from 'supertest';
 import { createOAuthSessionDbMock } from './fixtures/oauthSessionDb';
 
 const mockDb = createOAuthSessionDbMock();
-jest.mock('../services/db', () => ({ oauthSessionDb: mockDb }));
+jest.mock('../services/db', () => ({
+  oauthSessionDb: mockDb,
+  userDb: { getUserById: jest.fn(async () => ({ userId: 'user-123' })), updateUser: jest.fn() },
+  orgDb: { getOrgById: jest.fn(), setOrgSecret: jest.fn() },
+}));
+jest.mock('../services/clickupService', () => ({ getAccessToken: jest.fn(), getWorkspaces: jest.fn(async () => []), listDocs: jest.fn(), listTasks: jest.fn() }));
+jest.mock('../utils/crypto', () => ({ encryptPassword: jest.fn(() => 'encrypted'), decryptPassword: jest.fn() }));
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     req.user = { userId: req.headers['x-user'] || 'user-123' }; next();
@@ -12,12 +18,14 @@ jest.mock('../middleware/auth', () => ({
 jest.mock('../config/integrations', () => {
   const config = { clientId: 'client', clientSecret: 'secret', redirectUri: 'https://example.com/callback',
     authorizationUrl: 'https://example.com/auth', tokenUrl: 'https://example.com/token',
-    tokenInfoUrl: 'https://example.com/info', scopes: ['crm'], marketingScopes: ['crm'], marketingOnlyScopes: [] };
-  return { getHubSpotConfig: async () => config, getFathomConfig: async () => config };
+    tokenInfoUrl: 'https://example.com/info', selfUrl: 'https://example.com/self', scopes: ['crm'], marketingScopes: ['crm'], marketingOnlyScopes: [] };
+  return { getHubSpotConfig: async () => config, getFathomConfig: async () => config,
+    getAttioConfig: async () => config, getClickUpConfig: async () => config };
 });
 jest.mock('axios', () => ({
   post: jest.fn(async () => ({ data: { access_token: 'access', refresh_token: 'refresh', expires_in: 3600 } })),
-  get: jest.fn(async () => ({ data: { hub_id: 123, hub_domain: 'example.com', user: 'user', scopes: ['crm'] } })),
+  get: jest.fn(async () => ({ data: { hub_id: 123, hub_domain: 'example.com', user: 'user', scopes: ['crm'],
+    workspace_id: 'ws-1', workspace_name: 'Workspace' } })),
 }));
 jest.mock('../services/connectedAccountsDb', () => ({ createAccount: jest.fn(async () => ({ account_id: 'account' })), updateAccountConfig: jest.fn() }));
 jest.mock('../services/fathomApiService', () => ({ FathomApiService: jest.fn(() => ({ registerWebhook: async () => ({ id: 'webhook' }) })) }));
@@ -35,7 +43,7 @@ async function finalize(app: express.Express) {
   return request(app).post('/finalize').send({ code: 'code', state });
 }
 
-describe.each(['hubspot', 'fathom'])('%s shared OAuth sessions', provider => {
+describe.each(['hubspot', 'fathom', 'attio', 'clickup'])('%s shared OAuth sessions', provider => {
   beforeEach(() => { mockDb.rows.clear(); jest.clearAllMocks(); });
   afterEach(() => jest.restoreAllMocks());
 
